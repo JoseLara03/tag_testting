@@ -5,6 +5,7 @@ project(tag_testting)
 
 target_sources(app PRIVATE
     src/main.c
+    src/ble_log.c
     drivers/lis2hh12-pid/lis2hh12_reg.c
 )
 
