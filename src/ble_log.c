@@ -7,7 +7,7 @@
 #include "ble_log.h"
 
 static volatile struct bt_conn *current_conn;
-static K_SEM_DEFINE(conn_sem, 0, 1);
+static K_SEM_DEFINE(notif_sem, 0, 1);
 
 static const struct bt_data ad[] = {
     BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
@@ -45,8 +45,16 @@ static void nus_received(struct bt_conn *conn, const uint8_t *data, uint16_t len
     /* TX-only — ignore incoming data */
 }
 
+static void nus_send_enabled(enum bt_nus_send_status status)
+{
+    if (status == BT_NUS_SEND_STATUS_ENABLED) {
+        k_sem_give(&notif_sem);
+    }
+}
+
 static struct bt_nus_cb nus_cb = {
-    .received = nus_received,
+    .received     = nus_received,
+    .send_enabled = nus_send_enabled,
 };
 
 int ble_log_init(void)
@@ -66,9 +74,10 @@ int ble_log_init(void)
     return bt_le_adv_start(BT_LE_ADV_CONN_FAST_2, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
 }
 
-void ble_log_wait_connected(void)
+void ble_log_wait_ready(void)
 {
-    k_sem_take(&conn_sem, K_FOREVER);
+    /* Blocks until the central writes the NUS TX CCCD (enables notifications) */
+    k_sem_take(&notif_sem, K_FOREVER);
 }
 
 void ble_log_send(const char *msg)

@@ -17,11 +17,8 @@ int main(void)
         return 0;
     }
 
-    /* Block until a central connects and enables NUS notifications */
-    ble_log_wait_connected();
-
-    /* Small delay to allow the central to enable NUS TX notifications (CCCD write) */
-    k_msleep(200);
+    /* Block until the central connects AND writes the NUS TX CCCD */
+    ble_log_wait_ready();
 
     if (lis2hh12_dev_id_get(&dev_ctx, &who_am_i) != 0) {
         snprintf(msg, sizeof(msg), "WHO_AM_I read failed (I2C error)\r\n");
