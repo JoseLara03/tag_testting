@@ -1,38 +1,39 @@
 #include <zephyr/kernel.h>
-#include "ble_log.h"
+#include <zephyr/device.h>
+#include <zephyr/drivers/led_strip.h>
 #include "lis2hh12_if.h"
 #include "lis2hh12_reg.h"
+
+static const struct device *strip = DEVICE_DT_GET(DT_ALIAS(led_strip));
 
 int main(void)
 {
     stmdev_ctx_t dev_ctx = {0};
     uint8_t who_am_i = 0;
-    char msg[48];
+    struct led_rgb pixel;
 
-    (void)ble_log_init();
-
-    if (lis2hh12_if_init(&dev_ctx) != 0) {
-        /* I2C bus not ready — nothing we can do without debug output yet */
+    if (!device_is_ready(strip)) {
         k_sleep(K_FOREVER);
         return 0;
     }
 
-    /* Block until the central connects AND writes the NUS TX CCCD */
-    ble_log_wait_ready();
+    if (lis2hh12_if_init(&dev_ctx) != 0) {
+        /* I2C bus not ready — blue */
+        pixel = (struct led_rgb){.r = 0, .g = 0, .b = 10};
+        led_strip_update_rgb(strip, &pixel, 1);
+        k_sleep(K_FOREVER);
+        return 0;
+    }
 
-    if (lis2hh12_dev_id_get(&dev_ctx, &who_am_i) != 0) {
-        snprintf(msg, sizeof(msg), "WHO_AM_I read failed (I2C error)\r\n");
-    } else if (who_am_i == LIS2HH12_ID) {
-        snprintf(msg, sizeof(msg), "WHO_AM_I = 0x%02X (OK)\r\n", who_am_i);
+    if (lis2hh12_dev_id_get(&dev_ctx, &who_am_i) != 0 || who_am_i != LIS2HH12_ID) {
+        /* I2C error or wrong ID — red */
+        pixel = (struct led_rgb){.r = 10, .g = 0, .b = 0};
     } else {
-        snprintf(msg, sizeof(msg), "WHO_AM_I = 0x%02X (FAIL, expected 0x%02X)\r\n",
-                 who_am_i, LIS2HH12_ID);
+        /* WHO_AM_I = 0x41 — green */
+        pixel = (struct led_rgb){.r = 0, .g = 10, .b = 0};
     }
 
-    while (1) {
-        ble_log_send(msg);
-        k_msleep(3000);
-    }
-
+    led_strip_update_rgb(strip, &pixel, 1);
+    k_sleep(K_FOREVER);
     return 0;
 }
