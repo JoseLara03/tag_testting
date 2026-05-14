@@ -63,7 +63,7 @@ int ble_log_init(void)
         return err;
     }
 
-    return bt_le_adv_start(BT_LE_ADV_CONN, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
+    return bt_le_adv_start(BT_LE_ADV_CONN_FAST_2, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
 }
 
 void ble_log_wait_connected(void)
