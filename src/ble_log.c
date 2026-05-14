@@ -6,7 +6,7 @@
 #include <bluetooth/services/nus.h>
 #include "ble_log.h"
 
-static struct bt_conn *current_conn;
+static volatile struct bt_conn *current_conn;
 static K_SEM_DEFINE(conn_sem, 0, 1);
 
 static const struct bt_data ad[] = {
@@ -25,7 +25,7 @@ static void on_connected(struct bt_conn *conn, uint8_t err)
 static void on_disconnected(struct bt_conn *conn, uint8_t reason)
 {
     if (current_conn) {
-        bt_conn_unref(current_conn);
+        bt_conn_unref((struct bt_conn *)current_conn);
         current_conn = NULL;
     }
 }
@@ -68,8 +68,10 @@ void ble_log_wait_connected(void)
 
 void ble_log_send(const char *msg)
 {
-    if (!current_conn) {
+    struct bt_conn *conn = (struct bt_conn *)current_conn;
+
+    if (!conn) {
         return;
     }
-    bt_nus_send(current_conn, (const uint8_t *)msg, strlen(msg));
+    bt_nus_send(conn, (const uint8_t *)msg, strlen(msg));
 }
