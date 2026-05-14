@@ -32,8 +32,10 @@ int main(void)
                  who_am_i, LIS2HH12_ID);
     }
 
-    ble_log_send(msg);
+    while (1) {
+        ble_log_send(msg);
+        k_msleep(3000);
+    }
 
-    k_sleep(K_FOREVER);
     return 0;
 }
