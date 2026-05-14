@@ -3,4 +3,13 @@ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 
 project(tag_testting)
 
-target_sources(app PRIVATE src/main.c)
+target_sources(app PRIVATE
+    src/main.c
+    src/ble_log.c
+    src/lis2hh12_if.c
+    drivers/lis2hh12-pid/lis2hh12_reg.c
+)
+
+target_include_directories(app PRIVATE
+    drivers/lis2hh12-pid
+)
