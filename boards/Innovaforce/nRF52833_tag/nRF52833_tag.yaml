@@ -1,0 +1,10 @@
+identifier: nRF52833_tag/nrf52833
+name: LP custom tag
+vendor: Innovaforce
+type: mcu
+arch: arm
+ram: 128
+flash: 512
+toolchain:
+  - zephyr
+supported: []

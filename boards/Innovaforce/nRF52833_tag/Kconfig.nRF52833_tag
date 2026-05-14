@@ -1,0 +1,2 @@
+config BOARD_NRF52833_TAG
+	select SOC_NRF52833_QDAA
