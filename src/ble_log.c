@@ -23,7 +23,6 @@ static void on_connected(struct bt_conn *conn, uint8_t err)
 {
     if (!err) {
         current_conn = bt_conn_ref(conn);
-        k_sem_give(&conn_sem);
     }
 }
 
