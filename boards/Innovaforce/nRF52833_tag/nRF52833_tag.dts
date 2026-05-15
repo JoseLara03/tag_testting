@@ -16,6 +16,7 @@
 	aliases {
 		led0 = &status_led;
 		led-strip = &ws2812;
+		button0 = &user_button;
 	};
 
 
@@ -23,6 +24,14 @@
 		compatible = "gpio-leds";
 		status_led: led_0 {
 			gpios = <&gpio0 30 GPIO_ACTIVE_HIGH>;
+		};
+	};
+
+	buttons {
+		compatible = "gpio-buttons";
+		user_button: button_0 {
+			gpios = <&gpio0 17 GPIO_ACTIVE_HIGH>;
+			label = "Button 0";
 		};
 	};
 };
