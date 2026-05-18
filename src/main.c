@@ -94,14 +94,14 @@ int main(void)
         return 0;
     }
 
-    const struct device *button = DEVICE_DT_GET(DT_ALIAS(button0));
-    if (!device_is_ready(button)) {
+    const struct device *gpio0 = DEVICE_DT_GET(DT_NODELABEL(gpio0));
+    if (!device_is_ready(gpio0)) {
         k_sleep(K_FOREVER);
         return 0;
     }
 
-    int ret = gpio_pin_configure(button, DT_GPIO_PIN(DT_ALIAS(button0), gpios),
-                                 GPIO_INPUT | DT_GPIO_FLAGS(DT_ALIAS(button0), gpios));
+    uint8_t button_pin = 17;
+    int ret = gpio_pin_configure(gpio0, button_pin, GPIO_INPUT | GPIO_ACTIVE_HIGH);
     if (ret != 0) {
         k_sleep(K_FOREVER);
         return 0;
@@ -110,20 +110,17 @@ int main(void)
     /* Initialize long press timer */
     k_timer_init(&long_press_timer, long_press_timer_expired, NULL);
 
-    uint32_t button_pin = DT_GPIO_PIN(DT_ALIAS(button0), gpios);
-
     /* Setup rising edge (button press) callback */
     gpio_init_callback(&button_cb_rising, button_pressed, BIT(button_pin));
-    gpio_add_callback(button, &button_cb_rising);
+    gpio_add_callback(gpio0, &button_cb_rising);
 
     /* Setup falling edge (button release) callback */
     gpio_init_callback(&button_cb_falling, button_released, BIT(button_pin));
-    gpio_add_callback(button, &button_cb_falling);
+    gpio_add_callback(gpio0, &button_cb_falling);
 
     /* Enable both rising and falling edge interrupts */
-    gpio_pin_interrupt_configure(button, button_pin,
-                                 GPIO_INT_EDGE_RISING | GPIO_INT_EDGE_FALLING |
-                                 GPIO_INT_PRIORITY_LEVEL(7));
+    gpio_pin_interrupt_configure(gpio0, button_pin,
+                                 GPIO_INT_EDGE_RISING | GPIO_INT_EDGE_FALLING);
 
     if (lis2hh12_if_init(&dev_ctx) != 0) {
         /* I2C bus not ready — blue */
