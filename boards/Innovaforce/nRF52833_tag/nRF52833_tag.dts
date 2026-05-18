@@ -82,6 +82,15 @@
 	pinctrl-0 = <&i2c0_default>;
 	pinctrl-1 = <&i2c0_sleep>;
 	pinctrl-names = "default", "sleep";
+
+	fuel_gauge: bq274xx@55 {
+		compatible = "ti,bq274xx";
+		reg = <0x55>;
+		design-voltage = <3700>;
+		design-capacity = <3200>;
+		taper-current = <341>;
+		terminate-voltage = <3000>;
+	};
 };
 
 &spi1 {
