@@ -6,6 +6,7 @@
 #include "ble_log.h"
 #include "uwb.h"
 #include "nfc_tag.h"
+#include "batt.h"
 
 static const struct device *strip = DEVICE_DT_GET(DT_ALIAS(led_strip));
 static uint32_t dw3000_id = 0;
@@ -122,6 +123,11 @@ int main(void)
                                  GPIO_INT_EDGE_RISING | GPIO_INT_EDGE_FALLING);
 
     if (ble_log_init() != 0) {
+        k_sleep(K_FOREVER);
+        return 0;
+    }
+
+    if (batt_init() != 0) {
         k_sleep(K_FOREVER);
         return 0;
     }
