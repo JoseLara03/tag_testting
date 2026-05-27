@@ -1,4 +1,5 @@
 #include <zephyr/kernel.h>
+#include <string.h>
 #include <nfc_t4t_lib.h>
 #include <nfc/ndef/uri_msg.h>
 #include <nfc/t4t/ndef_file.h>
@@ -31,12 +32,12 @@ static void parse_and_forward(const uint8_t *file_buf, uint32_t nlen)
     uint32_t result_len = sizeof(result_buf);
     const uint8_t *msg_data = file_buf + NFC_NDEF_FILE_NLEN_FIELD_SIZE;
     uint32_t msg_len = nlen;
-    char out[128];
+    char out[256];
 
     if (nfc_ndef_msg_parse(result_buf, &result_len, msg_data, &msg_len) != 0) {
         /* Parse failed — hex dump first 16 bytes */
         int pos = snprintf(out, sizeof(out), "NFC_RAW:");
-        for (uint32_t i = 0; i < nlen && i < 16 && pos < (int)sizeof(out) - 4; i++) {
+        for (uint32_t i = 0; i < msg_len && i < 16 && pos < (int)sizeof(out) - 4; i++) {
             pos += snprintf(out + pos, sizeof(out) - pos, " %02X", msg_data[i]);
         }
         snprintf(out + pos, sizeof(out) - pos, "\n");
@@ -54,8 +55,12 @@ static void parse_and_forward(const uint8_t *file_buf, uint32_t nlen)
     const struct nfc_ndef_bin_payload_desc *pay =
         (const struct nfc_ndef_bin_payload_desc *)rec->payload_descriptor;
 
+    if (pay == NULL || pay->payload == NULL) {
+        return;
+    }
+
     if (rec->tnf == TNF_WELL_KNOWN && rec->type_length == 1 &&
-        rec->type[0] == 'U' && pay->payload_length >= 1) {
+        rec->type != NULL && rec->type[0] == 'U' && pay->payload_length >= 1) {
         /* URI record: payload[0] = prefix ID, payload[1..] = URI string */
         snprintf(out, sizeof(out), "NFC: %s%.*s\n",
                  uri_prefix(pay->payload[0]),
@@ -63,7 +68,7 @@ static void parse_and_forward(const uint8_t *file_buf, uint32_t nlen)
                  (const char *)(pay->payload + 1));
 
     } else if (rec->tnf == TNF_WELL_KNOWN && rec->type_length == 1 &&
-               rec->type[0] == 'T' && pay->payload_length >= 1) {
+               rec->type != NULL && rec->type[0] == 'T' && pay->payload_length >= 1) {
         /* Text record: payload[0] = status byte, bits[5:0] = lang code length */
         uint8_t lang_len = pay->payload[0] & 0x3F;
         uint32_t text_offset = 1U + lang_len;
@@ -107,7 +112,7 @@ int nfc_tag_init(void)
     /* Encode https://google.mx URI into NDEF content area (after NLEN) */
     int err = nfc_ndef_uri_msg_encode(NFC_URI_HTTPS,
                                       (const uint8_t *)"//google.mx",
-                                      sizeof("//google.mx") - 1,
+                                      strlen("//google.mx"),
                                       msg_ptr, &msg_size);
     if (err) {
         return err;
