@@ -112,7 +112,7 @@ int nfc_tag_init(void)
     /* Encode https://google.mx URI into NDEF content area (after NLEN) */
     int err = nfc_ndef_uri_msg_encode(NFC_URI_HTTPS,
                                       (const uint8_t *)"//google.mx",
-                                      strlen("//google.mx"),
+                                      (uint16_t)strlen("//google.mx"),
                                       msg_ptr, &msg_size);
     if (err) {
         return err;
