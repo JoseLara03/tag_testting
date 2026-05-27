@@ -64,6 +64,10 @@
 	};
 };
 
+&nfct {
+	status = "okay";
+};
+
 &gpiote {
 	status = "okay";
 };
@@ -86,8 +90,8 @@
 	fuel_gauge: bq274xx@55 {
 		compatible = "ti,bq274xx";
 		reg = <0x55>;
-		design-voltage = <3700>;
-		design-capacity = <3200>;
+		design-voltage = <4200>;
+		design-capacity = <3700>;
 		taper-current = <341>;
 		terminate-voltage = <3000>;
 	};
