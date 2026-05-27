@@ -6,6 +6,7 @@ project(tag_testting)
 target_sources(app PRIVATE
     src/main.c
     src/ble_log.c
+    src/batt.c
     src/lis2hh12_if.c
     src/uwb.c
     src/nfc_tag.c
