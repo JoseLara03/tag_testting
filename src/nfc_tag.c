@@ -17,8 +17,8 @@ static const char *uri_prefix(uint8_t id)
     switch (id) {
     case 0x01: return "http://www.";
     case 0x02: return "https://www.";
-    case 0x03: return "http:";
-    case 0x04: return "https:";
+    case 0x03: return "http://";
+    case 0x04: return "https://";
     case 0x05: return "tel:";
     case 0x06: return "mailto:";
     default:   return "";
@@ -111,8 +111,8 @@ int nfc_tag_init(void)
 
     /* Encode https://google.mx URI into NDEF content area (after NLEN) */
     int err = nfc_ndef_uri_msg_encode(NFC_URI_HTTPS,
-                                      (const uint8_t *)"//google.mx",
-                                      (uint16_t)strlen("//google.mx"),
+                                      (const uint8_t *)"google.mx",
+                                      (uint16_t)strlen("google.mx"),
                                       msg_ptr, &msg_size);
     if (err) {
         return err;
