@@ -3,12 +3,12 @@
 #include <zephyr/device.h>
 #include <zephyr/drivers/led_strip.h>
 #include <zephyr/drivers/gpio.h>
-#include "lis2hh12_if.h"
-#include "lis2hh12_reg.h"
 #include "ble_log.h"
+#include "uwb.h"
+#include "nfc_tag.h"
 
 static const struct device *strip = DEVICE_DT_GET(DT_ALIAS(led_strip));
-static uint8_t who_am_i_value = 0;
+static uint32_t dw3000_id = 0;
 
 /* Button press duration detection */
 #define LONG_PRESS_MS 3000
@@ -64,18 +64,18 @@ static void button_released(const struct device *dev, struct gpio_callback *cb, 
     k_timer_stop(&long_press_timer);
 
     if (button_state == BUTTON_PRESSING) {
-        /* Short press: less than 3s */
-        char msg[32];
-        snprintf(msg, sizeof(msg), "WHO_AM_I=0x%02x\n", who_am_i_value);
+        /* Short press: less than 3s — send DW3000 chip ID */
+        char msg[64];
+        snprintf(msg, sizeof(msg), "DW3000_ID=0x%08X\n", dw3000_id);
         ble_log_send(msg);
     } else if (button_state == BUTTON_LONG_PRESS_DETECTED) {
         /* Long press: toggle orange LED */
         orange_led_active = !orange_led_active;
         if (orange_led_active) {
             /* Orange: (255, 165, 0) scaled to 0-10 range ≈ (8, 5, 0) */
-            pixel = (struct led_rgb){.r = 8, .g = 5, .b = 0};
+            pixel = (struct led_rgb){.r = 10, .g = 5, .b = 5};
         } else {
-            /* Return to green (WHO_AM_I detected) */
+            /* Green */
             pixel = (struct led_rgb){.r = 0, .g = 10, .b = 0};
         }
         led_strip_update_rgb(strip, &pixel, 1);
@@ -86,7 +86,6 @@ static void button_released(const struct device *dev, struct gpio_callback *cb, 
 
 int main(void)
 {
-    stmdev_ctx_t dev_ctx = {0};
     struct led_rgb pixel;
 
     if (!device_is_ready(strip)) {
@@ -122,30 +121,35 @@ int main(void)
     gpio_pin_interrupt_configure(gpio0, button_pin,
                                  GPIO_INT_EDGE_RISING | GPIO_INT_EDGE_FALLING);
 
-    if (lis2hh12_if_init(&dev_ctx) != 0) {
-        /* I2C bus not ready — blue */
-        pixel = (struct led_rgb){.r = 0, .g = 0, .b = 10};
-        led_strip_update_rgb(strip, &pixel, 1);
-        k_sleep(K_FOREVER);
-        return 0;
-    }
-
-    if (lis2hh12_dev_id_get(&dev_ctx, &who_am_i_value) != 0 || who_am_i_value != LIS2HH12_ID) {
-        /* I2C error or wrong ID — red */
-        pixel = (struct led_rgb){.r = 10, .g = 0, .b = 0};
-    } else {
-        /* WHO_AM_I = 0x41 — green */
-        pixel = (struct led_rgb){.r = 0, .g = 10, .b = 0};
-    }
-
-    led_strip_update_rgb(strip, &pixel, 1);
-
     if (ble_log_init() != 0) {
         k_sleep(K_FOREVER);
         return 0;
     }
 
+    if (nfc_tag_init() != 0) {
+        k_sleep(K_FOREVER);
+        return 0;
+    }
+
     ble_log_wait_ready();
+
+    /* Cyan: initializing DW3000 on SPI1 */
+    pixel = (struct led_rgb){.r = 0, .g = 10, .b = 10};
+    led_strip_update_rgb(strip, &pixel, 1);
+
+    if (uwb_init(3) == 0) {
+        dw3000_id = uwb_get_dev_id();
+        /* Green: DW3000 SPI1 OK */
+        pixel = (struct led_rgb){.r = 0, .g = 10, .b = 0};
+        led_strip_update_rgb(strip, &pixel, 1);
+        char msg[64];
+        snprintf(msg, sizeof(msg), "DW3000_ID=0x%08X\n", dw3000_id);
+        ble_log_send(msg);
+    } else {
+        /* Red: DW3000 SPI1 init failed */
+        pixel = (struct led_rgb){.r = 10, .g = 0, .b = 0};
+        led_strip_update_rgb(strip, &pixel, 1);
+    }
 
     k_sleep(K_FOREVER);
     return 0;
