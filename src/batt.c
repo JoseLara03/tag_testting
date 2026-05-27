@@ -12,12 +12,13 @@ static void batt_work_handler(struct k_work *w)
 {
     ARG_UNUSED(w);
 
-    struct fuel_gauge_get_property props[] = {
-        { .property_type = FUEL_GAUGE_VOLTAGE },
-        { .property_type = FUEL_GAUGE_STATE_OF_CHARGE },
+    fuel_gauge_prop_t props[] = {
+        FUEL_GAUGE_VOLTAGE,
+        FUEL_GAUGE_RELATIVE_STATE_OF_CHARGE,
     };
+    union fuel_gauge_prop_val vals[ARRAY_SIZE(props)];
 
-    int err = fuel_gauge_get_prop(fg, props, ARRAY_SIZE(props));
+    int err = fuel_gauge_get_props(fg, props, vals, ARRAY_SIZE(props));
     if (err) {
         ble_log_send("BATT: ERR\n");
         return;
@@ -25,8 +26,8 @@ static void batt_work_handler(struct k_work *w)
 
     char msg[32];
     snprintf(msg, sizeof(msg), "BATT: %dmV %d%%\n",
-             (int)(props[0].value.voltage / 1000U),
-             (int)props[1].value.state_of_charge);
+             vals[0].voltage / 1000,
+             (int)vals[1].relative_state_of_charge);
     ble_log_send(msg);
 }
 
