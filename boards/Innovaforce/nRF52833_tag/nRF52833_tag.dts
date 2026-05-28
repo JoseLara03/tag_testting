@@ -91,8 +91,8 @@
 		compatible = "ti,bq274xx";
 		reg = <0x55>;
 		design-voltage = <4200>;
-		design-capacity = <3700>;
-		taper-current = <341>;
+		design-capacity = <400>;
+		taper-current = <40>;
 		terminate-voltage = <3000>;
 	};
 };
