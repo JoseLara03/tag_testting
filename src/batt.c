@@ -1,5 +1,5 @@
 #include <zephyr/kernel.h>
-#include <zephyr/drivers/fuel_gauge.h>
+#include <zephyr/drivers/sensor.h>
 #include <stdio.h>
 #include "batt.h"
 #include "ble_log.h"
@@ -12,22 +12,24 @@ static void batt_work_handler(struct k_work *w)
 {
     ARG_UNUSED(w);
 
-    fuel_gauge_prop_t props[] = {
-        FUEL_GAUGE_VOLTAGE,
-        FUEL_GAUGE_RELATIVE_STATE_OF_CHARGE,
-    };
-    union fuel_gauge_prop_val vals[ARRAY_SIZE(props)];
+    struct sensor_value voltage, soc;
 
-    int err = fuel_gauge_get_props(fg, props, vals, ARRAY_SIZE(props));
-    if (err) {
+    if (sensor_sample_fetch(fg) < 0) {
         ble_log_send("BATT: ERR\n");
         return;
     }
 
+    if (sensor_channel_get(fg, SENSOR_CHAN_GAUGE_VOLTAGE, &voltage) < 0 ||
+        sensor_channel_get(fg, SENSOR_CHAN_GAUGE_STATE_OF_CHARGE, &soc) < 0) {
+        ble_log_send("BATT: ERR\n");
+        return;
+    }
+
+    /* val1 = V, val2 = µV fractional → mV */
+    int mv = voltage.val1 * 1000 + voltage.val2 / 1000;
+
     char msg[32];
-    snprintf(msg, sizeof(msg), "BATT: %dmV %d%%\n",
-             vals[0].voltage / 1000,
-             (int)vals[1].relative_state_of_charge);
+    snprintf(msg, sizeof(msg), "BATT: %dmV %d%%\n", mv, soc.val1);
     ble_log_send(msg);
 }
 
