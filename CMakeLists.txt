@@ -24,8 +24,19 @@ target_include_directories(app PRIVATE
     Shared/dwt_uwb_driver/Inc
 )
 
-target_link_libraries(app PRIVATE
+# The precompiled Decawave archive registers per-chip drivers into the
+# .dw_drivers linker section via static objects. Nothing in app code references
+# them directly, so the linker would skip those .o files and the section ends
+# up empty. Force-pull dw3000_driver via --undefined; this drags in its .o
+# (and the .dw_drivers entries it carries) without --whole-archive.
+add_library(dwt_uwb_driver STATIC IMPORTED GLOBAL)
+set_target_properties(dwt_uwb_driver PROPERTIES
+    IMPORTED_LOCATION
     ${CMAKE_CURRENT_SOURCE_DIR}/Shared/dwt_uwb_driver/lib/libdwt_uwb_driver-m4-sfp-6.0.7.a
 )
+target_link_libraries(app PRIVATE
+    dwt_uwb_driver
+)
+zephyr_ld_options(-Wl,--undefined=dw3000_driver)
 
-zephyr_linker_sources(SECTIONS dw_drivers.ld)
+zephyr_linker_sources(SECTIONS ${CMAKE_CURRENT_SOURCE_DIR}/dw_drivers.ld)

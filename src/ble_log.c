@@ -86,5 +86,14 @@ void ble_log_send(const char *msg)
     if (!conn) {
         return;
     }
-    bt_nus_send(conn, (const uint8_t *)msg, strlen(msg));
+
+    /* Retry on -ENOMEM: BLE TX buffer pool can be momentarily exhausted
+     * when several sends are issued back-to-back. Block until drained. */
+    for (int i = 0; i < 50; i++) {
+        int err = bt_nus_send(conn, (const uint8_t *)msg, strlen(msg));
+        if (err != -ENOMEM) {
+            return;
+        }
+        k_msleep(10);
+    }
 }

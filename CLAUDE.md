@@ -17,8 +17,8 @@ The user builds and flashes the firmware themselves and will report any errors o
 
 ```
 src/
-  main.c            — button state machine, LED control, UWB init, NFC init, BLE TX
-  ble_log.c/h       — BLE NUS wrapper (TX-only; blocks until notifications enabled)
+  main.c            — minimal bring-up: LED status, BLE NUS, DW3000 init (see Application Behavior)
+  ble_log.c/h       — BLE NUS wrapper (TX-only; blocks until notifications enabled; retries on -ENOMEM)
   nfc_tag.c/h       — NFC T4T emulation; default URI https://google.mx; forwards phone writes via ble_log_send()
   uwb.c/h           — DW3000 init with retry logic; exposes uwb_get_dev_id()
   batt.c/h          — BQ274xx periodic read (k_timer 10 s → k_work); sends "BATT: xxmV xx%\n" over BLE NUS
@@ -36,7 +36,9 @@ Shared/
 ```
 
 New source files must be added to `CMakeLists.txt` via `target_sources(app PRIVATE ...)`.  
-The Decawave library exposes a custom linker section; `dw_drivers.ld` places it in Flash.
+The Decawave library exposes a custom linker section; `dw_drivers.ld` places it in Flash, and `zephyr_ld_options(-Wl,--undefined=dw3000_driver)` in `CMakeLists.txt` pulls the driver registration object into the link (see Key Patterns).
+
+Note: `nfc_tag.c`, `batt.c`, `lis2hh12_if.c`, and `drivers/lis2hh12-pid/lis2hh12_reg.c` are still listed in `CMakeLists.txt` and compile into the image, but `main.c` does not invoke them — they are dormant code awaiting reintegration.
 
 ## Hardware Peripherals
 
@@ -65,19 +67,24 @@ To enable a new subsystem, add the `CONFIG_*` line to `prj.conf`.
 
 ## Application Behavior (main.c)
 
-1. Initialize WS2812 RGB LED and button GPIO interrupt.
+Stripped down to the minimum needed to verify DW3000 SPI bring-up over BLE NUS:
+
+1. Get WS2812 RGB LED device; hang on failure.
 2. `ble_log_init()` — starts BLE advertising.
-3. `batt_init()` — starts 10 s k_timer for battery reads (non-fatal if BQ274xx not found; sends `"BATT: not found\n"` after BLE connects).
-4. `nfc_tag_init()` — starts NFC T4T emulation immediately (tag live before BLE connects).
-5. `ble_log_wait_ready()` — blocks until BLE central enables NUS TX notifications.
-6. `uwb_init()` — initializes DW3000; LED: **cyan** during init → **green** (success) or **red** (failure).
-7. Button interrupt drives a k_timer state machine:
-   - Short press (<3 s): transmit DW3000 chip ID via BLE NUS.
-   - Long press (≥3 s): toggle RGB LED between green and orange.
+3. `ble_log_wait_ready()` — blocks until BLE central enables NUS TX notifications.
+4. LED **cyan** — initializing DW3000.
+5. `uwb_init(3)` — three retries; sends `probe fail N/3` or `init fail N/3` on each failure, `OK ID=0x........` on success, `all 3 fail` on total failure.
+6. On success: LED **green**, send `ID=0x........\n` over NUS.
+7. On failure: LED **red**, send `DW3000: init failed\n` over NUS.
+8. `k_sleep(K_FOREVER)`.
+
+NFC, battery, accelerometer, and button handling are intentionally not initialised; the goal of this build is end-to-end DW3000 ID read.
 
 ## Key Patterns
 
-- **BLE NUS transmit:** `ble_log_init()` → `ble_log_wait_ready()` → `ble_log_send(msg)`. The wait blocks on a semaphore until the central enables notifications; do not call `ble_log_send` before that.
+- **BLE NUS transmit:** `ble_log_init()` → `ble_log_wait_ready()` → `ble_log_send(msg)`. The wait blocks on a semaphore until the central enables notifications; do not call `ble_log_send` before that. `ble_log_send` retries internally on `-ENOMEM` (TX buffer momentarily exhausted by back-to-back sends).
+- **NUS 20-byte payload limit:** Default ATT MTU is 23, so a single notification carries at most 20 bytes. `bt_nus_send` does not auto-fragment — payloads >20 bytes fail with `-EMSGSIZE` and are silently dropped. Keep diagnostic strings short (e.g. `"probe fail 1/3\n"`, `"ID=0xDEADBEEF\n"`), or initiate an MTU exchange before transmitting long messages.
+- **Linking the precompiled Decawave driver:** `libdwt_uwb_driver-*.a` registers per-chip drivers (DW3000/DW3700/DW3720) into the `.dw_drivers` linker section via static objects. Nothing in app code references those symbols, so the linker would skip the .o files. `zephyr_ld_options(-Wl,--undefined=dw3000_driver)` in `CMakeLists.txt` forces `dw3000_device.c.obj` into the link, populating the section so `dwt_probe()` can find a matching driver. Do **not** use `-Wl,--whole-archive` — CMake 3.21 (nCS 3.2.4) strips the matching `--no-whole-archive` as a duplicate and the flag leaks into picolibc/libgcc, causing multiple-definition errors on `calloc`/`free`/`malloc`/`__retarget_lock_*`/etc.
 - **GPIO interrupts:** Use `gpio_pin_interrupt_configure_dt()` with `GPIO_INT_EDGE_BOTH`; never use the button subsystem — GPIO is managed manually to avoid conflicts with the NUS setup.
 - **SPI rate switching:** Call `openspi()` / `closespi()` in `deca_spi.c` when changing between init (4 MHz) and fast (32 MHz) modes; the static RX buffer is required for EasyDMA.
 - **DW3000 critical sections:** Always bracket Decawave library calls that touch the IRQ with `decamutexon()` / `decamutexoff()`.
