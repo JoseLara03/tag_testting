@@ -21,6 +21,7 @@ src/
   ble_log.c/h       — BLE NUS wrapper (TX-only; blocks until notifications enabled)
   nfc_tag.c/h       — NFC T4T emulation; default URI https://google.mx; forwards phone writes via ble_log_send()
   uwb.c/h           — DW3000 init with retry logic; exposes uwb_get_dev_id()
+  batt.c/h          — BQ274xx periodic read (k_timer 10 s → k_work); sends "BATT: xxmV xx%\n" over BLE NUS
   lis2hh12_if.c/h   — LIS2HH12 I2C callback registration
 platform/
   port.c/h          — DW3000 GPIO/reset/wakeup HAL; DW3000_IRQ_Pin=30, RST=37, WUP=15
@@ -56,7 +57,7 @@ Key configs currently enabled:
 - `CONFIG_BT=y`, `CONFIG_BT_PERIPHERAL=y`, `CONFIG_BT_NUS=y` — BLE peripheral + Nordic UART Service
 - `CONFIG_NFC_T4T_NRFXLIB=y`, `CONFIG_NFC_NDEF=y`, `CONFIG_NFC_NDEF_MSG=y`, `CONFIG_NFC_NDEF_RECORD=y`, `CONFIG_NFC_NDEF_URI_REC=y`, `CONFIG_NFC_NDEF_URI_MSG=y`, `CONFIG_NFC_NDEF_PARSER=y` — NFC T4T + NDEF encode/parse
 - `CONFIG_LED_STRIP=y`, `CONFIG_WS2812_STRIP_SPI=y` — RGB LED
-- `CONFIG_I2C=y`, `CONFIG_FUEL_GAUGE=y`, `CONFIG_BQ274XX=y` — fuel gauge
+- `CONFIG_SENSOR=y`, `CONFIG_I2C=y`, `CONFIG_FUEL_GAUGE=y`, `CONFIG_BQ274XX=y` — fuel gauge (BQ274xx is a sensor driver in nCS 3.2.4; requires `CONFIG_SENSOR=y`)
 - `CONFIG_ARM_MPU=y`, `CONFIG_HW_STACK_PROTECTION=y`
 
 Board-level defaults live in `boards/Innovaforce/nRF52833_tag/nRF52833_tag_defconfig`.  
@@ -66,10 +67,11 @@ To enable a new subsystem, add the `CONFIG_*` line to `prj.conf`.
 
 1. Initialize WS2812 RGB LED and button GPIO interrupt.
 2. `ble_log_init()` — starts BLE advertising.
-3. `nfc_tag_init()` — starts NFC T4T emulation immediately (tag live before BLE connects).
-4. `ble_log_wait_ready()` — blocks until BLE central enables NUS TX notifications.
-5. `uwb_init()` — initializes DW3000; LED: **cyan** during init → **green** (success) or **red** (failure).
-6. Button interrupt drives a k_timer state machine:
+3. `batt_init()` — starts 10 s k_timer for battery reads (non-fatal if BQ274xx not found; sends `"BATT: not found\n"` after BLE connects).
+4. `nfc_tag_init()` — starts NFC T4T emulation immediately (tag live before BLE connects).
+5. `ble_log_wait_ready()` — blocks until BLE central enables NUS TX notifications.
+6. `uwb_init()` — initializes DW3000; LED: **cyan** during init → **green** (success) or **red** (failure).
+7. Button interrupt drives a k_timer state machine:
    - Short press (<3 s): transmit DW3000 chip ID via BLE NUS.
    - Long press (≥3 s): toggle RGB LED between green and orange.
 
@@ -80,6 +82,7 @@ To enable a new subsystem, add the `CONFIG_*` line to `prj.conf`.
 - **SPI rate switching:** Call `openspi()` / `closespi()` in `deca_spi.c` when changing between init (4 MHz) and fast (32 MHz) modes; the static RX buffer is required for EasyDMA.
 - **DW3000 critical sections:** Always bracket Decawave library calls that touch the IRQ with `decamutexon()` / `decamutexoff()`.
 - **Adding a peripheral to I2C0:** Add the node under `&i2c0` in `nRF52833_tag.dts`; the bus is already enabled with the correct pins.
+- **BQ274xx fuel gauge:** In nCS 3.2.4 the driver lives under `drivers/sensor/ti/bq274xx/` and implements the **sensor API**, not the fuel_gauge API. Use `sensor_sample_fetch(dev)` then `sensor_channel_get(dev, SENSOR_CHAN_GAUGE_VOLTAGE, &val)` and `sensor_channel_get(dev, SENSOR_CHAN_GAUGE_STATE_OF_CHARGE, &val)`. Voltage: `val.val1` = V, `val.val2` = µV fractional → mV = `val1 * 1000 + val2 / 1000`. SoC: `val.val1` = %. The driver requires `CONFIG_SENSOR=y`; `CONFIG_FUEL_GAUGE=y` and `CONFIG_BQ274XX=y` are in the board defconfig. The gauge is not ready without a battery connected — `device_is_ready()` returns false on USB-only power. Battery parameters (DTS node `fuel_gauge: bq274xx@55` under `&i2c0`): design-voltage=4200 mV, design-capacity=400 mAh, taper-current=40 mA, terminate-voltage=3000 mV.
 - **NFC T4T:** `nfc_tag_init()` encodes a default URI, registers an RW payload buffer, and starts emulation. The `NFC_T4T_EVENT_NDEF_UPDATED` callback runs in the nrfxlib NFC thread (not ISR) — `ble_log_send()` is safe to call from it. Writes before BLE connects are silently dropped. The NFCT node must be enabled in the board DTS (`&nfct { status = "okay"; }`) for `HAS_HW_NRF_NFCT` to be set, which is required for `NFC_PLATFORM` and `NRFX_NFCT` to build. URI prefix codes follow NFC Forum RTD: 0x03 = `"http://"`, 0x04 = `"https://"` (already includes `://`). Do not pass `"//host"` as the URI string when using these prefix codes.
 
 ## Flash Memory Layout
