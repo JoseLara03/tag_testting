@@ -127,10 +127,7 @@ int main(void)
         return 0;
     }
 
-    if (batt_init() != 0) {
-        k_sleep(K_FOREVER);
-        return 0;
-    }
+    bool batt_ok = (batt_init() == 0);
 
     if (nfc_tag_init() != 0) {
         k_sleep(K_FOREVER);
@@ -138,6 +135,10 @@ int main(void)
     }
 
     ble_log_wait_ready();
+
+    if (!batt_ok) {
+        ble_log_send("BATT: not found\n");
+    }
 
     /* Cyan: initializing DW3000 on SPI1 */
     pixel = (struct led_rgb){.r = 0, .g = 10, .b = 10};
