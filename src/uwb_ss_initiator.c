@@ -22,8 +22,8 @@
 #include <stdarg.h>
 
 /* ---- Calibration knob: antenna delay (edit + rebuild to iterate) ----------- */
-#define TX_ANT_DLY  16385U
-#define RX_ANT_DLY  16385U
+#define TX_ANT_DLY  16371U
+#define RX_ANT_DLY  16371U
 
 /* ---- Timing (seeded from the working DS initiator for CONFIG_OPTION_07) ----- */
 #define UUS_TO_DWT_TIME             65536UL
