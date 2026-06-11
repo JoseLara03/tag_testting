@@ -12,6 +12,7 @@ target_sources(app PRIVATE
     src/nfc_tag.c
     src/phy_config.c
     src/uwb_ss_initiator.c
+    src/motion.c
     drivers/lis2hh12-pid/lis2hh12_reg.c
     platform/port.c
     platform/deca_spi.c
