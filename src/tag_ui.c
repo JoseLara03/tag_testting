@@ -1,14 +1,49 @@
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/device.h>
+#include <zephyr/drivers/led_strip.h>
 #include "tag_ui.h"
-#include "ble_log.h"
+#include "batt.h"
 
 /* Button: P0.17, button0 alias in the board DTS. */
 static const struct gpio_dt_spec button =
     GPIO_DT_SPEC_GET(DT_ALIAS(button0), gpios);
 
+static const struct device *strip = DEVICE_DT_GET(DT_ALIAS(led_strip));
+
 #define DEBOUNCE_MS   30U
 #define DOUBLE_MS     350U    /* window to detect a second press */
+#define BLINK_MS       500U
+#define BATTERY_MS    5000U
+
+static void led_set(uint8_t r, uint8_t g, uint8_t b)
+{
+    struct led_rgb px = { .r = r, .g = g, .b = b };
+    led_strip_update_rgb(strip, &px, 1);
+}
+
+#define LED_OFF()     led_set(0, 0, 0)
+#define LED_ORANGE()  led_set(10, 4, 0)
+
+/* Discrete SoC -> color (matches the design spec). */
+static void led_show_battery(void)
+{
+    int soc;
+
+    if (batt_read_soc(&soc) != 0) {
+        led_set(0, 0, 10);          /* dim blue: no gauge data */
+        return;
+    }
+    if (soc >= 75) {
+        led_set(0, 10, 0);          /* green */
+    } else if (soc >= 50) {
+        led_set(10, 10, 0);         /* yellow */
+    } else if (soc >= 25) {
+        led_set(10, 4, 0);          /* orange */
+    } else {
+        led_set(10, 0, 0);          /* red */
+    }
+}
 
 /* Press timestamps (uptime ms) flow ISR -> UI thread. */
 K_MSGQ_DEFINE(press_q, sizeof(uint32_t), 8, 4);
@@ -36,9 +71,6 @@ static void button_isr(const struct device *port, struct gpio_callback *cb, uint
     k_msgq_put(&press_q, &now, K_NO_WAIT);   /* drop if full */
 }
 
-/* UI state. BLINK handling/LED come in Task 8; here we track the flag only. */
-static bool blinking;
-
 #define UI_PRIO    7
 #define UI_STACK   1024
 
@@ -57,26 +89,35 @@ static void ui_fn(void *p1, void *p2, void *p3)
             continue;
         }
 
-        if (blinking) {
-            /* Any press stops blinking; consume it (no battery display). */
-            blinking = false;
-            ble_log_send("UI: blink stop\n");
-            continue;
-        }
-
         /* Wait up to DOUBLE_MS for a second press; presses can sit in the
          * queue while this thread is delayed, so confirm with timestamps. */
         int got = k_msgq_get(&press_q, &t2, K_MSEC(DOUBLE_MS));
 
         if (got == 0 && (t2 - t1) <= DOUBLE_MS) {
-            blinking = true;
-            ble_log_send("UI: double\n");
-        } else {
-            ble_log_send("UI: single\n");
-            if (got == 0) {
-                /* Stale press from a delayed dequeue: starts a new gesture. */
-                k_msgq_put(&press_q, &t2, K_NO_WAIT);
+            /* Double press: blink orange until any press; toggle every BLINK_MS. */
+            bool on = true;
+            while (1) {
+                if (on) { LED_ORANGE(); } else { LED_OFF(); }
+                on = !on;
+                if (k_msgq_get(&press_q, &t2, K_MSEC(BLINK_MS)) == 0) {
+                    break;   /* press -> stop blinking; consumed (no battery display) */
+                }
             }
+            LED_OFF();
+        } else {
+            /* Single press: battery color for 5 s. */
+            led_show_battery();
+            if (got != 0) {
+                got = k_msgq_get(&press_q, &t2, K_MSEC(BATTERY_MS));
+            }
+            /* A press during the display (or a stale dequeued one) starts a
+             * fresh gesture. */
+            if (got == 0) {
+                LED_OFF();
+                k_msgq_put(&press_q, &t2, K_NO_WAIT);
+                continue;
+            }
+            LED_OFF();
         }
     }
 }
