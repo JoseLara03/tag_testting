@@ -15,20 +15,20 @@
 #include "port.h"
 #include "deca_device_api.h"
 #include "ble_log.h"
+#include "phy_config.h"
 
 #include <zephyr/kernel.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdarg.h>
 
-/* ---- Calibration knob: antenna delay (edit + rebuild to iterate) ----------- */
-#define TX_ANT_DLY  16371U
-#define RX_ANT_DLY  16371U
+/* Antenna delay (TX_ANT_DLY / RX_ANT_DLY) comes from phy_config.h — the
+ * calibration knob. Edit it there and rebuild to re-calibrate. */
 
 /* ---- Timing (seeded from the working DS initiator for CONFIG_OPTION_07) ----- */
 #define UUS_TO_DWT_TIME             65536UL
-#define POLL_TX_TO_RESP_RX_DLY_UUS  2000U   /* RX turns on this long after poll TX */
-#define RESP_RX_TIMEOUT_UUS         4000U   /* covers full response frame air time */
+#define POLL_TX_TO_RESP_RX_DLY_UUS  1000U   /* RX turns on this long after poll TX */
+#define RESP_RX_TIMEOUT_UUS         2000U   /* covers full response frame air time */
 #define PRE_TIMEOUT                  128U
 #define RNG_DELAY_MS                1000U
 
