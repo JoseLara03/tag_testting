@@ -2,8 +2,10 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/device.h>
 #include <zephyr/drivers/led_strip.h>
+#include <stdio.h>
 #include "tag_ui.h"
 #include "batt.h"
+#include "ble_log.h"
 
 /* Button: P0.17, button0 alias in the board DTS. */
 static const struct gpio_dt_spec button =
@@ -29,11 +31,18 @@ static void led_set(uint8_t r, uint8_t g, uint8_t b)
 static void led_show_battery(void)
 {
     int soc;
+    int err = batt_read_soc(&soc);
+    char msg[20];
 
-    if (batt_read_soc(&soc) != 0) {
+    if (err != 0) {
+        snprintf(msg, sizeof(msg), "BATT err %d\n", err);
+        ble_log_send(msg);
         led_set(0, 0, 10);          /* dim blue: no gauge data */
         return;
     }
+
+    snprintf(msg, sizeof(msg), "BATT: %d%%\n", soc);
+    ble_log_send(msg);
     if (soc >= 75) {
         led_set(0, 10, 0);          /* green */
     } else if (soc >= 50) {
