@@ -7,8 +7,6 @@
 #include <zephyr/kernel.h>
 #include <stdio.h>
 #include "phy_config.h"
-#include "uwb_simple_tx.h"
-#include "uwb_simple_rx.h"
 
 static uint32_t dev_id = 0xDEADBEEFU;
 
@@ -83,14 +81,4 @@ int uwb_init(int max_retries)
 uint32_t uwb_get_dev_id(void)
 {
     return dev_id;
-}
-
-void uwb_simple_tx(void)
-{
-    simple_tx();
-}
-
-void uwb_simple_rx(void)
-{
-    simple_rx();
 }

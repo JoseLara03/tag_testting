@@ -11,9 +11,6 @@ target_sources(app PRIVATE
     src/uwb.c
     src/nfc_tag.c
     src/phy_config.c
-    src/uwb_simple_tx.c
-    src/uwb_simple_rx.c
-    src/uwb_ds_initiator.c
     src/uwb_ss_initiator.c
     drivers/lis2hh12-pid/lis2hh12_reg.c
     platform/port.c
