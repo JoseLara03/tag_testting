@@ -33,6 +33,10 @@
 			gpios = <&gpio0 17 GPIO_ACTIVE_HIGH>;
 			label = "Button 0";
 		};
+		accel_int: accel_int_0 {
+			gpios = <&gpio0 28 GPIO_ACTIVE_HIGH>;
+			label = "Accel INT1";
+		};
 	};
 };
 
