@@ -22,8 +22,6 @@ int main(void)
         return 0;
     }
 
-    ble_log_wait_ready();
-
     /* Cyan: initializing DW3000 on SPI1 */
     pixel = (struct led_rgb){.r = 0, .g = 10, .b = 10};
     led_strip_update_rgb(strip, &pixel, 1);
