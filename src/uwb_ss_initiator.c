@@ -30,7 +30,8 @@
 #define POLL_TX_TO_RESP_RX_DLY_UUS  1000U   /* RX turns on this long after poll TX */
 #define RESP_RX_TIMEOUT_UUS         2000U   /* covers full response frame air time */
 #define PRE_TIMEOUT                  128U
-#define RNG_DELAY_MS                1000U
+#define RNG_FAST_MS                 1000U   /* cadence while moving */
+#define RNG_SLOW_MS                 5000U   /* cadence after ~5 s of no motion */
 
 /* SPEED_OF_LIGHT is a Qorvo shared_defines macro not present in this project's
  * driver headers; define it locally (m/s, as used by the Qorvo examples). */
@@ -56,8 +57,8 @@ struct twr_msg {
     char text[TWR_MSG_LEN];
 };
 
-/* Unique symbol names: uwb_ds_initiator.c defines same-named globals and is
- * also compiled into the image, so these must not collide. */
+/* Unique symbol names: names kept distinct from the example in
+ * examples/uwb_ds_initiator.c, which is not currently compiled. */
 K_MSGQ_DEFINE(ss_twr_msgq, sizeof(struct twr_msg), 8, 4);
 
 static void twr_log(const char *fmt, ...)
@@ -101,6 +102,9 @@ typedef enum {
 
 static volatile irq_evt_t last_evt;
 static K_SEM_DEFINE(irq_sem, 0, 1);
+
+static volatile bool ss_moving = true;     /* start fast until motion module reports otherwise */
+K_SEM_DEFINE(range_tick, 0, 1);
 
 static void cb_txdone(const dwt_cb_data_t *d) { ARG_UNUSED(d); last_evt = EVT_TXFRS; k_sem_give(&irq_sem); }
 static void cb_rxok  (const dwt_cb_data_t *d) { ARG_UNUSED(d); last_evt = EVT_RXFCG; k_sem_give(&irq_sem); }
@@ -228,11 +232,20 @@ static void ss_twr_fn(void *p1, void *p2, void *p3)
             dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
         }
 
-        k_msleep(RNG_DELAY_MS);
+        uint32_t wait_ms = ss_moving ? RNG_FAST_MS : RNG_SLOW_MS;
+        k_sem_take(&range_tick, K_MSEC(wait_ms));
     }
 }
 
 /* ---- Public API ------------------------------------------------------------ */
+
+void uwb_set_moving(bool moving)
+{
+    ss_moving = moving;
+    if (moving) {
+        k_sem_give(&range_tick);   /* cut a slow wait short */
+    }
+}
 
 void uwb_ss_initiator_start(void)
 {
