@@ -6,6 +6,7 @@
 #include "uwb.h"
 #include "uwb_ss_initiator.h"
 #include "motion.h"
+#include "tag_ui.h"
 
 static const struct device *strip = DEVICE_DT_GET(DT_ALIAS(led_strip));
 
@@ -36,6 +37,7 @@ int main(void)
         if (motion_init() != 0) {
             ble_log_send("motion init fail\n");
         }
+        tag_ui_init();
     } else {
         /* Red: DW3000 SPI1 init failed */
         pixel = (struct led_rgb){.r = 10, .g = 0, .b = 0};
