@@ -21,18 +21,18 @@ static void button_isr(const struct device *port, struct gpio_callback *cb, uint
     ARG_UNUSED(cb);
     ARG_UNUSED(pins);
 
-    static uint32_t last_ms;
+    static uint32_t last_edge_ms;
     uint32_t now = k_uptime_get_32();
+    bool bounced = (now - last_edge_ms) < DEBOUNCE_MS;
 
-    /* Only count the active (pressed) edge, debounced. */
+    last_edge_ms = now;
+    if (bounced) {
+        return;
+    }
+    /* Only count the active (pressed) edge. */
     if (gpio_pin_get_dt(&button) != 1) {
         return;
     }
-    if ((now - last_ms) < DEBOUNCE_MS) {
-        return;
-    }
-    last_ms = now;
-
     k_msgq_put(&press_q, &now, K_NO_WAIT);   /* drop if full */
 }
 
@@ -49,11 +49,11 @@ static void ui_fn(void *p1, void *p2, void *p3)
 {
     ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
 
-    uint32_t t;
+    uint32_t t1, t2;
 
     while (1) {
         /* Wait for the first press of a gesture. */
-        if (k_msgq_get(&press_q, &t, K_FOREVER) != 0) {
+        if (k_msgq_get(&press_q, &t1, K_FOREVER) != 0) {
             continue;
         }
 
@@ -64,12 +64,19 @@ static void ui_fn(void *p1, void *p2, void *p3)
             continue;
         }
 
-        /* Wait up to DOUBLE_MS for a second press. */
-        if (k_msgq_get(&press_q, &t, K_MSEC(DOUBLE_MS)) == 0) {
+        /* Wait up to DOUBLE_MS for a second press; presses can sit in the
+         * queue while this thread is delayed, so confirm with timestamps. */
+        int got = k_msgq_get(&press_q, &t2, K_MSEC(DOUBLE_MS));
+
+        if (got == 0 && (t2 - t1) <= DOUBLE_MS) {
             blinking = true;
             ble_log_send("UI: double\n");
         } else {
             ble_log_send("UI: single\n");
+            if (got == 0) {
+                /* Stale press from a delayed dequeue: starts a new gesture. */
+                k_msgq_put(&press_q, &t2, K_NO_WAIT);
+            }
         }
     }
 }
