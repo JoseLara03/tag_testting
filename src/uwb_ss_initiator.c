@@ -241,8 +241,10 @@ static void ss_twr_fn(void *p1, void *p2, void *p3)
 
 void uwb_set_moving(bool moving)
 {
+    bool was_moving = ss_moving;
+
     ss_moving = moving;
-    if (moving) {
+    if (moving && !was_moving) {
         k_sem_give(&range_tick);   /* cut a slow wait short */
     }
 }

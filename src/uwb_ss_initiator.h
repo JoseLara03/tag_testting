@@ -8,8 +8,9 @@
 void uwb_ss_initiator_start(void);
 
 /* Set ranging cadence: true -> fast (1 s), false -> slow (5 s).
- * Safe to call from ISR context. Switching to fast also wakes the
- * ranging thread immediately if it is in a long idle wait. */
+ * Safe to call from ISR context. Only the still->moving transition wakes
+ * the ranging thread immediately; repeated calls while already moving do
+ * not give extra semaphore tokens. */
 void uwb_set_moving(bool moving);
 
 #endif /* UWB_SS_INITIATOR_H_ */
