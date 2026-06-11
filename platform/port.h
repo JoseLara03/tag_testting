@@ -50,7 +50,7 @@ void Sleep(uint32_t x);
 
 int peripherals_init(void);
 
-/* @fn    gpio_init — assert DW3000 control GPIO device is ready */
+/* @fn    gpio_init — assert gpio0 ready; configure RST and WUP pins */
 void gpio_init(void);
 
 void reset_DWIC(void);

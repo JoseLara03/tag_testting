@@ -59,6 +59,13 @@ int peripherals_init(void)
 void gpio_init(void)
 {
     __ASSERT(device_is_ready(gpio0), "gpio0 device not ready");
+
+    /* RST: driven HIGH → transistor active → DW3000 RST pin floats → chip runs.
+     * Drive LOW to assert reset (transistor pulls DW3000 RST to GND). */
+    gpio_pin_configure(gpio0, DW3000_RST_Pin, GPIO_OUTPUT_ACTIVE);
+
+    /* WUP: external pull-down holds it low at rest; drive HIGH to wake DW3000. */
+    gpio_pin_configure(gpio0, DW3000_WUP_Pin, GPIO_OUTPUT_INACTIVE);
 }
 
 /* ---- DW3000 IRQ ---------------------------------------------------------- */
@@ -78,23 +85,22 @@ static void deca_irq_handler(const struct device *dev,
 
 void dw_irq_init(void)
 {
-    gpio_pin_configure(gpio0, DW3000_IRQ_Pin, GPIO_INPUT | GPIO_PULL_DOWN);
+    /* IRQ: external pull-down; DW3000 drives high to signal. No internal pull needed. */
+    gpio_pin_configure(gpio0, DW3000_IRQ_Pin, GPIO_INPUT);
     gpio_init_callback(&dw3000_irq_cb, deca_irq_handler, BIT(DW3000_IRQ_Pin));
     gpio_add_callback(gpio0, &dw3000_irq_cb);
-    /* Interrupt is left disabled here; enable it after port_set_dwic_isr(). */
-    gpio_pin_interrupt_configure(gpio0, DW3000_IRQ_Pin, GPIO_INT_DISABLE);
-
-    gpio_pin_configure(gpio0, DW3000_WUP_Pin, GPIO_OUTPUT_INACTIVE);
+    gpio_pin_interrupt_configure(gpio0, DW3000_IRQ_Pin, GPIO_INT_EDGE_RISING);
 }
 
 /* ---- DW3000 control ------------------------------------------------------ */
 
 void reset_DWIC(void)
 {
-    gpio_pin_configure(gpio0, DW3000_RST_Pin, GPIO_OUTPUT_ACTIVE);
+    /* LOW → transistor off → DW3000 RST pulled to GND → chip in reset. */
     gpio_pin_set(gpio0, DW3000_RST_Pin, 0);
     k_msleep(2);
-    gpio_pin_configure(gpio0, DW3000_RST_Pin, GPIO_INPUT);
+    /* HIGH → transistor on → DW3000 RST floats → chip released from reset. */
+    gpio_pin_set(gpio0, DW3000_RST_Pin, 1);
     k_msleep(2);
 }
 
