@@ -4,6 +4,7 @@
 #include <zephyr/drivers/led_strip.h>
 #include "ble_log.h"
 #include "uwb.h"
+#include "uwb_ss_initiator.h"
 
 static const struct device *strip = DEVICE_DT_GET(DT_ALIAS(led_strip));
 
@@ -28,13 +29,11 @@ int main(void)
     led_strip_update_rgb(strip, &pixel, 1);
 
     if (uwb_init(3) == 0) {
-        uint32_t dw3000_id = uwb_get_dev_id();
         /* Green: DW3000 SPI1 OK */
         pixel = (struct led_rgb){.r = 0, .g = 10, .b = 0};
         led_strip_update_rgb(strip, &pixel, 1);
-        char msg[64];
-        snprintf(msg, sizeof(msg), "ID=0x%08X\n", dw3000_id);
-        ble_log_send(msg);
+        ble_log_send("Config OK\n");
+        uwb_ss_initiator_start();
     } else {
         /* Red: DW3000 SPI1 init failed */
         pixel = (struct led_rgb){.r = 10, .g = 0, .b = 0};
