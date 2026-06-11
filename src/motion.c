@@ -8,9 +8,10 @@
 static const struct gpio_dt_spec accel_int =
     GPIO_DT_SPEC_GET(DT_NODELABEL(accel_int), gpios);
 
-/* Logical pin level that means "moving". The LIS2HH12 INT1_INACT polarity
- * is verified on hardware in Step 6; flip this (0/1) if cadence is inverted. */
-#define ACCEL_INT_MOVING_LEVEL  1
+/* Logical pin level that means "moving". INT1_INACT is an inactivity status:
+ * with active-high polarity the pin is HIGH while still, LOW while moving
+ * (datasheet/AN4662). Verified on hardware; flip (0/1) if cadence is inverted. */
+#define ACCEL_INT_MOVING_LEVEL  0
 
 /* Activity tuning (LIS2HH12, FS=2g, ODR=50 Hz):
  *  ACT_THS LSB = FS/128 = 2000 mg / 128 ≈ 15.6 mg.  8 -> ~125 mg.
