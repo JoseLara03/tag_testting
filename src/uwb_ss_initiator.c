@@ -104,7 +104,7 @@ static volatile irq_evt_t last_evt;
 static K_SEM_DEFINE(irq_sem, 0, 1);
 
 static volatile bool ss_moving = true;     /* start fast until motion module reports otherwise */
-K_SEM_DEFINE(range_tick, 0, 1);
+static K_SEM_DEFINE(range_tick, 0, 1);
 
 static void cb_txdone(const dwt_cb_data_t *d) { ARG_UNUSED(d); last_evt = EVT_TXFRS; k_sem_give(&irq_sem); }
 static void cb_rxok  (const dwt_cb_data_t *d) { ARG_UNUSED(d); last_evt = EVT_RXFCG; k_sem_give(&irq_sem); }
