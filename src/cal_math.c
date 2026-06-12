@@ -75,6 +75,70 @@ void cal_split_dly(uint16_t total, uint16_t *tx, uint16_t *rx)
     *rx = total - *tx;
 }
 
+static void sort_i32(int32_t *a, size_t n)
+{
+    /* Insertion sort: n <= CAL_MAX_SAMPLES (128), simple and allocation-free. */
+    for (size_t i = 1; i < n; i++) {
+        int32_t key = a[i];
+        size_t j = i;
+        while (j > 0 && a[j - 1] > key) {
+            a[j] = a[j - 1];
+            j--;
+        }
+        a[j] = key;
+    }
+}
+
+static int32_t median_sorted(const int32_t *a, size_t n)
+{
+    return a[n / 2];  /* upper-middle for even n; adequate for outlier centring */
+}
+
+bool cal_filtered_mean(const int32_t *samples, size_t n,
+                       int32_t *out_mean, size_t *out_kept)
+{
+    if (n == 0 || n > CAL_MAX_SAMPLES) {
+        return false;
+    }
+
+    int32_t work[CAL_MAX_SAMPLES];
+    memcpy(work, samples, n * sizeof(int32_t));
+    sort_i32(work, n);
+    int32_t med = median_sorted(work, n);
+
+    /* MAD = median of absolute deviations from the median. */
+    int32_t devs[CAL_MAX_SAMPLES];
+    for (size_t i = 0; i < n; i++) {
+        int32_t d = work[i] - med;
+        devs[i] = (d < 0) ? -d : d;
+    }
+    sort_i32(devs, n);
+    int32_t mad = median_sorted(devs, n);
+    if (mad < 1) {
+        mad = 1;  /* floor: avoid rejecting everything when samples are tight */
+    }
+
+    int64_t sum = 0;
+    size_t kept = 0;
+    int32_t limit = 6 * mad;
+    for (size_t i = 0; i < n; i++) {
+        int32_t d = samples[i] - med;
+        if (d < 0) {
+            d = -d;
+        }
+        if (d <= limit) {
+            sum += samples[i];
+            kept++;
+        }
+    }
+    if (kept == 0) {
+        return false;
+    }
+    *out_mean = (int32_t)(sum / (int64_t)kept);
+    *out_kept = kept;
+    return true;
+}
+
 int cal_math_selftest(void)
 {
     int fails = 0;
@@ -125,6 +189,21 @@ int cal_math_selftest(void)
     cal_split_dly(33, &tx, &rx);
     if (tx != 16 || rx != 17) {
         fails++;
+    }
+
+    /* Filtered mean: one gross outlier (5000) must be rejected. */
+    int32_t s[] = {100, 102, 98, 101, 99, 5000};
+    int32_t mean;
+    size_t kept;
+    if (!cal_filtered_mean(s, 6, &mean, &kept)) {
+        fails++;
+    } else {
+        if (kept != 5) {
+            fails++;
+        }
+        if (mean < 98 || mean > 102) {
+            fails++;
+        }
     }
 
     return fails;
