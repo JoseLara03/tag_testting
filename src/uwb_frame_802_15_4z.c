@@ -1,6 +1,11 @@
 #include "uwb_frame_802_15_4z.h"
 #include <errno.h>
 
+/* NOTE: the DISC/MPOL/RESP frames use 2-byte little-endian short addresses at
+ * bytes 5-6 (dest) and 7-8 (src). This is intentionally distinct from the legacy
+ * SS-TWR E0/E1 frames in uwb_ss_initiator.c, whose bytes 5-8 are a 4-char ASCII
+ * tag ('WAVE'/'VEWA'); the two frame families are not wire-compatible by design. */
+
 /* ---- Field offsets ---- */
 #define OFF_FC0        0
 #define OFF_FC1        1
@@ -51,7 +56,17 @@ static void write_hdr(uint8_t *buf, uint16_t dest, uint16_t src, uint8_t type)
 /* ---- Builders (STUBS) ---- */
 int uwb_frame_discovery_build(uint8_t *buf, size_t buf_len,
                               uint16_t src_addr, uint32_t tx_ts)
-{ (void)buf; (void)buf_len; (void)src_addr; (void)tx_ts; return -EINVAL; }
+{
+    if (!buf) {
+        return -EINVAL;
+    }
+    if (buf_len < UWB_FRAME_LEN_DISC) {
+        return -EMSGSIZE;
+    }
+    write_hdr(buf, UWB_FRAME_ADDR_BCAST, src_addr, UWB_FRAME_TYPE_DISC);
+    put_u32(&buf[OFF_DISC_TS], tx_ts);
+    return UWB_FRAME_LEN_DISC;
+}
 
 int uwb_frame_multipoll_build(uint8_t *buf, size_t buf_len, uint16_t src_addr,
                               const struct uwb_anchor_slot *slots,
@@ -75,9 +90,31 @@ int uwb_frame_parse_multipoll(const uint8_t *buf, size_t len,
                               uint8_t *num_slots, uint32_t *tx_ts)
 { (void)buf; (void)len; (void)slots_out; (void)num_slots; (void)tx_ts; return -EINVAL; }
 
-/* ---- Validators (STUBS) ---- */
-bool uwb_frame_is_valid(const uint8_t *buf, size_t len)      { (void)buf; (void)len; return false; }
-bool uwb_frame_is_discovery(const uint8_t *buf, size_t len)  { (void)buf; (void)len; return false; }
+/* ---- Validators ---- */
+bool uwb_frame_is_valid(const uint8_t *buf, size_t len)
+{
+    if (!buf) {
+        return false;
+    }
+    if (len < UWB_FRAME_HDR_LEN || len > UWB_FRAME_MAX_LEN) {
+        return false;
+    }
+    if (buf[OFF_FC0] != 0x41 || buf[OFF_FC1] != 0x88) {
+        return false;
+    }
+    if (buf[OFF_PAN] != 0xCA || buf[OFF_PAN + 1] != 0xDE) {
+        return false;
+    }
+    return true;
+}
+
+bool uwb_frame_is_discovery(const uint8_t *buf, size_t len)
+{
+    return uwb_frame_is_valid(buf, len) &&
+           buf[OFF_TYPE] == UWB_FRAME_TYPE_DISC &&
+           len >= UWB_FRAME_LEN_DISC;
+}
+
 bool uwb_frame_is_multipoll(const uint8_t *buf, size_t len)  { (void)buf; (void)len; return false; }
 bool uwb_frame_is_response(const uint8_t *buf, size_t len)   { (void)buf; (void)len; return false; }
 

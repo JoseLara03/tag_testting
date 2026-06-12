@@ -1,4 +1,5 @@
 #include "uwb_frame_802_15_4z.h"
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -33,10 +34,38 @@ static void test_utilities(void)
     CHECK(f[2] == 0x2A);  /* set is a plain setter, no auto-increment */
 }
 
+static void test_discovery(void)
+{
+    uint8_t buf[32];
+    int n = uwb_frame_discovery_build(buf, sizeof(buf), 0x1234, 0xAABBCCDD);
+    CHECK(n == UWB_FRAME_LEN_DISC);
+
+    /* Exact byte layout. */
+    uint8_t expect[UWB_FRAME_LEN_DISC] = {
+        0x41, 0x88, 0x00, 0xCA, 0xDE,   /* FC, seq, PANID */
+        0xFF, 0xFF,                     /* dest = broadcast */
+        0x34, 0x12,                     /* src 0x1234 LE */
+        UWB_FRAME_TYPE_DISC,            /* type 0xE2 */
+        0xDD, 0xCC, 0xBB, 0xAA          /* tx_ts 0xAABBCCDD LE */
+    };
+    CHECK(memcmp(buf, expect, UWB_FRAME_LEN_DISC) == 0);
+
+    /* Validators. */
+    CHECK(uwb_frame_is_valid(buf, n));
+    CHECK(uwb_frame_is_discovery(buf, n));
+    CHECK(!uwb_frame_is_response(buf, n));   /* type byte differs */
+
+    /* Buffer too small. */
+    CHECK(uwb_frame_discovery_build(buf, 5, 0x1234, 0) == -EMSGSIZE);
+    /* Null buffer. */
+    CHECK(uwb_frame_discovery_build(NULL, sizeof(buf), 0x1234, 0) == -EINVAL);
+}
+
 int main(void)
 {
     test_scaffold();
     test_utilities();
+    test_discovery();
     if (g_fail) { printf("%d CHECK(s) FAILED\n", g_fail); return 1; }
     printf("ALL TESTS PASSED\n");
     return 0;
