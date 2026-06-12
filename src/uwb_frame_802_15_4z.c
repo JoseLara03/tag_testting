@@ -81,8 +81,8 @@ bool uwb_frame_is_discovery(const uint8_t *buf, size_t len)  { (void)buf; (void)
 bool uwb_frame_is_multipoll(const uint8_t *buf, size_t len)  { (void)buf; (void)len; return false; }
 bool uwb_frame_is_response(const uint8_t *buf, size_t len)   { (void)buf; (void)len; return false; }
 
-/* ---- Utilities (STUBS) ---- */
-uint16_t uwb_frame_get_src_addr(const uint8_t *buf)  { (void)buf; return 0; }
-uint16_t uwb_frame_get_dest_addr(const uint8_t *buf) { (void)buf; return 0; }
-uint8_t  uwb_frame_get_seq_num(const uint8_t *buf)   { (void)buf; return 0; }
-void     uwb_frame_set_seq_num(uint8_t *buf, uint8_t seq) { (void)buf; (void)seq; }
+/* ---- Utilities ---- */
+uint16_t uwb_frame_get_src_addr(const uint8_t *buf)  { return get_u16(&buf[OFF_SRC]); }
+uint16_t uwb_frame_get_dest_addr(const uint8_t *buf) { return get_u16(&buf[OFF_DEST]); }
+uint8_t  uwb_frame_get_seq_num(const uint8_t *buf)   { return buf[OFF_SEQ]; }
+void     uwb_frame_set_seq_num(uint8_t *buf, uint8_t seq) { buf[OFF_SEQ] = seq; }
