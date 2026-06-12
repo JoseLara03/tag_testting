@@ -16,6 +16,8 @@
 #include "deca_device_api.h"
 #include "ble_log.h"
 #include "phy_config.h"
+#include "cal.h"
+#include "cal_math.h"
 
 #include <zephyr/kernel.h>
 #include <string.h>
@@ -32,6 +34,11 @@
 #define PRE_TIMEOUT                  128U
 #define RNG_FAST_MS                 1000U   /* cadence while moving */
 #define RNG_SLOW_MS                 5000U   /* cadence after ~5 s of no motion */
+
+/* Calibration procedure parameters. */
+#define CAL_SAMPLES_PER_ITER  100U   /* ranges averaged per iteration */
+#define CAL_MAX_ITERS         4U     /* give up after this many corrections */
+#define CAL_ACCEPT_MM         15     /* residual error considered converged */
 
 /* SPEED_OF_LIGHT is a Qorvo shared_defines macro not present in this project's
  * driver headers; define it locally (m/s, as used by the Qorvo examples). */
@@ -158,6 +165,127 @@ static struct k_thread ss_twr_tid;
 #define INT_RX_PHASE  (DWT_INT_RXFCG_BIT_MASK | DWT_INT_RXFTO_BIT_MASK | \
                        DWT_INT_RXPTO_BIT_MASK  | SYS_STATUS_ALL_RX_ERR)
 
+/*
+ * Run a single SS-TWR exchange. On a valid response, writes the measured
+ * distance in millimetres to *out_mm and returns true. Returns false on
+ * timeout, RX error, or an unexpected frame. Assumes interrupts/antenna delay
+ * are already configured by the caller.
+ */
+static bool do_one_range(int32_t *out_mm)
+{
+    dwt_setinterrupt(INT_RX_PHASE, 0, DWT_ENABLE_INT_ONLY);
+
+    tx_poll_msg[ALL_MSG_SN_IDX] = frame_seq_nb;
+    dwt_writetxdata(sizeof(tx_poll_msg), tx_poll_msg, 0);
+    dwt_writetxfctrl(sizeof(tx_poll_msg) + FCS_LEN, 0, 1);
+    dwt_starttx(DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED);
+    frame_seq_nb++;
+
+    irq_evt_t evt = wait_event(K_MSEC(20));
+
+    if (evt != EVT_RXFCG) {
+        dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+        return false;
+    }
+
+    uint16_t flen = dwt_getframelength();
+    if (flen <= RX_BUF_LEN) {
+        dwt_readrxdata(rx_buf, flen, 0);
+    }
+    rx_buf[ALL_MSG_SN_IDX] = 0;
+
+    if (memcmp(rx_buf, rx_resp_msg, ALL_MSG_COMMON_LEN) != 0) {
+        dwt_writesysstatuslo(DWT_INT_RXFCG_BIT_MASK);
+        return false;
+    }
+
+    uint32_t poll_tx_ts = dwt_readtxtimestamplo32();
+    uint32_t resp_rx_ts = dwt_readrxtimestamplo32();
+    double clock_offset_ratio =
+        ((double)dwt_readclockoffset()) / (uint32_t)(1 << 26);
+    uint32_t poll_rx_ts = get_ts_4b(&rx_buf[RESP_MSG_POLL_RX_TS_IDX]);
+    uint32_t resp_tx_ts = get_ts_4b(&rx_buf[RESP_MSG_RESP_TX_TS_IDX]);
+
+    int32_t rtd_init = (int32_t)(resp_rx_ts - poll_tx_ts);
+    int32_t rtd_resp = (int32_t)(resp_tx_ts - poll_rx_ts);
+
+    double tof = ((rtd_init - rtd_resp * (1 - clock_offset_ratio)) / 2.0)
+                 * DWT_TIME_UNITS;
+    *out_mm = (int32_t)(tof * SPEED_OF_LIGHT * 1000.0);
+    return true;
+}
+
+/* Apply a combined antenna delay to the DW3000 (split equally TX/RX). */
+static void apply_total_dly(uint16_t total, uint16_t *tx, uint16_t *rx)
+{
+    cal_split_dly(total, tx, rx);
+    dwt_settxantennadelay(*tx);
+    dwt_setrxantennadelay(*rx);
+}
+
+/* Combined antenna-delay seed for a fresh calibration run. */
+static uint16_t active_total_seed(void)
+{
+    if (cal_is_valid()) {
+        uint16_t tx, rx;
+        cal_get_ant_dly(&tx, &rx);
+        return (uint16_t)(tx + rx);
+    }
+    return (uint16_t)(TX_ANT_DLY + RX_ANT_DLY);  /* factory reference fallback */
+}
+
+/*
+ * Iterative auto-solve: collect CAL_SAMPLES_PER_ITER ranges, reject outliers,
+ * correct the combined antenna delay toward ref_mm, repeat until the residual
+ * is within CAL_ACCEPT_MM or CAL_MAX_ITERS is exhausted. Stores to NVS on
+ * success. Reports progress over BLE.
+ */
+static void run_calibration(uint32_t ref_mm)
+{
+    static int32_t samples[CAL_MAX_SAMPLES];
+
+    uint16_t tx, rx;
+    /* Seed from the active value if valid, else the factory reference. */
+    uint16_t total = active_total_seed();
+    apply_total_dly(total, &tx, &rx);
+
+    for (uint32_t it = 0; it < CAL_MAX_ITERS; it++) {
+        size_t got = 0;
+        for (uint32_t i = 0; i < CAL_SAMPLES_PER_ITER; i++) {
+            int32_t mm;
+            if (do_one_range(&mm)) {
+                samples[got++] = mm;
+            }
+            k_sleep(K_MSEC(5));
+        }
+
+        int32_t mean;
+        size_t kept;
+        if (got < CAL_SAMPLES_PER_ITER / 4 ||
+            !cal_filtered_mean(samples, got, &mean, &kept)) {
+            twr_log("CAL FAIL no-resp\n");
+            return;
+        }
+
+        int32_t err = mean - (int32_t)ref_mm;
+        int32_t abserr = (err < 0) ? -err : err;
+        twr_log("CAL it%u e=%dmm\n", it + 1, err);
+
+        if (abserr <= CAL_ACCEPT_MM) {
+            if (cal_store(tx, rx, ref_mm, (uint16_t)abserr) == 0) {
+                twr_log("CAL OK %u/%u\n", tx, rx);
+            } else {
+                twr_log("CAL FAIL nvs\n");
+            }
+            return;
+        }
+
+        total = cal_solve_step(mean, (int32_t)ref_mm, total);
+        apply_total_dly(total, &tx, &rx);
+    }
+    twr_log("CAL FAIL res\n");
+}
+
 static void ss_twr_fn(void *p1, void *p2, void *p3)
 {
     ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
@@ -165,71 +293,47 @@ static void ss_twr_fn(void *p1, void *p2, void *p3)
     dwt_setcallbacks(cb_txdone, cb_rxok, cb_rxto, cb_rxerr, NULL, NULL, NULL);
     port_set_dwic_isr(dwt_isr);
 
-    dwt_setrxantennadelay(RX_ANT_DLY);
-    dwt_settxantennadelay(TX_ANT_DLY);
     dwt_setrxaftertxdelay(POLL_TX_TO_RESP_RX_DLY_UUS);
     dwt_setrxtimeout(RESP_RX_TIMEOUT_UUS);
     dwt_setpreambledetecttimeout(PRE_TIMEOUT);
 
-    twr_log("SS-TWR start\n");
+    bool ranging = cal_is_valid();
+    if (ranging) {
+        uint16_t tx, rx;
+        cal_get_ant_dly(&tx, &rx);
+        dwt_settxantennadelay(tx);
+        dwt_setrxantennadelay(rx);
+        twr_log("SS-TWR start\n");
+    } else {
+        twr_log("CAL REQUIRED\n");
+    }
 
     while (1) {
-        /* Only RX-class events may wake us; the poll TXFRS is masked out. */
-        dwt_setinterrupt(INT_RX_PHASE, 0, DWT_ENABLE_INT_ONLY);
-
-        tx_poll_msg[ALL_MSG_SN_IDX] = frame_seq_nb;
-        dwt_writetxdata(sizeof(tx_poll_msg), tx_poll_msg, 0);
-        dwt_writetxfctrl(sizeof(tx_poll_msg) + FCS_LEN, 0, 1);
-        /* RESPONSE_EXPECTED: RX is enabled automatically after poll TX. */
-        dwt_starttx(DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED);
-        frame_seq_nb++;
-
-        /* 20 ms kernel fallback: comfortably covers the ~3 ms exchange at this PHY. */
-        irq_evt_t evt = wait_event(K_MSEC(20));
-
-        if (evt == EVT_RXFCG) {
-            uint16_t flen = dwt_getframelength();
-
-            if (flen <= RX_BUF_LEN) {
-                dwt_readrxdata(rx_buf, flen, 0);
+        uint32_t ref_mm;
+        if (cal_take_request(&ref_mm)) {
+            run_calibration(ref_mm);
+            ranging = cal_is_valid();
+            if (ranging) {
+                uint16_t tx, rx;
+                cal_get_ant_dly(&tx, &rx);
+                dwt_settxantennadelay(tx);
+                dwt_setrxantennadelay(rx);
             }
-            rx_buf[ALL_MSG_SN_IDX] = 0;
+        }
 
-            if (memcmp(rx_buf, rx_resp_msg, ALL_MSG_COMMON_LEN) == 0) {
-                uint32_t poll_tx_ts = dwt_readtxtimestamplo32();
-                uint32_t resp_rx_ts = dwt_readrxtimestamplo32();
+        if (!ranging) {
+            cal_wait_request();   /* block until a cal command arrives */
+            continue;
+        }
 
-                double clock_offset_ratio =
-                    ((double)dwt_readclockoffset()) / (uint32_t)(1 << 26);
-
-                uint32_t poll_rx_ts = get_ts_4b(&rx_buf[RESP_MSG_POLL_RX_TS_IDX]);
-                uint32_t resp_tx_ts = get_ts_4b(&rx_buf[RESP_MSG_RESP_TX_TS_IDX]);
-
-                int32_t rtd_init = (int32_t)(resp_rx_ts - poll_tx_ts);
-                int32_t rtd_resp = (int32_t)(resp_tx_ts - poll_rx_ts);
-
-                double tof = ((rtd_init - rtd_resp * (1 - clock_offset_ratio)) / 2.0)
-                             * DWT_TIME_UNITS;
-                double distance = tof * SPEED_OF_LIGHT;
-
-                /* Format "D:x.xxm" with integer math to avoid depending on
-                 * floating-point printf support (not enabled in this build). */
-                int cm = (int)(distance * 100.0);
-                const char *sign = (cm < 0) ? "-" : "";
-
-                if (cm < 0) {
-                    cm = -cm;
-                }
-                twr_log("D:%s%d.%02dm\n", sign, cm / 100, cm % 100);
-
-            } else {
-                dwt_writesysstatuslo(DWT_INT_RXFCG_BIT_MASK);
-                /* unexpected frame: stay quiet, just retry next cycle */
+        int32_t mm;
+        if (do_one_range(&mm)) {
+            int32_t v = mm;
+            const char *sign = (v < 0) ? "-" : "";
+            if (v < 0) {
+                v = -v;
             }
-
-        } else {
-            /* Timeout or RX error — clear residual status and retry. */
-            dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+            twr_log("D:%s%d.%02dm\n", sign, v / 1000, (v % 1000) / 10);
         }
 
         uint32_t wait_ms = ss_moving ? RNG_FAST_MS : RNG_SLOW_MS;
