@@ -7,7 +7,7 @@
  * temperature. These values can be calibrated prior to taking reference measurements. */
 dwt_txconfig_t txconfig_options = {
     0x34,       /* PG delay. */
-    0xfdfdfdfd, /* TX power. */
+    0xffffffff,/* TX power. */
     0x0         /*PG count*/
 };
 
@@ -160,7 +160,7 @@ dwt_config_t config_options = {
 dwt_config_t config_options = {
     5,                  /* Channel number. */
     DWT_PLEN_1024,      /* Preamble length. Used in TX only. */
-    DWT_PAC8,           /* Preamble acquisition chunk size. Used in RX only. */
+    DWT_PAC32,           /* Preamble acquisition chunk size. Used in RX only. */
     9,                  /* TX preamble code. Used in TX only. */
     9,                  /* RX preamble code. Used in RX only. */
     3,                  /* 0 to use standard 8 symbol SFD, 1 to use non-standard 8 symbol, 2 for non-standard 16 symbol SFD and 3 for 4z 8 symbol SDF type */
