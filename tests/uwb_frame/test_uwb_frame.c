@@ -154,6 +154,34 @@ static void test_multipoll(void)
     CHECK(uwb_frame_multipoll_build(buf, sizeof(buf), 0x1234, NULL, 4, 0) == -EINVAL);
 }
 
+static void test_corruption(void)
+{
+    uint8_t buf[32];
+    int n = uwb_frame_response_build(buf, sizeof(buf), 0x4583, 0x1234, 0, 0, 0);
+    CHECK(n == UWB_FRAME_LEN_RESP);
+
+    /* Wrong frame-control. */
+    uint8_t b1[32]; memcpy(b1, buf, n); b1[0] = 0x00;
+    CHECK(!uwb_frame_is_valid(b1, n));
+
+    /* Wrong PANID. */
+    uint8_t b2[32]; memcpy(b2, buf, n); b2[3] = 0xBE;
+    CHECK(!uwb_frame_is_valid(b2, n));
+
+    /* Truncated below header length. */
+    CHECK(!uwb_frame_is_valid(buf, 9));
+
+    /* Oversized beyond max frame length. */
+    CHECK(!uwb_frame_is_valid(buf, UWB_FRAME_MAX_LEN + 1));
+
+    /* Right shape, wrong type for the specific predicate. */
+    CHECK(!uwb_frame_is_multipoll(buf, n));   /* it's a RESP */
+    CHECK(!uwb_frame_is_discovery(buf, n));
+
+    /* Response too short for its own fields is rejected by is_response. */
+    CHECK(!uwb_frame_is_response(buf, UWB_FRAME_LEN_RESP - 1));
+}
+
 int main(void)
 {
     test_scaffold();
@@ -161,6 +189,7 @@ int main(void)
     test_discovery();
     test_response();
     test_multipoll();
+    test_corruption();
     if (g_fail) { printf("%d CHECK(s) FAILED\n", g_fail); return 1; }
     printf("ALL TESTS PASSED\n");
     return 0;
