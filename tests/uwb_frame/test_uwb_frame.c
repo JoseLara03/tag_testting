@@ -102,12 +102,65 @@ static void test_response(void)
     CHECK(uwb_frame_response_build(buf, 10, 0x4583, 0x1234, 0, 0, 0) == -EMSGSIZE);
 }
 
+static void test_multipoll(void)
+{
+    struct uwb_anchor_slot slots[4] = {
+        { 0x4583, 1000 }, { 0xA381, 1500 }, { 0x7F21, 2000 }, { 0x2048, 2500 }
+    };
+    uint8_t buf[40];
+
+    /* 4-anchor case: exact layout, length 31. */
+    int n = uwb_frame_multipoll_build(buf, sizeof(buf), 0x1234, slots, 4, 0x09ABCDEF);
+    CHECK(n == 31);
+    CHECK(n == UWB_FRAME_LEN_MPOL(4));
+    uint8_t expect[31] = {
+        0x41, 0x88, 0x00, 0xCA, 0xDE,
+        0xFF, 0xFF,                 /* dest broadcast */
+        0x34, 0x12,                 /* src 0x1234 */
+        UWB_FRAME_TYPE_MPOL,        /* 0xE3 */
+        0x04,                       /* num_anchors */
+        0x83, 0x45, 0xE8, 0x03,     /* slot0: 0x4583, 1000 (0x03E8) */
+        0x81, 0xA3, 0xDC, 0x05,     /* slot1: 0xA381, 1500 (0x05DC) */
+        0x21, 0x7F, 0xD0, 0x07,     /* slot2: 0x7F21, 2000 (0x07D0) */
+        0x48, 0x20, 0xC4, 0x09,     /* slot3: 0x2048, 2500 (0x09C4) */
+        0xEF, 0xCD, 0xAB, 0x09      /* tx_ts 0x09ABCDEF LE, at offset 27 */
+    };
+    CHECK(memcmp(buf, expect, 31) == 0);
+    CHECK(uwb_frame_is_multipoll(buf, n));
+
+    /* Round-trip for every anchor count 1..4 (verifies packed tx_ts offset). */
+    for (uint8_t k = 1; k <= 4; k++) {
+        uint8_t b[40];
+        int m = uwb_frame_multipoll_build(b, sizeof(b), 0x1234, slots, k, 0x09ABCDEF);
+        CHECK(m == 15 + 4 * k);
+
+        struct uwb_anchor_slot out[4];
+        uint8_t num = 0; uint32_t ts = 0;
+        CHECK(uwb_frame_parse_multipoll(b, m, out, &num, &ts) == 0);
+        CHECK(num == k);
+        CHECK(ts == 0x09ABCDEF);
+        for (uint8_t i = 0; i < k; i++) {
+            CHECK(out[i].addr == slots[i].addr);
+            CHECK(out[i].delay_us == slots[i].delay_us);
+        }
+    }
+
+    /* Illegal anchor counts. */
+    CHECK(uwb_frame_multipoll_build(buf, sizeof(buf), 0x1234, slots, 0, 0) == -EINVAL);
+    CHECK(uwb_frame_multipoll_build(buf, sizeof(buf), 0x1234, slots, 5, 0) == -EINVAL);
+    /* Buffer too small for 4 slots. */
+    CHECK(uwb_frame_multipoll_build(buf, 20, 0x1234, slots, 4, 0) == -EMSGSIZE);
+    /* Null slots. */
+    CHECK(uwb_frame_multipoll_build(buf, sizeof(buf), 0x1234, NULL, 4, 0) == -EINVAL);
+}
+
 int main(void)
 {
     test_scaffold();
     test_utilities();
     test_discovery();
     test_response();
+    test_multipoll();
     if (g_fail) { printf("%d CHECK(s) FAILED\n", g_fail); return 1; }
     printf("ALL TESTS PASSED\n");
     return 0;

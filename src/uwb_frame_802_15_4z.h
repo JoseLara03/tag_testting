@@ -19,6 +19,9 @@
 #define UWB_FRAME_LEN_RESP    20
 #define UWB_FRAME_MAX_LEN     31  /* 4-anchor multi-poll, excl. FCS */
 
+/* Multi-poll is variable length: header(10) + num(1) + n*(addr2+delay2) + ts(4). */
+#define UWB_FRAME_LEN_MPOL(n)  (15 + 4 * (n))
+
 struct uwb_anchor_slot {
     uint16_t addr;      /* anchor short address */
     uint16_t delay_us;  /* staggered response delay, microseconds */

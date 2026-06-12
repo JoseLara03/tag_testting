@@ -22,12 +22,6 @@
 #define OFF_MPOL_SLOTS 11
 
 /* ---- Little-endian field helpers ---- */
-static void put_u16(uint8_t *p, uint16_t v) __attribute__((unused));
-static void put_u32(uint8_t *p, uint32_t v) __attribute__((unused));
-static uint16_t get_u16(const uint8_t *p) __attribute__((unused));
-static uint32_t get_u32(const uint8_t *p) __attribute__((unused));
-static void write_hdr(uint8_t *buf, uint16_t dest, uint16_t src, uint8_t type) __attribute__((unused));
-
 static void put_u16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
 static void put_u32(uint8_t *p, uint32_t v) {
     p[0] = (uint8_t)v;  p[1] = (uint8_t)(v >> 8);
@@ -53,7 +47,7 @@ static void write_hdr(uint8_t *buf, uint16_t dest, uint16_t src, uint8_t type)
     buf[OFF_TYPE] = type;
 }
 
-/* ---- Builders (STUBS) ---- */
+/* ---- Builders ---- */
 int uwb_frame_discovery_build(uint8_t *buf, size_t buf_len,
                               uint16_t src_addr, uint32_t tx_ts)
 {
@@ -71,7 +65,28 @@ int uwb_frame_discovery_build(uint8_t *buf, size_t buf_len,
 int uwb_frame_multipoll_build(uint8_t *buf, size_t buf_len, uint16_t src_addr,
                               const struct uwb_anchor_slot *slots,
                               uint8_t num_slots, uint32_t tx_ts)
-{ (void)buf; (void)buf_len; (void)src_addr; (void)slots; (void)num_slots; (void)tx_ts; return -EINVAL; }
+{
+    if (!buf || !slots) {
+        return -EINVAL;
+    }
+    if (num_slots == 0 || num_slots > UWB_FRAME_MAX_ANCHORS) {
+        return -EINVAL;
+    }
+    size_t need = 15u + 4u * (size_t)num_slots;
+    if (buf_len < need) {
+        return -EMSGSIZE;
+    }
+    write_hdr(buf, UWB_FRAME_ADDR_BCAST, src_addr, UWB_FRAME_TYPE_MPOL);
+    buf[OFF_MPOL_NUM] = num_slots;
+    size_t o = OFF_MPOL_SLOTS;
+    for (uint8_t i = 0; i < num_slots; i++) {
+        put_u16(&buf[o], slots[i].addr);
+        put_u16(&buf[o + 2], slots[i].delay_us);
+        o += 4;
+    }
+    put_u32(&buf[o], tx_ts);
+    return (int)need;
+}
 
 int uwb_frame_response_build(uint8_t *buf, size_t buf_len, uint16_t src_addr,
                              uint16_t dest_addr, uint32_t tx_ts,
@@ -90,7 +105,7 @@ int uwb_frame_response_build(uint8_t *buf, size_t buf_len, uint16_t src_addr,
     return UWB_FRAME_LEN_RESP;
 }
 
-/* ---- Parsers (STUBS) ---- */
+/* ---- Parsers ---- */
 int uwb_frame_parse_discovery_response(const uint8_t *buf, size_t len,
                                        uint16_t *src_addr, int32_t *cir_power,
                                        uint16_t *cir_quality)
@@ -110,7 +125,24 @@ int uwb_frame_parse_discovery_response(const uint8_t *buf, size_t len,
 int uwb_frame_parse_multipoll(const uint8_t *buf, size_t len,
                               struct uwb_anchor_slot *slots_out,
                               uint8_t *num_slots, uint32_t *tx_ts)
-{ (void)buf; (void)len; (void)slots_out; (void)num_slots; (void)tx_ts; return -EINVAL; }
+{
+    if (!buf || !slots_out || !num_slots || !tx_ts) {
+        return -EINVAL;
+    }
+    if (!uwb_frame_is_multipoll(buf, len)) {
+        return -EBADMSG;
+    }
+    uint8_t n = buf[OFF_MPOL_NUM];
+    size_t o = OFF_MPOL_SLOTS;
+    for (uint8_t i = 0; i < n; i++) {
+        slots_out[i].addr     = get_u16(&buf[o]);
+        slots_out[i].delay_us = get_u16(&buf[o + 2]);
+        o += 4;
+    }
+    *tx_ts = get_u32(&buf[o]);
+    *num_slots = n;
+    return 0;
+}
 
 /* ---- Validators ---- */
 bool uwb_frame_is_valid(const uint8_t *buf, size_t len)
@@ -137,7 +169,23 @@ bool uwb_frame_is_discovery(const uint8_t *buf, size_t len)
            len >= UWB_FRAME_LEN_DISC;
 }
 
-bool uwb_frame_is_multipoll(const uint8_t *buf, size_t len)  { (void)buf; (void)len; return false; }
+bool uwb_frame_is_multipoll(const uint8_t *buf, size_t len)
+{
+    if (!uwb_frame_is_valid(buf, len)) {
+        return false;
+    }
+    if (buf[OFF_TYPE] != UWB_FRAME_TYPE_MPOL) {
+        return false;
+    }
+    if (len < OFF_MPOL_SLOTS + 1) {   /* must be able to read num_anchors */
+        return false;
+    }
+    uint8_t n = buf[OFF_MPOL_NUM];
+    if (n == 0 || n > UWB_FRAME_MAX_ANCHORS) {
+        return false;
+    }
+    return len >= (size_t)(15u + 4u * n);
+}
 
 bool uwb_frame_is_response(const uint8_t *buf, size_t len)
 {
