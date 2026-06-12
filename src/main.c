@@ -11,6 +11,18 @@
 
 static const struct device *strip = DEVICE_DT_GET(DT_ALIAS(led_strip));
 
+static void on_ble_state(ble_state_t state)
+{
+    struct led_rgb px;
+
+    if (state == BLE_STATE_CONNECTED) {
+        px = (struct led_rgb){.r = 0, .g = 10, .b = 0};   /* green  */
+    } else {
+        px = (struct led_rgb){.r = 0, .g = 0, .b = 10};   /* blue = advertising */
+    }
+    led_strip_update_rgb(strip, &px, 1);
+}
+
 int main(void)
 {
     struct led_rgb pixel;
@@ -24,6 +36,7 @@ int main(void)
         k_sleep(K_FOREVER);
         return 0;
     }
+    ble_log_set_state_cb(on_ble_state);
 
     /* Cyan: initializing DW3000 on SPI1 */
     pixel = (struct led_rgb){.r = 0, .g = 10, .b = 10};
