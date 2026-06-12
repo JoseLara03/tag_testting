@@ -67,7 +67,7 @@ int uwb_init(int max_retries)
 
         dwt_configuretxrf(&txconfig_options);
 
-        dwt_setlnapamode(DWT_LNA_ENABLE /* | DWT_PA_ENABLE */);
+        dwt_setlnapamode(DWT_LNA_ENABLE | DWT_PA_ENABLE);
         // dwt_setlnapamode(DWT_LNA_PA_DISABLE);
         
         return 0;

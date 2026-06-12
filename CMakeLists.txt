@@ -11,6 +11,8 @@ target_sources(app PRIVATE
     src/uwb.c
     src/nfc_tag.c
     src/phy_config.c
+    src/cal_math.c
+    src/cal.c
     src/uwb_ss_initiator.c
     src/motion.c
     src/tag_ui.c

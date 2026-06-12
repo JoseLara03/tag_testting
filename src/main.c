@@ -7,6 +7,7 @@
 #include "uwb_ss_initiator.h"
 #include "motion.h"
 #include "tag_ui.h"
+#include "cal.h"
 
 static const struct device *strip = DEVICE_DT_GET(DT_ALIAS(led_strip));
 
@@ -33,6 +34,11 @@ int main(void)
         pixel = (struct led_rgb){.r = 0, .g = 10, .b = 0};
         led_strip_update_rgb(strip, &pixel, 1);
         ble_log_send("Config OK\n");
+        if (cal_init()) {
+            ble_log_send("CAL loaded\n");
+        } else {
+            ble_log_send("CAL REQUIRED\n");
+        }
         uwb_ss_initiator_start();
         if (motion_init() != 0) {
             ble_log_send("motion init fail\n");

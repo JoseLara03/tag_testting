@@ -39,9 +39,19 @@ BT_CONN_CB_DEFINE(conn_callbacks) = {
     .disconnected = on_disconnected,
 };
 
+static ble_rx_handler_t rx_handler;
+
+void ble_log_set_rx_handler(ble_rx_handler_t handler)
+{
+    rx_handler = handler;
+}
+
 static void nus_received(struct bt_conn *conn, const uint8_t *data, uint16_t len)
 {
-    /* TX-only — ignore incoming data */
+    ARG_UNUSED(conn);
+    if (rx_handler) {
+        rx_handler(data, len);
+    }
 }
 
 static void nus_send_enabled(enum bt_nus_send_status status)

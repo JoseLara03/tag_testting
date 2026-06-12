@@ -2,7 +2,7 @@
 
 **Fecha:** 2026-06-12
 **Estado:** Aprobado (pendiente de plan de implementación)
-**Branch objetivo:** feat/tag-workflow
+**Branch objetivo:** ant_cal (creada desde feat/tag-workflow)
 
 ## 1. Problema y motivación
 
