@@ -4,14 +4,23 @@
 #include "phy_config.h"   /* CONFIG_OPTION */
 
 #include <zephyr/kernel.h>
+#include <zephyr/device.h>
+#include <zephyr/devicetree.h>
 #include <zephyr/fs/nvs.h>
-#include <zephyr/storage/flash_map.h>
 #include <zephyr/drivers/flash.h>
+#include <errno.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 
-#define CAL_NVS_PARTITION   storage_partition
+/* NVS lives in the DTS `storage_partition` (label "storage", 24 KB @ 0x7a000).
+ * We resolve geometry straight from devicetree rather than via the flash_map /
+ * FIXED_PARTITION_ID API: this is an NCS Partition Manager build where PM owns
+ * the whole flash as a single `app` region and the DTS partitions are not
+ * registered with flash_map, so FIXED_PARTITION_ID(storage_partition) does not
+ * exist. The region sits above the (small) application image and is unused by
+ * PM, so it is safe to use for NVS on this single-image bench build. */
+#define CAL_NVS_NODE        DT_NODELABEL(storage_partition)
 #define CAL_NVS_ID          1
 
 static struct nvs_fs fs;
@@ -27,25 +36,25 @@ static volatile bool     cal_req_pending;
 /* ---- NVS bring-up ---------------------------------------------------------- */
 static int nvs_bringup(void)
 {
-    const struct flash_area *fa;
-    int rc = flash_area_open(FIXED_PARTITION_ID(CAL_NVS_PARTITION), &fa);
-    if (rc) {
-        return rc;
+    const struct device *flash_dev =
+        DEVICE_DT_GET(DT_MTD_FROM_FIXED_PARTITION(CAL_NVS_NODE));
+    if (!device_is_ready(flash_dev)) {
+        return -ENODEV;
     }
+
+    off_t  offset = (off_t)DT_REG_ADDR(CAL_NVS_NODE);
+    size_t size   = (size_t)DT_REG_SIZE(CAL_NVS_NODE);
 
     struct flash_pages_info info;
-    rc = flash_get_page_info_by_offs(flash_area_get_device(fa),
-                                     fa->fa_off, &info);
+    int rc = flash_get_page_info_by_offs(flash_dev, offset, &info);
     if (rc) {
-        flash_area_close(fa);
         return rc;
     }
 
-    fs.flash_device = flash_area_get_device(fa);
-    fs.offset       = fa->fa_off;
+    fs.flash_device = flash_dev;
+    fs.offset       = offset;
     fs.sector_size  = info.size;
-    fs.sector_count = (uint16_t)(fa->fa_size / info.size);
-    flash_area_close(fa);
+    fs.sector_count = (uint16_t)(size / info.size);
 
     rc = nvs_mount(&fs);
     if (rc == 0) {
