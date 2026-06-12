@@ -43,6 +43,38 @@ bool cal_record_valid(const struct cal_record *r, uint8_t expected_phy)
     return r->crc32 == cal_crc32(r, CAL_CRC_LEN);
 }
 
+/* Round-to-nearest signed integer division (den must be > 0). */
+static int32_t div_round_pos(int32_t num, int32_t den)
+{
+    if (num >= 0) {
+        return (num + den / 2) / den;
+    }
+    return -(((-num) + den / 2) / den);
+}
+
+uint16_t cal_solve_step(int32_t measured_mm, int32_t ref_mm, uint16_t cur_total_dly)
+{
+    /* err > 0 => measuring too far => increase delay to pull distance down. */
+    int32_t err_mm = measured_mm - ref_mm;
+    int32_t delta_units = div_round_pos(err_mm * 1000, CAL_MM_PER_UNIT_X1000);
+
+    int32_t new_total = (int32_t)cur_total_dly + delta_units;
+
+    if (new_total < 0) {
+        new_total = 0;
+    }
+    if (new_total > (int32_t)CAL_MAX_TOTAL_DLY) {
+        new_total = (int32_t)CAL_MAX_TOTAL_DLY;
+    }
+    return (uint16_t)new_total;
+}
+
+void cal_split_dly(uint16_t total, uint16_t *tx, uint16_t *rx)
+{
+    *tx = total / 2u;
+    *rx = total - *tx;
+}
+
 int cal_math_selftest(void)
 {
     int fails = 0;
@@ -69,6 +101,29 @@ int cal_math_selftest(void)
     /* Corrupt a byte -> CRC must reject. */
     r.tx_ant_dly ^= 0x01;
     if (cal_record_valid(&r, 7)) {
+        fails++;
+    }
+
+    /* Solver: 234 mm too far / 2.34 mm-per-unit = +100 units. */
+    if (cal_solve_step(2234, 2000, 32742) != 32842) {
+        fails++;
+    }
+    /* Solver: 234 mm too short = -100 units. */
+    if (cal_solve_step(1766, 2000, 32742) != 32642) {
+        fails++;
+    }
+    /* Solver clamps at zero (cannot go negative). */
+    if (cal_solve_step(0, 100000, 10) != 0) {
+        fails++;
+    }
+    /* Equal split: even and odd totals. */
+    uint16_t tx, rx;
+    cal_split_dly(32742, &tx, &rx);
+    if (tx != 16371 || rx != 16371) {
+        fails++;
+    }
+    cal_split_dly(33, &tx, &rx);
+    if (tx != 16 || rx != 17) {
         fails++;
     }
 
