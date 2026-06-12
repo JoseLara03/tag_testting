@@ -76,14 +76,36 @@ int uwb_frame_multipoll_build(uint8_t *buf, size_t buf_len, uint16_t src_addr,
 int uwb_frame_response_build(uint8_t *buf, size_t buf_len, uint16_t src_addr,
                              uint16_t dest_addr, uint32_t tx_ts,
                              int32_t cir_power, uint16_t cir_quality)
-{ (void)buf; (void)buf_len; (void)src_addr; (void)dest_addr; (void)tx_ts;
-  (void)cir_power; (void)cir_quality; return -EINVAL; }
+{
+    if (!buf) {
+        return -EINVAL;
+    }
+    if (buf_len < UWB_FRAME_LEN_RESP) {
+        return -EMSGSIZE;
+    }
+    write_hdr(buf, dest_addr, src_addr, UWB_FRAME_TYPE_RESP);
+    put_u32(&buf[OFF_RESP_TS], tx_ts);
+    put_u32(&buf[OFF_RESP_CIRP], (uint32_t)cir_power);
+    put_u16(&buf[OFF_RESP_CIRQ], cir_quality);
+    return UWB_FRAME_LEN_RESP;
+}
 
 /* ---- Parsers (STUBS) ---- */
 int uwb_frame_parse_discovery_response(const uint8_t *buf, size_t len,
                                        uint16_t *src_addr, int32_t *cir_power,
                                        uint16_t *cir_quality)
-{ (void)buf; (void)len; (void)src_addr; (void)cir_power; (void)cir_quality; return -EINVAL; }
+{
+    if (!buf || !src_addr || !cir_power || !cir_quality) {
+        return -EINVAL;
+    }
+    if (!uwb_frame_is_response(buf, len)) {
+        return -EBADMSG;
+    }
+    *src_addr    = get_u16(&buf[OFF_SRC]);
+    *cir_power   = (int32_t)get_u32(&buf[OFF_RESP_CIRP]);
+    *cir_quality = get_u16(&buf[OFF_RESP_CIRQ]);
+    return 0;
+}
 
 int uwb_frame_parse_multipoll(const uint8_t *buf, size_t len,
                               struct uwb_anchor_slot *slots_out,
@@ -116,7 +138,13 @@ bool uwb_frame_is_discovery(const uint8_t *buf, size_t len)
 }
 
 bool uwb_frame_is_multipoll(const uint8_t *buf, size_t len)  { (void)buf; (void)len; return false; }
-bool uwb_frame_is_response(const uint8_t *buf, size_t len)   { (void)buf; (void)len; return false; }
+
+bool uwb_frame_is_response(const uint8_t *buf, size_t len)
+{
+    return uwb_frame_is_valid(buf, len) &&
+           buf[OFF_TYPE] == UWB_FRAME_TYPE_RESP &&
+           len >= UWB_FRAME_LEN_RESP;
+}
 
 /* ---- Utilities ---- */
 uint16_t uwb_frame_get_src_addr(const uint8_t *buf)  { return get_u16(&buf[OFF_SRC]); }

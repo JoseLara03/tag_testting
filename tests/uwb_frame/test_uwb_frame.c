@@ -61,11 +61,53 @@ static void test_discovery(void)
     CHECK(uwb_frame_discovery_build(NULL, sizeof(buf), 0x1234, 0) == -EINVAL);
 }
 
+static void test_response(void)
+{
+    uint8_t buf[32];
+    /* src(anchor)=0x4583, dest(tag)=0x1234, ts=0x11223344,
+     * cir_power=-5000, cir_quality=200. */
+    int n = uwb_frame_response_build(buf, sizeof(buf), 0x4583, 0x1234,
+                                     0x11223344, -5000, 200);
+    CHECK(n == UWB_FRAME_LEN_RESP);
+
+    uint8_t expect[UWB_FRAME_LEN_RESP] = {
+        0x41, 0x88, 0x00, 0xCA, 0xDE,
+        0x34, 0x12,                     /* dest 0x1234 (tag) LE */
+        0x83, 0x45,                     /* src 0x4583 (anchor) LE */
+        UWB_FRAME_TYPE_RESP,            /* 0xE4 */
+        0x44, 0x33, 0x22, 0x11,         /* tx_ts LE */
+        0x78, 0xEC, 0xFF, 0xFF,         /* cir_power -5000 (0xFFFFEC78) LE */
+        0xC8, 0x00                      /* cir_quality 200 LE u16 */
+    };
+    CHECK(memcmp(buf, expect, UWB_FRAME_LEN_RESP) == 0);
+    CHECK(uwb_frame_is_response(buf, n));
+    CHECK(!uwb_frame_is_discovery(buf, n));
+
+    /* Round-trip parse. */
+    uint16_t src; int32_t cirp; uint16_t cirq;
+    CHECK(uwb_frame_parse_discovery_response(buf, n, &src, &cirp, &cirq) == 0);
+    CHECK(src == 0x4583);
+    CHECK(cirp == -5000);
+    CHECK(cirq == 200);
+
+    /* Parser rejects a non-response frame. */
+    uint8_t disc[32];
+    int dn = uwb_frame_discovery_build(disc, sizeof(disc), 0x1234, 0);
+    CHECK(uwb_frame_parse_discovery_response(disc, dn, &src, &cirp, &cirq) == -EBADMSG);
+
+    /* Parser rejects null out-params. */
+    CHECK(uwb_frame_parse_discovery_response(buf, n, NULL, &cirp, &cirq) == -EINVAL);
+
+    /* Builder buffer too small. */
+    CHECK(uwb_frame_response_build(buf, 10, 0x4583, 0x1234, 0, 0, 0) == -EMSGSIZE);
+}
+
 int main(void)
 {
     test_scaffold();
     test_utilities();
     test_discovery();
+    test_response();
     if (g_fail) { printf("%d CHECK(s) FAILED\n", g_fail); return 1; }
     printf("ALL TESTS PASSED\n");
     return 0;
