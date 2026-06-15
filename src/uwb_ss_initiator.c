@@ -65,6 +65,7 @@ static uint8_t rx_resp_msg[] = { 0x41, 0x88, 0, 0xCA, 0xDE, 'V', 'E', 'W', 'A', 
 #define POS_RESP_TX_TS_IDX       15
 #define POS_ANCHOR_X_IDX         19
 #define POS_ANCHOR_Y_IDX         23
+#define POS_RESP_LEN_MIN  (POS_ANCHOR_Y_IDX + (int)sizeof(float) + FCS_LEN)
 
 static uint8_t pos_poll_msg[] = { 0x41, 0x88, 0, 0xCA, 0xDE, 'W', 'A', 'V', 'E', 0xE0, 0 };
 static uint8_t pos_resp_ref[] = { 0x41, 0x88, 0, 0xCA, 0xDE, 'V', 'E', 'W', 'A', 0xE1 };
@@ -256,7 +257,7 @@ static bool do_one_range_anchor(uint8_t aid, float *range_m, float *ax, float *a
     }
 
     uint16_t flen = dwt_getframelength();
-    if (flen > RX_BUF_LEN) {
+    if (flen < POS_RESP_LEN_MIN || flen > RX_BUF_LEN) {
         dwt_writesysstatuslo(DWT_INT_RXFCG_BIT_MASK);
         return false;
     }
