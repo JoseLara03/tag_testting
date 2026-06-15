@@ -376,8 +376,9 @@ static void fmt_coord(char *buf, size_t len, float v)
 {
     /* Reject NaN/Inf/out-of-range (untrusted radio data) before the int cast,
      * which would otherwise be undefined behaviour. The negated range test is
-     * also false for NaN, so NaN is caught too. */
-    if (!(v > -100000.0f && v < 100000.0f)) {
+     * also false for NaN, so NaN is caught too. The +/-9999.99 m bound also
+     * caps each coordinate at 7 chars so "P:x.xx,y.yy\n" always fits TWR_MSG_LEN. */
+    if (!(v > -10000.0f && v < 10000.0f)) {
         v = 0.0f;
     }
 
