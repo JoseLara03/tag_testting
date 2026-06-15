@@ -32,8 +32,8 @@
 #define POLL_TX_TO_RESP_RX_DLY_UUS  1000U   /* RX turns on this long after poll TX */
 #define RESP_RX_TIMEOUT_UUS         2000U   /* covers full response frame air time */
 #define PRE_TIMEOUT                  128U
-#define RNG_FAST_MS                 1000U   /* cadence while moving */
-#define RNG_SLOW_MS                 5000U   /* cadence after ~5 s of no motion */
+#define RNG_FAST_MS                 200U   /* cadence while moving */
+#define RNG_SLOW_MS                 1000U   /* cadence after ~5 s of no motion */
 
 /* Calibration procedure parameters. */
 #define CAL_SAMPLES_PER_ITER  100U   /* ranges averaged per iteration */
