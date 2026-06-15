@@ -18,6 +18,7 @@
 #include "phy_config.h"
 #include "cal.h"
 #include "cal_math.h"
+#include "pos_solver.h"
 
 #include <zephyr/kernel.h>
 #include <string.h>
@@ -49,10 +50,24 @@
 #define ALL_MSG_SN_IDX            2
 #define RESP_MSG_POLL_RX_TS_IDX  10
 #define RESP_MSG_RESP_TX_TS_IDX  14
-#define RX_BUF_LEN               20
+#define RX_BUF_LEN               32
 
 static uint8_t tx_poll_msg[] = { 0x41, 0x88, 0, 0xCA, 0xDE, 'W', 'A', 'V', 'E', 0xE0 };
 static uint8_t rx_resp_msg[] = { 0x41, 0x88, 0, 0xCA, 0xDE, 'V', 'E', 'W', 'A', 0xE1 };
+
+/* ---- Positioning frames (addressed; anchor self-reports its (x,y)) --------
+ * Poll : [hdr 0..9][anchor_id @10]
+ * Resp : [hdr 0..9][anchor_id @10][poll_rx_ts @11..14][resp_tx_ts @15..18]
+ *        [x f32 @19..22][y f32 @23..26]
+ * Distinct from the non-addressed calibration frames above. */
+#define POS_ANCHOR_ID_IDX        10
+#define POS_POLL_RX_TS_IDX       11
+#define POS_RESP_TX_TS_IDX       15
+#define POS_ANCHOR_X_IDX         19
+#define POS_ANCHOR_Y_IDX         23
+
+static uint8_t pos_poll_msg[] = { 0x41, 0x88, 0, 0xCA, 0xDE, 'W', 'A', 'V', 'E', 0xE0, 0 };
+static uint8_t pos_resp_ref[] = { 0x41, 0x88, 0, 0xCA, 0xDE, 'V', 'E', 'W', 'A', 0xE1 };
 
 static uint8_t  frame_seq_nb;
 static uint8_t  rx_buf[RX_BUF_LEN];
@@ -212,6 +227,66 @@ static bool do_one_range(int32_t *out_mm)
     double tof = ((rtd_init - rtd_resp * (1 - clock_offset_ratio)) / 2.0)
                  * DWT_TIME_UNITS;
     *out_mm = (int32_t)(tof * SPEED_OF_LIGHT * 1000.0);
+    return true;
+}
+
+/*
+ * Run a single addressed SS-TWR exchange against anchor `aid`. On a valid,
+ * id-matched response, writes the range in metres to *range_m and the anchor's
+ * self-reported coordinates to *ax/*ay, then returns true. Returns false on
+ * timeout, RX error, wrong magic, or an anchor_id mismatch. Relies on the
+ * rx-after-tx delay / timeout / antenna delay configured by ss_twr_fn.
+ */
+static bool do_one_range_anchor(uint8_t aid, float *range_m, float *ax, float *ay)
+{
+    dwt_setinterrupt(INT_RX_PHASE, 0, DWT_ENABLE_INT_ONLY);
+
+    pos_poll_msg[ALL_MSG_SN_IDX]    = frame_seq_nb;
+    pos_poll_msg[POS_ANCHOR_ID_IDX] = aid;
+    dwt_writetxdata(sizeof(pos_poll_msg), pos_poll_msg, 0);
+    dwt_writetxfctrl(sizeof(pos_poll_msg) + FCS_LEN, 0, 1);
+    dwt_starttx(DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED);
+    frame_seq_nb++;
+
+    irq_evt_t evt = wait_event(K_MSEC(20));
+
+    if (evt != EVT_RXFCG) {
+        dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+        return false;
+    }
+
+    uint16_t flen = dwt_getframelength();
+    if (flen > RX_BUF_LEN) {
+        dwt_writesysstatuslo(DWT_INT_RXFCG_BIT_MASK);
+        return false;
+    }
+    dwt_readrxdata(rx_buf, flen, 0);
+    dwt_writesysstatuslo(DWT_INT_RXFCG_BIT_MASK);
+
+    rx_buf[ALL_MSG_SN_IDX] = 0;
+    if (memcmp(rx_buf, pos_resp_ref, ALL_MSG_COMMON_LEN) != 0) {
+        return false;
+    }
+    if (rx_buf[POS_ANCHOR_ID_IDX] != aid) {
+        return false;   /* response from a different anchor */
+    }
+
+    uint32_t poll_tx_ts = dwt_readtxtimestamplo32();
+    uint32_t resp_rx_ts = dwt_readrxtimestamplo32();
+    double clock_offset_ratio =
+        ((double)dwt_readclockoffset()) / (uint32_t)(1 << 26);
+    uint32_t poll_rx_ts = get_ts_4b(&rx_buf[POS_POLL_RX_TS_IDX]);
+    uint32_t resp_tx_ts = get_ts_4b(&rx_buf[POS_RESP_TX_TS_IDX]);
+
+    int32_t rtd_init = (int32_t)(resp_rx_ts - poll_tx_ts);
+    int32_t rtd_resp = (int32_t)(resp_tx_ts - poll_rx_ts);
+
+    double tof = ((rtd_init - rtd_resp * (1 - clock_offset_ratio)) / 2.0)
+                 * DWT_TIME_UNITS;
+    *range_m = (float)(tof * SPEED_OF_LIGHT);
+
+    memcpy(ax, &rx_buf[POS_ANCHOR_X_IDX], sizeof(float));
+    memcpy(ay, &rx_buf[POS_ANCHOR_Y_IDX], sizeof(float));
     return true;
 }
 
