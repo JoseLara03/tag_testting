@@ -374,6 +374,13 @@ static void run_calibration(uint32_t ref_mm)
  * without relying on %f. */
 static void fmt_coord(char *buf, size_t len, float v)
 {
+    /* Reject NaN/Inf/out-of-range (untrusted radio data) before the int cast,
+     * which would otherwise be undefined behaviour. The negated range test is
+     * also false for NaN, so NaN is caught too. */
+    if (!(v > -100000.0f && v < 100000.0f)) {
+        v = 0.0f;
+    }
+
     int cm = (int)(v * 100.0f);     /* truncates toward zero */
     const char *sign = (cm < 0) ? "-" : "";
 
@@ -437,6 +444,8 @@ static void ss_twr_fn(void *p1, void *p2, void *p3)
             continue;
         }
 
+        uint32_t cycle_start = k_uptime_get_32();
+
         struct pos_meas meas[POS_NUM_ANCHORS];
         size_t n = 0;
 
@@ -448,7 +457,9 @@ static void ss_twr_fn(void *p1, void *p2, void *p3)
                 meas[n].range_m = r;
                 n++;
             }
-            k_sleep(K_MSEC(INTER_ANCHOR_DELAY_MS));
+            if (i + 1 < POS_NUM_ANCHORS) {
+                k_sleep(K_MSEC(INTER_ANCHOR_DELAY_MS));
+            }
         }
 
         struct pos_result pos;
@@ -456,8 +467,14 @@ static void ss_twr_fn(void *p1, void *p2, void *p3)
             position_publish(pos.x, pos.y);
         }
 
+        /* Hold the configured cadence as a true period: subtract the time the
+         * ranging cycle itself took. If the cycle already overran the period,
+         * skip the wait and start the next one immediately. */
         uint32_t wait_ms = ss_moving ? RNG_FAST_MS : RNG_SLOW_MS;
-        k_sem_take(&range_tick, K_MSEC(wait_ms));
+        uint32_t elapsed = k_uptime_get_32() - cycle_start;
+        if (elapsed < wait_ms) {
+            k_sem_take(&range_tick, K_MSEC(wait_ms - elapsed));
+        }
     }
 }
 
