@@ -140,9 +140,16 @@ exists).
 Add for CMSIS-DSP matrix math on the FPU:
 ```
 CONFIG_FPU=y
+CONFIG_FP_SOFTABI=y      # NOT hard-ABI: the precompiled DW3000 lib is soft-float
 CONFIG_CMSIS_DSP=y
-CONFIG_CMSIS_DSP_MATRICES=y
+CONFIG_CMSIS_DSP_MATRIX=y
 ```
+**ABI gotcha:** `CONFIG_FPU=y` defaults to `FP_HARDABI`, which makes the image
+"use VFP register arguments" and fails to link against the soft-float
+precompiled `libdwt_uwb_driver-m4-sfp`. `CONFIG_FP_SOFTABI=y` keeps FPU
+instructions but uses the soft-float calling convention, restoring link
+compatibility. The matrix Kconfig is `CMSIS_DSP_MATRIX` (singular), not
+`CMSIS_DSP_MATRICES`.
 
 ## Testing & success criteria
 

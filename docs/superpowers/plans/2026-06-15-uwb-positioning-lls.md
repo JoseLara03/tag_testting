@@ -37,9 +37,15 @@ Append to `prj.conf`:
 
 ```
 CONFIG_FPU=y
+CONFIG_FP_SOFTABI=y
 CONFIG_CMSIS_DSP=y
-CONFIG_CMSIS_DSP_MATRICES=y
+CONFIG_CMSIS_DSP_MATRIX=y
 ```
+
+`CONFIG_FP_SOFTABI=y` is required: `CONFIG_FPU=y` alone defaults to `FP_HARDABI`,
+which makes the image use VFP register arguments and fails to link against the
+soft-float precompiled DW3000 driver (`libdwt_uwb_driver-m4-sfp`). The matrix
+option is `CMSIS_DSP_MATRIX` (singular), not `CMSIS_DSP_MATRICES`.
 
 - [ ] **Step 2: Verify (build)**
 

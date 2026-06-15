@@ -242,7 +242,7 @@ static bool do_one_range(int32_t *out_mm)
 /*
  * Run a single addressed SS-TWR exchange against anchor `aid`. On a valid,
  * id-matched response, writes the range in metres to *range_m and the anchor's
- * self-reported coordinates to *ax/*ay, then returns true. Returns false on
+ * self-reported coordinates to *ax and *ay, then returns true. Returns false on
  * timeout, RX error, wrong magic, or an anchor_id mismatch. Relies on the
  * rx-after-tx delay / timeout / antenna delay configured by ss_twr_fn.
  */
@@ -398,7 +398,7 @@ static void fmt_coord(char *buf, size_t len, float v)
  */
 static void position_publish(float x, float y)
 {
-    char xs[12], ys[12];
+    char xs[16], ys[16];
 
     fmt_coord(xs, sizeof(xs), x);
     fmt_coord(ys, sizeof(ys), y);
