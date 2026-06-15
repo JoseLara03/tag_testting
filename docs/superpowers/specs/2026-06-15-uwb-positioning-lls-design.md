@@ -1,0 +1,131 @@
+# 2D Tag Positioning via Multi-Anchor SS-TWR + Linear Least Squares
+
+**Date:** 2026-06-15
+**Branch:** `feat/uwb-positioning-lls` (off `feat/tag-workflow`)
+**Status:** Approved design
+
+## Goal
+
+Compute the tag's 2D position by ranging to up to 4 self-describing anchors with
+SS-TWR, then solving a linear least-squares (LLS) trilateration. When a position
+is valid (≥3 anchors measured), queue it for transmission over BLE. The output
+queue is structured so a future UWB-to-master sender can replace the BLE sender
+without reworking the ranging/solver path.
+
+## Locked decisions
+
+- **Addressing:** add an `anchor_id` byte to the SS poll/response frames; anchors
+  reply only when addressed (mirrors the DS-TWR reference).
+- **Solver:** 2D `(x, y)` linear least squares; requires ≥3 anchors. `z` assumed
+  fixed/known (single floor).
+- **Anchor coordinates:** self-describing — each anchor reports its own `(x, y)`
+  inside its SS response payload. No coordinate table on the tag.
+- **Anchor list:** static compile-time array of anchor IDs (≤4).
+- **Output:** BLE now (`P:x.xx,y.yy\n`), structured for UWB-to-master later. Do
+  not build UWB TX in this work (YAGNI).
+- **Units:** `float32` metres for anchor coordinates and solved position; ranges
+  converted to metres for the solver.
+- **Cadence:** unchanged — 0.2 s moving / 1 s static, driven by `uwb_set_moving()`.
+
+## Components
+
+| Unit | Responsibility | Deps | Tested |
+|---|---|---|---|
+| `pos_solver.c/.h` (new) | Pure 2D LLS trilateration. In: array of `{x,y,range}` + count. Out: `{x,y,valid}`. | none | host test `tests/pos_solver/test_pos_solver.c` |
+| `uwb_ss_initiator.c` (modified) | Anchor-addressed SS exchange, parse anchor self-coords, per-cycle multi-anchor loop → solver → publish. | DW3000, `pos_solver` | on-hardware |
+| `position_publish()` (in initiator) | Format `P:x.xx,y.yy\n` → existing `ss_twr_msgq` → BLE sender thread. Single swap point for future UWB-to-master TX. | `ble_log` | — |
+
+`pos_solver` is isolated because it is the one piece with provable correctness:
+pure math, host-testable, no radio. It mirrors the existing `cal_math` module
+and its `tests/cal_math/` host runner.
+
+## Frame contract (anchor responder firmware must match)
+
+Anchor-side firmware is updated separately to honor this contract; it is outside
+the tag-firmware scope of this work, but the layout below is the spec for it.
+
+**Poll** (tag → anchor), `WAVE` magic + anchor_id:
+```
+[hdr 0..9][anchor_id @10]                                       = 11 B (+FCS)
+```
+
+**Response** (anchor → tag), `VEWA` magic, self-describing:
+```
+[hdr 0..9][anchor_id @10][poll_rx_ts @11..14][resp_tx_ts @15..18]
+         [x f32 @19..22][y f32 @23..26]                         = 27 B (+FCS)
+```
+
+Tag-side changes:
+- `RX_BUF_LEN` 20 → 32.
+- Response field indices shift: `poll_rx_ts` 10→11, `resp_tx_ts` 14→15; add
+  `x @19`, `y @23`.
+- Validate `rx_buf[10] == polled aid`; reject a reply from any other anchor.
+
+## LLS math (`pos_solver`)
+
+Circle equations `(x−xᵢ)² + (y−yᵢ)² = rᵢ²`, linearized by subtracting a reference
+anchor `k` (the first successful anchor of the cycle):
+```
+A_i = [ 2(x_k − x_i),  2(y_k − y_i) ]
+b_i = (r_i² − r_k²) + (x_k² + y_k² − x_i² − y_i²)
+```
+Solve `p = [x, y]` via the normal equations `p = (AᵀA)⁻¹ Aᵀ b`. `AᵀA` is 2×2, so
+its inverse is closed-form. Return `valid = false` when fewer than 3 anchors are
+supplied or `det(AᵀA) ≈ 0` (collinear / degenerate geometry).
+
+## Data flow per ranging cycle
+
+In the existing `ss_twr_fn` loop, after the calibration gate:
+```
+n = 0
+for aid in ANCHOR_IDS[]:                      // static, ≤4
+    if do_one_range(aid, &range_m, &ax, &ay): // SS exchange + parse self-coords
+        meas[n++] = { ax, ay, range_m }
+    sleep(INTER_ANCHOR_DELAY_MS)
+if n >= 3 and pos_solve(meas, n, &pos):       // LLS
+    position_publish(pos.x, pos.y)            // → BLE queue
+k_sem_take(&range_tick, moving ? 200ms : 1000ms)   // cadence unchanged
+```
+
+`do_one_range` gains parameters `(uint8_t aid, float *range_m, float *ax,
+float *ay)`: it writes `aid` into the poll, validates the echoed `aid`, and
+parses the anchor's `(x, y)` from the response. Distance is computed as today,
+then converted to metres.
+
+## Calibration interaction
+
+Ranging stays gated on `cal_is_valid()` (`CAL REQUIRED` until a valid record
+exists). Calibration ranges against a fixed `CAL_ANCHOR_ID` (the first ID in the
+static list); the iterative auto-solve logic is otherwise unchanged. The anchor
+coordinates returned during calibration are ignored.
+
+## What stays the same
+
+- Cal gating, NVS calibration workflow, IRQ-driven `wait_event`.
+- The BLE sender thread and `ss_twr_msgq`.
+- Motion-driven cadence (`uwb_set_moving`, `range_tick`).
+- No new threads.
+
+## Output / logging
+
+- Position only: `P:x.xx,y.yy\n` (fits the 20-byte NUS limit; signed values
+  handled like the existing `D:` formatter).
+- Per-anchor `D:` distance logs are dropped. (Can be retained behind a debug
+  flag if desired — not part of this scope.)
+
+## Testing & success criteria
+
+- `pos_solver`: host C test (`tests/pos_solver/test_pos_solver.c`, WinLibs gcc)
+  with vectors covering: exact 3-anchor solution, 4-anchor overdetermined fit
+  with noise, collinear/degenerate → `valid=false`, <3 anchors → `valid=false`.
+  Self-test passes (`SELFTEST 0`-style convention as in `cal_math`).
+- On-hardware: with ≥3 anchors flashed to the new responder contract, the tag
+  emits `P:` positions at the correct cadence; with <3 anchors responding, no
+  position is published.
+
+## Out of scope
+
+- UWB-to-master position TX (frame + responder) — future work behind the
+  `position_publish()` seam.
+- Runtime/NVS-configurable anchor list or anchor coordinates.
+- 3D positioning.
