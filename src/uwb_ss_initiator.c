@@ -36,6 +36,14 @@
 #define RNG_FAST_MS                 200U   /* cadence while moving */
 #define RNG_SLOW_MS                 1000U   /* cadence after ~5 s of no motion */
 
+/* Anchors to range each cycle (static; <=4). Positioning needs >=3 of these
+ * to respond in a cycle to produce a fix. Edit and rebuild to change the set. */
+static const uint8_t ANCHOR_IDS[] = { 1, 2, 3, 4 };
+#define POS_NUM_ANCHORS  ARRAY_SIZE(ANCHOR_IDS)
+
+/* Settle time between anchors within one cycle (radio turnaround margin). */
+#define INTER_ANCHOR_DELAY_MS  10U
+
 /* Calibration procedure parameters. */
 #define CAL_SAMPLES_PER_ITER  100U   /* ranges averaged per iteration */
 #define CAL_MAX_ITERS         4U     /* give up after this many corrections */
@@ -362,6 +370,33 @@ static void run_calibration(uint32_t ref_mm)
     twr_log("CAL FAIL res\n");
 }
 
+/* Format a metre value as a signed "x.xx" string (centimetre resolution),
+ * without relying on %f. */
+static void fmt_coord(char *buf, size_t len, float v)
+{
+    int cm = (int)(v * 100.0f);     /* truncates toward zero */
+    const char *sign = (cm < 0) ? "-" : "";
+
+    if (cm < 0) {
+        cm = -cm;
+    }
+    snprintf(buf, len, "%s%d.%02d", sign, cm / 100, cm % 100);
+}
+
+/*
+ * Single output seam for a solved position. Today: format "P:x.xx,y.yy\n"
+ * (<=20 bytes for the NUS limit) and enqueue to the BLE sender. A future
+ * UWB-to-master sender replaces only this function body.
+ */
+static void position_publish(float x, float y)
+{
+    char xs[12], ys[12];
+
+    fmt_coord(xs, sizeof(xs), x);
+    fmt_coord(ys, sizeof(ys), y);
+    twr_log("P:%s,%s\n", xs, ys);
+}
+
 static void ss_twr_fn(void *p1, void *p2, void *p3)
 {
     ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
@@ -402,14 +437,23 @@ static void ss_twr_fn(void *p1, void *p2, void *p3)
             continue;
         }
 
-        int32_t mm;
-        if (do_one_range(&mm)) {
-            int32_t v = mm;
-            const char *sign = (v < 0) ? "-" : "";
-            if (v < 0) {
-                v = -v;
+        struct pos_meas meas[POS_NUM_ANCHORS];
+        size_t n = 0;
+
+        for (size_t i = 0; i < POS_NUM_ANCHORS; i++) {
+            float r, ax, ay;
+            if (do_one_range_anchor(ANCHOR_IDS[i], &r, &ax, &ay)) {
+                meas[n].x = ax;
+                meas[n].y = ay;
+                meas[n].range_m = r;
+                n++;
             }
-            twr_log("D:%s%d.%02dm\n", sign, v / 1000, (v % 1000) / 10);
+            k_sleep(K_MSEC(INTER_ANCHOR_DELAY_MS));
+        }
+
+        struct pos_result pos;
+        if (n >= 3 && pos_solve(meas, n, &pos)) {
+            position_publish(pos.x, pos.y);
         }
 
         uint32_t wait_ms = ss_moving ? RNG_FAST_MS : RNG_SLOW_MS;
