@@ -2,13 +2,15 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Compute the tag's 2D position by ranging up to 4 self-describing anchors over SS-TWR and solving a linear least-squares trilateration, publishing valid positions (≥3 anchors) over BLE.
+**Goal:** Compute the tag's 2D position by ranging up to 4 self-describing anchors over SS-TWR and solving a CMSIS-DSP linear least-squares trilateration, publishing valid positions (≥3 anchors) over BLE.
 
-**Architecture:** A new pure, host-tested `pos_solver` module does the 2D LLS math. The existing SS-TWR initiator gains an anchor-addressed ranging primitive (`do_one_range_anchor`) and a per-cycle loop that ranges each anchor, feeds `{x,y,range}` to the solver, and publishes the result through a single `position_publish()` seam (BLE today, UWB-to-master later). The hardware-verified calibration path is left untouched.
+**Architecture:** A new `pos_solver` module does the 2D LLS math using CMSIS-DSP (`arm_math.h`) matrix functions on the hardware FPU. The existing SS-TWR initiator gains an anchor-addressed ranging primitive (`do_one_range_anchor`) and a per-cycle loop that ranges each anchor, feeds `{x,y,range}` to the solver, and publishes the result through a single `position_publish()` seam (BLE today, UWB-to-master later). The hardware-verified calibration path is left untouched.
 
-**Tech Stack:** Zephyr RTOS, nRF52833, DW3000 (Decawave driver), C99. Host unit tests built with WinLibs gcc.
+**Tech Stack:** Zephyr RTOS, nRF52833 (Cortex-M4F), DW3000 (Decawave driver), CMSIS-DSP, C99.
 
 **Spec:** `docs/superpowers/specs/2026-06-15-uwb-positioning-lls-design.md`
+
+**Verification note:** Per project convention the user builds/flashes (`west build`) and reports results. The solver depends on CMSIS-DSP (target-only), so there is **no host self-test** — the solver and the radio code are verified together on hardware in Task 4.
 
 ---
 
@@ -16,22 +18,50 @@
 
 | File | Responsibility |
 |---|---|
-| `src/pos_solver.h` (new) | Solver types + `pos_solve()` + `pos_solver_selftest()` declarations |
-| `src/pos_solver.c` (new) | 2D LLS trilateration + built-in self-test vectors |
-| `tests/pos_solver/test_pos_solver.c` (new) | Host runner: calls `pos_solver_selftest()` |
-| `src/uwb_ss_initiator.c` (modify) | Positioning frames, `do_one_range_anchor`, multi-anchor cycle, `position_publish` |
+| `prj.conf` (modify) | Enable FPU + CMSIS-DSP matrix support |
+| `src/pos_solver.h` (new) | Solver types + `pos_solve()` declaration |
+| `src/pos_solver.c` (new) | 2D LLS trilateration via CMSIS-DSP matrices |
 | `CMakeLists.txt` (modify) | Add `src/pos_solver.c` to the build |
-
-Conventions mirror the existing `src/cal_math.c` / `tests/cal_math/test_cal_math.c` pair.
+| `src/uwb_ss_initiator.c` (modify) | Positioning frames, `do_one_range_anchor`, multi-anchor cycle, `position_publish` |
 
 ---
 
-## Task 1: `pos_solver` pure module + host test
+## Task 1: Enable FPU + CMSIS-DSP
+
+**Files:**
+- Modify: `prj.conf`
+
+- [ ] **Step 1: Add the configs**
+
+Append to `prj.conf`:
+
+```
+CONFIG_FPU=y
+CONFIG_CMSIS_DSP=y
+CONFIG_CMSIS_DSP_MATRICES=y
+```
+
+- [ ] **Step 2: Verify (build)**
+
+Ask the user to run `west build`. Expected: clean configure + build (the
+nRF52833 is a Cortex-M4F, so `CONFIG_FPU=y` is valid; CMSIS-DSP is provided by
+the Zephyr module). No new errors.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add prj.conf
+git commit -m "build(pos): enable FPU and CMSIS-DSP matrix support"
+```
+
+---
+
+## Task 2: `pos_solver` module (CMSIS-DSP)
 
 **Files:**
 - Create: `src/pos_solver.h`
-- Create: `tests/pos_solver/test_pos_solver.c`
 - Create: `src/pos_solver.c`
+- Modify: `CMakeLists.txt:6-25` (the `target_sources(app PRIVATE ...)` list)
 
 - [ ] **Step 1: Write the solver header**
 
@@ -43,6 +73,9 @@ Create `src/pos_solver.h`:
 
 #include <stddef.h>
 #include <stdbool.h>
+
+/* Maximum anchors per solve (matches the static anchor list). 2D needs >=3. */
+#define POS_MAX_ANCHORS  4
 
 /* One anchor measurement: anchor position (metres) + measured range (metres). */
 struct pos_meas {
@@ -58,218 +91,94 @@ struct pos_result {
     bool  valid;
 };
 
-/* 2D linear least-squares trilateration.
+/* 2D linear least-squares trilateration (CMSIS-DSP).
  *
  * Linearizes the circle equations by subtracting anchor index 0 (the
- * reference), then solves the 2x2 normal equations. Needs n >= 3. Sets
- * out->valid = false and returns false when n < 3 or the geometry is
- * degenerate (collinear anchors -> singular normal matrix). */
+ * reference), then solves the 2x2 normal equations p = (At*A)^-1 * (At*b).
+ * Needs 3 <= n <= POS_MAX_ANCHORS. Sets out->valid = false and returns false
+ * when n is out of range or the geometry is degenerate (collinear anchors ->
+ * singular normal matrix). */
 bool pos_solve(const struct pos_meas *m, size_t n, struct pos_result *out);
-
-/* Run built-in assertion vectors. Returns the number of failed checks
- * (0 == all pass). */
-int pos_solver_selftest(void);
 
 #endif /* POS_SOLVER_H */
 ```
 
-- [ ] **Step 2: Write the host test runner**
+- [ ] **Step 2: Write the solver implementation**
 
-Create `tests/pos_solver/test_pos_solver.c`:
-
-```c
-#include "../../src/pos_solver.h"
-#include <stdio.h>
-
-int main(void)
-{
-    int fails = pos_solver_selftest();
-    printf("pos_solver_selftest: %d failure(s)\n", fails);
-    return fails == 0 ? 0 : 1;
-}
-```
-
-- [ ] **Step 3: Write the solver with a stub `pos_solve` + real self-test vectors**
-
-Create `src/pos_solver.c`. The self-test vectors below encode the expected
-behaviour; `pos_solve` is a stub for now so the test fails first.
+Create `src/pos_solver.c`:
 
 ```c
 #include "pos_solver.h"
+#include <arm_math.h>
+
+/* Largest A is (POS_MAX_ANCHORS - 1) x 2. */
+#define POS_MAX_ROWS  (POS_MAX_ANCHORS - 1)
 
 bool pos_solve(const struct pos_meas *m, size_t n, struct pos_result *out)
 {
-    (void)m;
-    (void)n;
     out->valid = false;
-    return false;   /* stub: implemented in the next step */
-}
-
-/* |a - b| <= tol */
-static bool approx(float a, float b, float tol)
-{
-    float d = a - b;
-    if (d < 0) {
-        d = -d;
-    }
-    return d <= tol;
-}
-
-int pos_solver_selftest(void)
-{
-    int fails = 0;
-    struct pos_result p;
-
-    /* 1. Exact 3-anchor solution. Anchors (0,0),(4,0),(0,3); tag at (1,1). */
-    {
-        struct pos_meas m[3] = {
-            { 0.0f, 0.0f, 1.41421356f },   /* sqrt(2)  */
-            { 4.0f, 0.0f, 3.16227766f },   /* sqrt(10) */
-            { 0.0f, 3.0f, 2.23606798f },   /* sqrt(5)  */
-        };
-        if (!pos_solve(m, 3, &p) || !p.valid ||
-            !approx(p.x, 1.0f, 1e-3f) || !approx(p.y, 1.0f, 1e-3f)) {
-            fails++;
-        }
-    }
-
-    /* 2. Exact 4-anchor (overdetermined). Square corners; tag at (2,2). */
-    {
-        struct pos_meas m[4] = {
-            { 0.0f, 0.0f, 2.82842712f },   /* sqrt(8)  */
-            { 5.0f, 0.0f, 3.60555128f },   /* sqrt(13) */
-            { 0.0f, 5.0f, 3.60555128f },   /* sqrt(13) */
-            { 5.0f, 5.0f, 4.24264069f },   /* sqrt(18) */
-        };
-        if (!pos_solve(m, 4, &p) || !p.valid ||
-            !approx(p.x, 2.0f, 1e-3f) || !approx(p.y, 2.0f, 1e-3f)) {
-            fails++;
-        }
-    }
-
-    /* 3. Overdetermined with noise: LLS should land near the truth (2,2). */
-    {
-        struct pos_meas m[4] = {
-            { 0.0f, 0.0f, 2.81f },
-            { 5.0f, 0.0f, 3.63f },
-            { 0.0f, 5.0f, 3.59f },
-            { 5.0f, 5.0f, 4.26f },
-        };
-        if (!pos_solve(m, 4, &p) || !p.valid ||
-            !approx(p.x, 2.0f, 0.2f) || !approx(p.y, 2.0f, 0.2f)) {
-            fails++;
-        }
-    }
-
-    /* 4. Collinear anchors -> degenerate -> invalid. */
-    {
-        struct pos_meas m[3] = {
-            { 0.0f, 0.0f, 2.0f },
-            { 1.0f, 0.0f, 1.5f },
-            { 2.0f, 0.0f, 2.0f },
-        };
-        if (pos_solve(m, 3, &p) || p.valid) {
-            fails++;
-        }
-    }
-
-    /* 5. Fewer than 3 anchors -> invalid. */
-    {
-        struct pos_meas m[2] = {
-            { 0.0f, 0.0f, 1.0f },
-            { 2.0f, 0.0f, 1.0f },
-        };
-        if (pos_solve(m, 2, &p) || p.valid) {
-            fails++;
-        }
-    }
-
-    return fails;
-}
-```
-
-- [ ] **Step 4: Run the test and verify it FAILS**
-
-```bash
-GCC="/c/Users/JoseAntonioLaraPerez/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/bin/gcc.exe"
-"$GCC" -std=c99 -Wall -Wextra -Werror -I src tests/pos_solver/test_pos_solver.c src/pos_solver.c -o /tmp/test_pos_solver.exe && /tmp/test_pos_solver.exe
-```
-Expected: builds, then `pos_solver_selftest: 3 failure(s)` and exit code 1. Vectors 1–3 (which expect a valid solution) fail against the always-invalid stub; vectors 4 and 5 (which expect `valid == false`) pass against the stub.
-
-- [ ] **Step 5: Implement `pos_solve`**
-
-Replace the stub body in `src/pos_solver.c` with the real implementation:
-
-```c
-bool pos_solve(const struct pos_meas *m, size_t n, struct pos_result *out)
-{
-    out->valid = false;
-    if (n < 3) {
+    if (n < 3 || n > POS_MAX_ANCHORS) {
         return false;
     }
 
-    /* Reference anchor = index 0. For each other anchor i, subtracting the
-     * reference circle equation gives a linear row:
+    const uint16_t rows = (uint16_t)(n - 1);
+
+    /* Fixed-size scratch (max sizes; only the first `rows` are used). */
+    float32_t A_d[POS_MAX_ROWS * 2];
+    float32_t b_d[POS_MAX_ROWS * 1];
+    float32_t At_d[2 * POS_MAX_ROWS];
+    float32_t AtA_d[2 * 2];
+    float32_t Atb_d[2 * 1];
+    float32_t inv_d[2 * 2];
+    float32_t p_d[2 * 1];
+
+    /* Reference anchor = index 0. For each other anchor i:
      *   A_i = [ 2(xk - xi), 2(yk - yi) ]
-     *   b_i = (ri^2 - rk^2) + (xk^2 + yk^2 - xi^2 - yi^2)
-     * Accumulate the 2x2 normal equations (AtA) and 2-vector (Atb). */
-    const double xk = m[0].x, yk = m[0].y, rk = m[0].range_m;
-    const double ck = xk * xk + yk * yk;
+     *   b_i = (ri^2 - rk^2) + (xk^2 + yk^2 - xi^2 - yi^2) */
+    const float32_t xk = m[0].x, yk = m[0].y, rk = m[0].range_m;
+    const float32_t ck = xk * xk + yk * yk;
 
-    double AtA00 = 0, AtA01 = 0, AtA11 = 0;
-    double Atb0 = 0, Atb1 = 0;
+    for (uint16_t i = 0; i < rows; i++) {
+        const struct pos_meas *mi = &m[i + 1];
+        float32_t ci = mi->x * mi->x + mi->y * mi->y;
 
-    for (size_t i = 1; i < n; i++) {
-        double a0 = 2.0 * (xk - m[i].x);
-        double a1 = 2.0 * (yk - m[i].y);
-        double ci = (double)m[i].x * m[i].x + (double)m[i].y * m[i].y;
-        double bi = ((double)m[i].range_m * m[i].range_m - rk * rk) + (ck - ci);
-
-        AtA00 += a0 * a0;
-        AtA01 += a0 * a1;
-        AtA11 += a1 * a1;
-        Atb0  += a0 * bi;
-        Atb1  += a1 * bi;
+        A_d[i * 2 + 0] = 2.0f * (xk - mi->x);
+        A_d[i * 2 + 1] = 2.0f * (yk - mi->y);
+        b_d[i] = (mi->range_m * mi->range_m - rk * rk) + (ck - ci);
     }
 
-    double det = AtA00 * AtA11 - AtA01 * AtA01;
-    if (det > -1e-6 && det < 1e-6) {
-        return false;   /* singular: collinear / degenerate geometry */
+    arm_matrix_instance_f32 A, b, At, AtA, Atb, inv, p;
+    arm_mat_init_f32(&A,   rows, 2, A_d);
+    arm_mat_init_f32(&b,   rows, 1, b_d);
+    arm_mat_init_f32(&At,  2, rows, At_d);
+    arm_mat_init_f32(&AtA, 2, 2, AtA_d);
+    arm_mat_init_f32(&Atb, 2, 1, Atb_d);
+    arm_mat_init_f32(&inv, 2, 2, inv_d);
+    arm_mat_init_f32(&p,   2, 1, p_d);
+
+    arm_mat_trans_f32(&A, &At);       /* At = A^T            */
+    arm_mat_mult_f32(&At, &A, &AtA);  /* AtA = A^T A (2x2)   */
+    arm_mat_mult_f32(&At, &b, &Atb);  /* Atb = A^T b (2x1)   */
+
+    /* arm_mat_inverse_f32 returns ARM_MATH_SINGULAR on a non-invertible matrix
+     * (collinear/degenerate anchor geometry). It may modify AtA in place. */
+    if (arm_mat_inverse_f32(&AtA, &inv) != ARM_MATH_SUCCESS) {
+        return false;
     }
 
-    double inv = 1.0 / det;
-    out->x = (float)(( AtA11 * Atb0 - AtA01 * Atb1) * inv);
-    out->y = (float)((-AtA01 * Atb0 + AtA00 * Atb1) * inv);
+    arm_mat_mult_f32(&inv, &Atb, &p); /* p = inv(AtA) * Atb  */
+
+    out->x = p_d[0];
+    out->y = p_d[1];
     out->valid = true;
     return true;
 }
 ```
 
-- [ ] **Step 6: Run the test and verify it PASSES**
+- [ ] **Step 3: Register the source in the build**
 
-```bash
-GCC="/c/Users/JoseAntonioLaraPerez/AppData/Local/Microsoft/WinGet/Packages/BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe/mingw64/bin/gcc.exe"
-"$GCC" -std=c99 -Wall -Wextra -Werror -I src tests/pos_solver/test_pos_solver.c src/pos_solver.c -o /tmp/test_pos_solver.exe && /tmp/test_pos_solver.exe
-```
-Expected: `pos_solver_selftest: 0 failure(s)` and exit code 0.
-
-- [ ] **Step 7: Commit**
-
-```bash
-git add src/pos_solver.h src/pos_solver.c tests/pos_solver/test_pos_solver.c
-git commit -m "feat(pos): 2D linear least-squares trilateration solver + host test"
-```
-
----
-
-## Task 2: Register `pos_solver.c` in the build
-
-**Files:**
-- Modify: `CMakeLists.txt:6-25` (the `target_sources(app PRIVATE ...)` list)
-
-- [ ] **Step 1: Add the source file**
-
-In `CMakeLists.txt`, add `src/pos_solver.c` to the `target_sources` list, directly after the `src/cal.c` line:
+In `CMakeLists.txt`, add `src/pos_solver.c` to the `target_sources` list,
+directly after the `src/cal.c` line:
 
 ```cmake
     src/cal_math.c
@@ -278,16 +187,19 @@ In `CMakeLists.txt`, add `src/pos_solver.c` to the `target_sources` list, direct
     src/uwb_ss_initiator.c
 ```
 
-- [ ] **Step 2: Verify (build)**
+- [ ] **Step 4: Verify (build)**
 
-The user builds/flashes the firmware. Ask them to run `west build` and confirm the image links with `src/pos_solver.c` compiled in and no errors.
-Expected: clean build (no new warnings/errors).
+Ask the user to `west build`. Expected: clean build; `pos_solver.c` compiles
+and links against CMSIS-DSP (`arm_mat_*` symbols resolve). `pos_solve` is unused
+until Task 4 — if the build treats unused statics/functions as errors this is
+expected; otherwise it links cleanly. Behaviour is validated on hardware in
+Task 4.
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add CMakeLists.txt
-git commit -m "build(pos): compile pos_solver.c into the image"
+git add src/pos_solver.h src/pos_solver.c CMakeLists.txt
+git commit -m "feat(pos): 2D linear least-squares trilateration via CMSIS-DSP"
 ```
 
 ---
@@ -295,13 +207,13 @@ git commit -m "build(pos): compile pos_solver.c into the image"
 ## Task 3: Anchor-addressed ranging primitive
 
 **Files:**
-- Modify: `src/uwb_ss_initiator.c` (frame definitions block ~lines 47-58; add new function after `do_one_range`, ~line 216)
+- Modify: `src/uwb_ss_initiator.c` (includes; frames block ~lines 47-58; add new function after `do_one_range`, ~line 216)
 
-This is radio firmware — not host-testable. Verification is a clean build plus the on-hardware check in Task 4.
+Radio firmware — verified by build here and on-hardware in Task 4.
 
 - [ ] **Step 1: Add the `pos_solver` include**
 
-In `src/uwb_ss_initiator.c`, add to the project includes (after `#include "cal_math.h"`):
+In `src/uwb_ss_initiator.c`, after `#include "cal_math.h"`:
 
 ```c
 #include "pos_solver.h"
@@ -309,15 +221,15 @@ In `src/uwb_ss_initiator.c`, add to the project includes (after `#include "cal_m
 
 - [ ] **Step 2: Enlarge the RX buffer and add positioning frame definitions**
 
-The positioning response is 27 bytes; the shared `rx_buf` must hold it. In the
-frames block, change `RX_BUF_LEN` from 20 to 32:
+The positioning response is 27 bytes; the shared `rx_buf` must hold it. Change
+`RX_BUF_LEN` from 20 to 32:
 
 ```c
 #define RX_BUF_LEN               32
 ```
 
-Then, immediately after the existing `rx_resp_msg` definition (the calibration
-frames — leave them unchanged), add the positioning frames and field indices:
+Then, immediately after the existing `rx_resp_msg` definition (leave the
+calibration frames unchanged), add the positioning frames and field indices:
 
 ```c
 /* ---- Positioning frames (addressed; anchor self-reports its (x,y)) --------
@@ -337,9 +249,9 @@ static uint8_t pos_resp_ref[] = { 0x41, 0x88, 0, 0xCA, 0xDE, 'V', 'E', 'W', 'A',
 
 - [ ] **Step 3: Add the `do_one_range_anchor` primitive**
 
-Insert this function immediately after `do_one_range` (i.e. after its closing
-brace, before `apply_total_dly`). It mirrors `do_one_range` but addresses one
-anchor and parses the anchor's self-reported coordinates.
+Insert this function immediately after `do_one_range` (after its closing brace,
+before `apply_total_dly`). It mirrors `do_one_range` but addresses one anchor
+and parses the anchor's self-reported coordinates.
 
 ```c
 /*
@@ -353,7 +265,7 @@ static bool do_one_range_anchor(uint8_t aid, float *range_m, float *ax, float *a
 {
     dwt_setinterrupt(INT_RX_PHASE, 0, DWT_ENABLE_INT_ONLY);
 
-    pos_poll_msg[ALL_MSG_SN_IDX]   = frame_seq_nb;
+    pos_poll_msg[ALL_MSG_SN_IDX]    = frame_seq_nb;
     pos_poll_msg[POS_ANCHOR_ID_IDX] = aid;
     dwt_writetxdata(sizeof(pos_poll_msg), pos_poll_msg, 0);
     dwt_writetxfctrl(sizeof(pos_poll_msg) + FCS_LEN, 0, 1);
@@ -405,10 +317,9 @@ static bool do_one_range_anchor(uint8_t aid, float *range_m, float *ax, float *a
 
 - [ ] **Step 4: Verify (build)**
 
-Ask the user to `west build`. Expected: clean build. (`do_one_range_anchor` is
-unused until Task 4 — `static` + unused will warn; if the build uses `-Werror`
-this is expected to fail until Task 4 wires it in. In that case, combine the
-build verification with Task 4 Step 4 rather than building here.)
+`do_one_range_anchor` is unused until Task 4 — with `-Werror` on unused statics
+this won't build standalone, so fold this build check into Task 4 Step 4. Commit
+the code regardless (next step).
 
 - [ ] **Step 5: Commit**
 
@@ -422,7 +333,7 @@ git commit -m "feat(uwb): addressed SS-TWR primitive parsing anchor self-coords"
 ## Task 4: Multi-anchor cycle, position publish, wire-in
 
 **Files:**
-- Modify: `src/uwb_ss_initiator.c` (add anchor list + `position_publish` near the timing defines; rework the ranging branch in `ss_twr_fn` ~lines 329-337)
+- Modify: `src/uwb_ss_initiator.c` (anchor list + `position_publish` near the timing defines; rework the ranging branch in `ss_twr_fn` ~lines 329-337)
 
 - [ ] **Step 1: Add the anchor list and inter-anchor delay**
 
@@ -441,8 +352,8 @@ static const uint8_t ANCHOR_IDS[] = { 1, 2, 3, 4 };
 - [ ] **Step 2: Add the `position_publish` seam**
 
 Add these two functions just before `ss_twr_fn`. `fmt_coord` avoids `%f`
-(the nano printf in this build has no float support) by splitting into integer
-centimetres, matching the existing `D:` formatter style.
+(the nano printf has no float support) by splitting into integer centimetres,
+matching the existing `D:` formatter style.
 
 ```c
 /* Format a metre value as a signed "x.xx" string (centimetre resolution),
@@ -513,17 +424,18 @@ with the multi-anchor positioning cycle:
 ```
 
 The cadence wait below this block (`k_sem_take(&range_tick, K_MSEC(wait_ms))`)
-is unchanged. `do_one_range` and `run_calibration` remain in the file, still
-used by the calibration path.
+is unchanged. `do_one_range` and `run_calibration` remain, still used by the
+calibration path.
 
 - [ ] **Step 4: Verify (build + on-hardware)**
 
 Ask the user to `west build`, flash, and observe over BLE NUS:
 - Expected build: clean (no unused-function warning now — `do_one_range_anchor`
-  is referenced).
+  and `pos_solve` are referenced).
 - With ≥3 anchors flashed to the response contract and a valid calibration:
-  `P:x.xx,y.yy` lines arrive at ~0.2 s when moving / ~1 s when still.
+  plausible `P:x.xx,y.yy` lines arrive at ~0.2 s when moving / ~1 s when still.
 - With <3 anchors responding: no `P:` line is emitted.
+- Degenerate (collinear) anchor geometry: no `P:` line (solver returns invalid).
 - If responses time out unexpectedly, the longer (27-byte) response may exceed
   `RESP_RX_TIMEOUT_UUS`; bump it (e.g. to 3000) as an on-hardware tuning step.
 
@@ -538,7 +450,8 @@ git commit -m "feat(uwb): multi-anchor ranging cycle -> LLS -> BLE position publ
 
 ## Self-Review notes
 
-- **Spec coverage:** solver (Task 1) · build wiring (Task 2) · addressed frames + primitive + anchor_id validation + self-coord parse (Task 3) · static anchor list, ≥3 gate, cadence preserved, `position_publish` seam, `D:`→`P:` (Task 4). Calibration left untouched (Tasks touch only `do_one_range_anchor`, never `do_one_range`/`run_calibration`).
-- **Type consistency:** `pos_meas{x,y,range_m}`, `pos_result{x,y,valid}`, `pos_solve(const struct pos_meas*, size_t, struct pos_result*)`, `do_one_range_anchor(uint8_t, float*, float*, float*)` used identically across Tasks 1, 3, 4.
-- **Known build-order caveat:** `do_one_range_anchor` is unused between Task 3 and Task 4; with `-Werror` on unused-static, Task 3 won't build standalone. Documented in Task 3 Step 4 — fold its build check into Task 4 if so.
+- **Spec coverage:** FPU+CMSIS-DSP config (Task 1) · CMSIS-DSP solver + build wiring (Task 2) · addressed frames, primitive, anchor_id validation, self-coord parse (Task 3) · static anchor list, ≥3 gate, cadence preserved, `position_publish` seam, `D:`→`P:` (Task 4). Calibration left untouched (no task edits `do_one_range`/`run_calibration`).
+- **Type consistency:** `pos_meas{x,y,range_m}`, `pos_result{x,y,valid}`, `pos_solve(const struct pos_meas*, size_t, struct pos_result*)`, `do_one_range_anchor(uint8_t, float*, float*, float*)`, `POS_MAX_ANCHORS` used identically across Tasks 2–4.
+- **Testing:** no host self-test (CMSIS-DSP is target-only, per the approved decision); solver correctness is validated on hardware via the BLE `P:` output in Task 4.
+- **Known build-order caveat:** `do_one_range_anchor` is unused between Task 3 and Task 4; with `-Werror` on unused-static, Task 3 won't build standalone — fold its build check into Task 4.
 ```
