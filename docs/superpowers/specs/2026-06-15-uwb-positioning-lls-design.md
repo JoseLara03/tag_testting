@@ -41,8 +41,10 @@ and its `tests/cal_math/` host runner.
 
 ## Frame contract (anchor responder firmware must match)
 
-Anchor-side firmware is updated separately to honor this contract; it is outside
-the tag-firmware scope of this work, but the layout below is the spec for it.
+These addressed frames are **positioning-only**. The existing non-addressed
+calibration frames are unchanged (see "Calibration interaction"). Anchor-side
+firmware is updated separately to honor this contract; it is outside the
+tag-firmware scope of this work, but the layout below is the spec for it.
 
 **Poll** (tag → anchor), `WAVE` magic + anchor_id:
 ```
@@ -56,9 +58,11 @@ the tag-firmware scope of this work, but the layout below is the spec for it.
 ```
 
 Tag-side changes:
-- `RX_BUF_LEN` 20 → 32.
-- Response field indices shift: `poll_rx_ts` 10→11, `resp_tx_ts` 14→15; add
-  `x @19`, `y @23`.
+- Positioning uses its own poll/response message arrays and field indices
+  (`poll_rx_ts @11`, `resp_tx_ts @15`, `x @19`, `y @23`); the calibration frames
+  keep the current layout (`poll_rx_ts @10`, `resp_tx_ts @14`, no anchor_id).
+- `RX_BUF_LEN` 20 → 32 (shared buffer; harmless for calibration, which reads
+  only `flen` bytes).
 - Validate `rx_buf[10] == polled aid`; reject a reply from any other anchor.
 
 ## LLS math (`pos_solver`)
@@ -79,7 +83,7 @@ In the existing `ss_twr_fn` loop, after the calibration gate:
 ```
 n = 0
 for aid in ANCHOR_IDS[]:                      // static, ≤4
-    if do_one_range(aid, &range_m, &ax, &ay): // SS exchange + parse self-coords
+    if do_one_range_anchor(aid, &range_m, &ax, &ay): // SS exchange + parse self-coords
         meas[n++] = { ax, ay, range_m }
     sleep(INTER_ANCHOR_DELAY_MS)
 if n >= 3 and pos_solve(meas, n, &pos):       // LLS
@@ -87,17 +91,25 @@ if n >= 3 and pos_solve(meas, n, &pos):       // LLS
 k_sem_take(&range_tick, moving ? 200ms : 1000ms)   // cadence unchanged
 ```
 
-`do_one_range` gains parameters `(uint8_t aid, float *range_m, float *ax,
-float *ay)`: it writes `aid` into the poll, validates the echoed `aid`, and
-parses the anchor's `(x, y)` from the response. Distance is computed as today,
-then converted to metres.
+Positioning uses a new primitive `do_one_range_anchor(uint8_t aid, float
+*range_m, float *ax, float *ay)`: it writes `aid` into the poll, validates the
+echoed `aid`, parses the anchor's `(x, y)` from the response, and returns the
+range in metres. The SS-exchange/ToF math mirrors the existing `do_one_range`;
+the small duplication is deliberate, to isolate the new path from the
+hardware-verified calibration code. (If DRY is preferred, the shared inner
+exchange can be factored into one helper — noted as an option for the plan.)
 
 ## Calibration interaction
 
+Calibration is a **bench-only** procedure run before production to calibrate a
+unit against a reference device at a known distance. It is not tied to any
+deployment anchor or `anchor_id`. The existing `do_one_range(int32_t *out_mm)`
+primitive and its non-addressed `WAVE`/`VEWA` frames are **left untouched**, and
+`run_calibration()` is unchanged. After this work, `do_one_range` is called only
+by calibration; positioning uses `do_one_range_anchor`.
+
 Ranging stays gated on `cal_is_valid()` (`CAL REQUIRED` until a valid record
-exists). Calibration ranges against a fixed `CAL_ANCHOR_ID` (the first ID in the
-static list); the iterative auto-solve logic is otherwise unchanged. The anchor
-coordinates returned during calibration are ignored.
+exists).
 
 ## What stays the same
 
