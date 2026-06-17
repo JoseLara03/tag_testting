@@ -35,8 +35,11 @@ static uint32_t get_u32(const uint8_t *p) {
 
 /* Write the common 10-byte header. PANID is written as literal bytes 0xCA,0xDE
  * (matching existing tag frames), NOT little-endian-encoded. */
-static void write_hdr(uint8_t *buf, uint16_t dest, uint16_t src, uint8_t type)
+static int write_hdr(uint8_t *buf, size_t buf_len, size_t need,
+                     uint16_t dest, uint16_t src, uint8_t type)
 {
+    if (!buf) return -EINVAL;
+    if (buf_len < need) return -EMSGSIZE;
     buf[OFF_FC0] = 0x41;
     buf[OFF_FC1] = 0x88;
     buf[OFF_SEQ] = 0;           /* caller sets via uwb_frame_set_seq_num */
@@ -45,19 +48,16 @@ static void write_hdr(uint8_t *buf, uint16_t dest, uint16_t src, uint8_t type)
     put_u16(&buf[OFF_DEST], dest);
     put_u16(&buf[OFF_SRC], src);
     buf[OFF_TYPE] = type;
+    return 0;
 }
 
 /* ---- Builders ---- */
 int uwb_frame_discovery_build(uint8_t *buf, size_t buf_len,
                               uint16_t src_addr, uint32_t tx_ts)
 {
-    if (!buf) {
-        return -EINVAL;
-    }
-    if (buf_len < UWB_FRAME_LEN_DISC) {
-        return -EMSGSIZE;
-    }
-    write_hdr(buf, UWB_FRAME_ADDR_BCAST, src_addr, UWB_FRAME_TYPE_DISC);
+    int rc = write_hdr(buf, buf_len, UWB_FRAME_LEN_DISC,
+                       UWB_FRAME_ADDR_BCAST, src_addr, UWB_FRAME_TYPE_DISC);
+    if (rc) return rc;
     put_u32(&buf[OFF_DISC_TS], tx_ts);
     return UWB_FRAME_LEN_DISC;
 }
@@ -73,10 +73,9 @@ int uwb_frame_multipoll_build(uint8_t *buf, size_t buf_len, uint16_t src_addr,
         return -EINVAL;
     }
     size_t need = 15u + 4u * (size_t)num_slots;
-    if (buf_len < need) {
-        return -EMSGSIZE;
-    }
-    write_hdr(buf, UWB_FRAME_ADDR_BCAST, src_addr, UWB_FRAME_TYPE_MPOL);
+    int rc = write_hdr(buf, buf_len, need,
+                       UWB_FRAME_ADDR_BCAST, src_addr, UWB_FRAME_TYPE_MPOL);
+    if (rc) return rc;
     buf[OFF_MPOL_NUM] = num_slots;
     size_t o = OFF_MPOL_SLOTS;
     for (uint8_t i = 0; i < num_slots; i++) {
@@ -92,13 +91,9 @@ int uwb_frame_response_build(uint8_t *buf, size_t buf_len, uint16_t src_addr,
                              uint16_t dest_addr, uint32_t tx_ts,
                              int32_t cir_power, uint16_t cir_quality)
 {
-    if (!buf) {
-        return -EINVAL;
-    }
-    if (buf_len < UWB_FRAME_LEN_RESP) {
-        return -EMSGSIZE;
-    }
-    write_hdr(buf, dest_addr, src_addr, UWB_FRAME_TYPE_RESP);
+    int rc = write_hdr(buf, buf_len, UWB_FRAME_LEN_RESP,
+                       dest_addr, src_addr, UWB_FRAME_TYPE_RESP);
+    if (rc) return rc;
     put_u32(&buf[OFF_RESP_TS], tx_ts);
     put_u32(&buf[OFF_RESP_CIRP], (uint32_t)cir_power);
     put_u16(&buf[OFF_RESP_CIRQ], cir_quality);
@@ -202,28 +197,14 @@ void     uwb_frame_set_seq_num(uint8_t *buf, uint8_t seq) { buf[OFF_SEQ] = seq; 
 
 /* ---- BEACON frame support ---- */
 
-/* Common header writer for BEACON (validates buffer size). */
-static int write_hdr_beacon(uint8_t *buf, size_t buf_len, size_t need,
-                            uint16_t dest, uint16_t src, uint8_t type)
-{
-    if (!buf) return -EINVAL;
-    if (buf_len < need) return -EMSGSIZE;
-    buf[OFF_FC0] = 0x41; buf[OFF_FC1] = 0x88; buf[OFF_SEQ] = 0;
-    buf[OFF_PAN] = 0xCA; buf[OFF_PAN + 1] = 0xDE;
-    put_u16(&buf[OFF_DEST], dest);
-    put_u16(&buf[OFF_SRC], src);
-    buf[OFF_TYPE] = type;
-    return 0;
-}
-
 int uwb_frame_beacon_build(uint8_t *buf, size_t buf_len, uint32_t frame_counter,
                            const uint16_t *slot_map, uint8_t n_slots)
 {
-    size_t need = 15u + 2u * (size_t)n_slots;
-    int rc = write_hdr_beacon(buf, buf_len, need, UWB_FRAME_ADDR_BCAST,
-                              UWB_ADDR_GATEWAY, UWB_FRAME_TYPE_BEACON);
-    if (rc) return rc;
     if (!slot_map) return -EINVAL;
+    size_t need = 15u + 2u * (size_t)n_slots;
+    int rc = write_hdr(buf, buf_len, need, UWB_FRAME_ADDR_BCAST,
+                       UWB_ADDR_GATEWAY, UWB_FRAME_TYPE_BEACON);
+    if (rc) return rc;
     buf[10] = UWB_PROTO_VER;
     put_u32(&buf[11], frame_counter);
     for (uint8_t i = 0; i < n_slots; i++) put_u16(&buf[15 + 2 * i], slot_map[i]);
@@ -250,6 +231,7 @@ int uwb_frame_parse_beacon(const uint8_t *buf, size_t len, uint8_t *proto_ver,
 
 int uwb_frame_beacon_find_addr(const uint16_t *slot_map, uint8_t n_slots, uint16_t addr)
 {
+    if (!slot_map) return -1;
     for (uint8_t i = 0; i < n_slots; i++) if (slot_map[i] == addr) return (int)i;
     return -1;
 }
