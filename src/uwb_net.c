@@ -24,9 +24,40 @@ void uwb_net_init(struct uwb_net_ctx *c, const uint8_t eui[8])
     c->req_tier = UWB_TIER_FAST;
 }
 
-/* uwb_net_handle is implemented incrementally in Tasks 6-8. Temporary stub: */
 uint32_t uwb_net_handle(struct uwb_net_ctx *c, const struct uwb_net_event *ev)
 {
-    (void)c; (void)ev;
-    return UWB_ACT_NONE;
+    /* Motion is orthogonal: it only updates the requested tier. */
+    if (ev->kind == UWB_EV_MOTION) {
+        c->req_tier = (uwb_tier_t)ev->req_tier;
+        return UWB_ACT_NONE;
+    }
+
+    switch (c->state) {
+    case UWB_ST_SCAN:
+        if (ev->kind == UWB_EV_BEACON && ev->proto_ver == UWB_NET_PROTO_VER) {
+            c->frame_counter = ev->frame_counter;
+            c->miss_count = 0;
+            c->join_retries = 0;
+            c->state = UWB_ST_JOINING;
+            return UWB_ACT_SEND_JOIN;
+        }
+        return UWB_ACT_NONE;
+
+    case UWB_ST_JOINING:
+        if (ev->kind == UWB_EV_GRANT_MISS) {
+            if (++c->join_retries >= UWB_NET_JOIN_RETRY_MAX) {
+                c->state = UWB_ST_SCAN;
+                return UWB_ACT_NONE;
+            }
+            return UWB_ACT_SEND_JOIN;
+        }
+        if (ev->kind == UWB_EV_BEACON) {
+            c->miss_count = 0;
+            c->frame_counter = ev->frame_counter;
+        }
+        return UWB_ACT_NONE;   /* GRANT handled in Task 7 */
+
+    default:
+        return UWB_ACT_NONE;
+    }
 }
