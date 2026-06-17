@@ -249,6 +249,25 @@ static void test_join_grant(void)
     CHECK(memcmp(e3, eui, 8) == 0 && sa == 0x0007 && si == 3 && rt == 1 && ls == 50);
 }
 
+static void test_keepalive_release(void)
+{
+    uint8_t buf[16];
+    int n = uwb_frame_keepalive_build(buf, sizeof(buf), 0x0007, 2, 3);
+    CHECK(n == UWB_FRAME_LEN_KEEPALIVE);
+    CHECK(buf[5] == 0x00 && buf[6] == 0x00);       /* dest gateway */
+    CHECK(buf[7] == 0x07 && buf[8] == 0x00);       /* src 0x0007 LE */
+    CHECK(buf[9] == UWB_FRAME_TYPE_KEEPALIVE);
+    CHECK(uwb_frame_is_keepalive(buf, n));
+    uint16_t sa; uint8_t rt, si;
+    CHECK(uwb_frame_parse_keepalive(buf, n, &sa, &rt, &si) == 0);
+    CHECK(sa == 0x0007 && rt == 2 && si == 3);
+
+    n = uwb_frame_release_build(buf, sizeof(buf), 0x0007);
+    CHECK(n == UWB_FRAME_LEN_RELEASE);
+    CHECK(buf[9] == UWB_FRAME_TYPE_RELEASE);
+    CHECK(uwb_frame_is_release(buf, n));
+}
+
 int main(void)
 {
     test_scaffold();
@@ -260,6 +279,7 @@ int main(void)
     test_new_constants();
     test_beacon();
     test_join_grant();
+    test_keepalive_release();
     if (g_fail) { printf("%d CHECK(s) FAILED\n", g_fail); return 1; }
     printf("ALL TESTS PASSED\n");
     return 0;

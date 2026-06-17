@@ -298,3 +298,46 @@ int uwb_frame_parse_grant(const uint8_t *buf, size_t len, uint8_t eui_out[8],
     if (lease)      *lease = get_u16(&buf[22]);
     return 0;
 }
+
+/* ---- KEEPALIVE and RELEASE frame support ---- */
+
+int uwb_frame_keepalive_build(uint8_t *buf, size_t buf_len, uint16_t src_addr,
+                              uint8_t req_tier, uint8_t slot_index)
+{
+    int rc = write_hdr(buf, buf_len, UWB_FRAME_LEN_KEEPALIVE, UWB_ADDR_GATEWAY,
+                       src_addr, UWB_FRAME_TYPE_KEEPALIVE);
+    if (rc) return rc;
+    buf[10] = req_tier;
+    buf[11] = slot_index;
+    return UWB_FRAME_LEN_KEEPALIVE;
+}
+
+bool uwb_frame_is_keepalive(const uint8_t *buf, size_t len)
+{
+    return len == UWB_FRAME_LEN_KEEPALIVE && uwb_frame_is_valid(buf, len) &&
+           buf[OFF_TYPE] == UWB_FRAME_TYPE_KEEPALIVE;
+}
+
+int uwb_frame_parse_keepalive(const uint8_t *buf, size_t len, uint16_t *src_addr,
+                              uint8_t *req_tier, uint8_t *slot_index)
+{
+    if (!uwb_frame_is_keepalive(buf, len)) return -EINVAL;
+    if (src_addr)   *src_addr = uwb_frame_get_src_addr(buf);
+    if (req_tier)   *req_tier = buf[10];
+    if (slot_index) *slot_index = buf[11];
+    return 0;
+}
+
+int uwb_frame_release_build(uint8_t *buf, size_t buf_len, uint16_t src_addr)
+{
+    int rc = write_hdr(buf, buf_len, UWB_FRAME_LEN_RELEASE, UWB_ADDR_GATEWAY,
+                       src_addr, UWB_FRAME_TYPE_RELEASE);
+    if (rc) return rc;
+    return UWB_FRAME_LEN_RELEASE;
+}
+
+bool uwb_frame_is_release(const uint8_t *buf, size_t len)
+{
+    return len == UWB_FRAME_LEN_RELEASE && uwb_frame_is_valid(buf, len) &&
+           buf[OFF_TYPE] == UWB_FRAME_TYPE_RELEASE;
+}

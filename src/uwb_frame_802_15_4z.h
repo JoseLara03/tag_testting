@@ -90,6 +90,15 @@ int uwb_frame_parse_grant(const uint8_t *buf, size_t len, uint8_t eui_out[8],
                           uint16_t *short_addr, uint8_t *slot_index, uint8_t *rate_tier, uint16_t *lease);
 bool uwb_frame_is_grant(const uint8_t *buf, size_t len);
 
+/* ---- KEEPALIVE and RELEASE frame builders and parsers ---- */
+int uwb_frame_keepalive_build(uint8_t *buf, size_t buf_len, uint16_t src_addr,
+                              uint8_t req_tier, uint8_t slot_index);
+int uwb_frame_parse_keepalive(const uint8_t *buf, size_t len, uint16_t *src_addr,
+                              uint8_t *req_tier, uint8_t *slot_index);
+bool uwb_frame_is_keepalive(const uint8_t *buf, size_t len);
+int uwb_frame_release_build(uint8_t *buf, size_t buf_len, uint16_t src_addr);
+bool uwb_frame_is_release(const uint8_t *buf, size_t len);
+
 /* ---- Validators ---- */
 bool uwb_frame_is_valid(const uint8_t *buf, size_t len);
 bool uwb_frame_is_discovery(const uint8_t *buf, size_t len);
