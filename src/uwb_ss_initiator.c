@@ -431,10 +431,10 @@ static void ss_twr_fn(void *p1, void *p2, void *p3)
                 dwt_settxantennadelay(tx);
                 dwt_setrxantennadelay(rx);
             }
-        }
-
-        if (!ranging) {
+        } else if (!ranging) {
             cal_wait_request();   /* block until a cal command arrives */
+        } else {
+            k_sleep(K_MSEC(100));  /* yield while awaiting optional cal request */
         }
     }
 }
