@@ -225,6 +225,30 @@ static void test_beacon(void)
     CHECK(uwb_frame_beacon_build(buf, 5, 0, map, UWB_FRAME_N_CFP) == -EMSGSIZE);
 }
 
+static void test_join_grant(void)
+{
+    const uint8_t eui[8] = {1,2,3,4,5,6,7,8};
+    uint8_t buf[32];
+
+    int n = uwb_frame_join_build(buf, sizeof(buf), eui, 2 /*FAST*/);
+    CHECK(n == UWB_FRAME_LEN_JOIN);
+    CHECK(buf[5] == 0x00 && buf[6] == 0x00);       /* dest gateway */
+    CHECK(buf[7] == 0xFE && buf[8] == 0xFF);       /* src unassoc LE */
+    CHECK(buf[9] == UWB_FRAME_TYPE_JOIN);
+    CHECK(uwb_frame_is_join(buf, n));
+    uint8_t e2[8], t; CHECK(uwb_frame_parse_join(buf, n, e2, &t) == 0);
+    CHECK(memcmp(e2, eui, 8) == 0 && t == 2);
+
+    n = uwb_frame_grant_build(buf, sizeof(buf), eui, 0x0007, 3, 1, 50);
+    CHECK(n == UWB_FRAME_LEN_GRANT);
+    CHECK(buf[5] == 0xFF && buf[6] == 0xFF);       /* dest broadcast (EUI-matched) */
+    CHECK(buf[9] == UWB_FRAME_TYPE_GRANT);
+    CHECK(uwb_frame_is_grant(buf, n));
+    uint8_t e3[8]; uint16_t sa, ls; uint8_t si, rt;
+    CHECK(uwb_frame_parse_grant(buf, n, e3, &sa, &si, &rt, &ls) == 0);
+    CHECK(memcmp(e3, eui, 8) == 0 && sa == 0x0007 && si == 3 && rt == 1 && ls == 50);
+}
+
 int main(void)
 {
     test_scaffold();
@@ -235,6 +259,7 @@ int main(void)
     test_corruption();
     test_new_constants();
     test_beacon();
+    test_join_grant();
     if (g_fail) { printf("%d CHECK(s) FAILED\n", g_fail); return 1; }
     printf("ALL TESTS PASSED\n");
     return 0;

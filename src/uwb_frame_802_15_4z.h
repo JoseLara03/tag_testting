@@ -78,6 +78,18 @@ int  uwb_frame_parse_beacon(const uint8_t *buf, size_t len, uint8_t *proto_ver,
 bool uwb_frame_is_beacon(const uint8_t *buf, size_t len);
 int  uwb_frame_beacon_find_addr(const uint16_t *slot_map, uint8_t n_slots, uint16_t addr);
 
+/* ---- JOIN_REQ frame builders and parsers ---- */
+int uwb_frame_join_build(uint8_t *buf, size_t buf_len, const uint8_t eui[8], uint8_t req_tier);
+int uwb_frame_parse_join(const uint8_t *buf, size_t len, uint8_t eui_out[8], uint8_t *req_tier);
+bool uwb_frame_is_join(const uint8_t *buf, size_t len);
+
+/* ---- GRANT frame builders and parsers ---- */
+int uwb_frame_grant_build(uint8_t *buf, size_t buf_len, const uint8_t eui[8],
+                          uint16_t short_addr, uint8_t slot_index, uint8_t rate_tier, uint16_t lease);
+int uwb_frame_parse_grant(const uint8_t *buf, size_t len, uint8_t eui_out[8],
+                          uint16_t *short_addr, uint8_t *slot_index, uint8_t *rate_tier, uint16_t *lease);
+bool uwb_frame_is_grant(const uint8_t *buf, size_t len);
+
 /* ---- Validators ---- */
 bool uwb_frame_is_valid(const uint8_t *buf, size_t len);
 bool uwb_frame_is_discovery(const uint8_t *buf, size_t len);

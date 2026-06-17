@@ -1,5 +1,6 @@
 #include "uwb_frame_802_15_4z.h"
 #include <errno.h>
+#include <string.h>
 
 /* NOTE: the DISC/MPOL/RESP frames use 2-byte little-endian short addresses at
  * bytes 5-6 (dest) and 7-8 (src). This is intentionally distinct from the legacy
@@ -234,4 +235,66 @@ int uwb_frame_beacon_find_addr(const uint16_t *slot_map, uint8_t n_slots, uint16
     if (!slot_map) return -1;
     for (uint8_t i = 0; i < n_slots; i++) if (slot_map[i] == addr) return (int)i;
     return -1;
+}
+
+/* ---- JOIN_REQ frame support ---- */
+
+int uwb_frame_join_build(uint8_t *buf, size_t buf_len, const uint8_t eui[8], uint8_t req_tier)
+{
+    int rc = write_hdr(buf, buf_len, UWB_FRAME_LEN_JOIN, UWB_ADDR_GATEWAY,
+                       UWB_ADDR_UNASSOC, UWB_FRAME_TYPE_JOIN);
+    if (rc) return rc;
+    if (!eui) return -EINVAL;
+    memcpy(&buf[10], eui, UWB_FRAME_EUI_LEN);
+    buf[18] = req_tier;
+    return UWB_FRAME_LEN_JOIN;
+}
+
+bool uwb_frame_is_join(const uint8_t *buf, size_t len)
+{
+    return len == UWB_FRAME_LEN_JOIN && uwb_frame_is_valid(buf, len) &&
+           buf[OFF_TYPE] == UWB_FRAME_TYPE_JOIN;
+}
+
+int uwb_frame_parse_join(const uint8_t *buf, size_t len, uint8_t eui_out[8], uint8_t *req_tier)
+{
+    if (!uwb_frame_is_join(buf, len)) return -EINVAL;
+    if (eui_out) memcpy(eui_out, &buf[10], UWB_FRAME_EUI_LEN);
+    if (req_tier) *req_tier = buf[18];
+    return 0;
+}
+
+/* ---- GRANT frame support ---- */
+
+int uwb_frame_grant_build(uint8_t *buf, size_t buf_len, const uint8_t eui[8],
+                          uint16_t short_addr, uint8_t slot_index, uint8_t rate_tier, uint16_t lease)
+{
+    int rc = write_hdr(buf, buf_len, UWB_FRAME_LEN_GRANT, UWB_FRAME_ADDR_BCAST,
+                       UWB_ADDR_GATEWAY, UWB_FRAME_TYPE_GRANT);
+    if (rc) return rc;
+    if (!eui) return -EINVAL;
+    memcpy(&buf[10], eui, UWB_FRAME_EUI_LEN);
+    put_u16(&buf[18], short_addr);
+    buf[20] = slot_index;
+    buf[21] = rate_tier;
+    put_u16(&buf[22], lease);
+    return UWB_FRAME_LEN_GRANT;
+}
+
+bool uwb_frame_is_grant(const uint8_t *buf, size_t len)
+{
+    return len == UWB_FRAME_LEN_GRANT && uwb_frame_is_valid(buf, len) &&
+           buf[OFF_TYPE] == UWB_FRAME_TYPE_GRANT;
+}
+
+int uwb_frame_parse_grant(const uint8_t *buf, size_t len, uint8_t eui_out[8],
+                          uint16_t *short_addr, uint8_t *slot_index, uint8_t *rate_tier, uint16_t *lease)
+{
+    if (!uwb_frame_is_grant(buf, len)) return -EINVAL;
+    if (eui_out)   memcpy(eui_out, &buf[10], UWB_FRAME_EUI_LEN);
+    if (short_addr) *short_addr = get_u16(&buf[18]);
+    if (slot_index) *slot_index = buf[20];
+    if (rate_tier)  *rate_tier = buf[21];
+    if (lease)      *lease = get_u16(&buf[22]);
+    return 0;
 }
