@@ -19,6 +19,7 @@ target_sources(app PRIVATE
     src/tag_ui.c
     src/uwb_frame_802_15_4z.c
     src/uwb_net.c
+    src/uwb_net_runner.c
     drivers/lis2hh12-pid/lis2hh12_reg.c
     platform/port.c
     platform/deca_spi.c

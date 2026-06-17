@@ -11,7 +11,7 @@
  * applied by uwb_init() and persists in the DW3000.
  */
 
-#include "uwb_ss_initiator.h"
+#include "uwb_ss_initiator.h"   /* also pulls in uwb_net_runner.h for uwb_net_set_tier */
 #include "port.h"
 #include "deca_device_api.h"
 #include "ble_log.h"
@@ -33,8 +33,7 @@
 #define POLL_TX_TO_RESP_RX_DLY_UUS  1000U   /* RX turns on this long after poll TX */
 #define RESP_RX_TIMEOUT_UUS         2000U   /* covers full response frame air time */
 #define PRE_TIMEOUT                  128U
-#define RNG_FAST_MS                 200U   /* cadence while moving */
-#define RNG_SLOW_MS                 1000U   /* cadence after ~5 s of no motion */
+/* RNG_FAST_MS / RNG_SLOW_MS removed — cadence now owned by uwb_net_runner. */
 
 /* Anchors to range each cycle (static; <=4). Positioning needs >=3 of these
  * to respond in a cycle to produce a fix. Edit and rebuild to change the set. */
@@ -123,19 +122,10 @@ static void ble_tx_fn(void *p1, void *p2, void *p3)
 }
 
 /* ---- DW3000 IRQ event ------------------------------------------------------ */
-typedef enum {
-    EVT_NONE = 0,
-    EVT_TXFRS,
-    EVT_RXFCG,
-    EVT_RXTO,
-    EVT_RXERR,
-} irq_evt_t;
+/* irq_evt_t is now declared in uwb_ss_initiator.h and shared with the runner. */
 
 static volatile irq_evt_t last_evt;
 static K_SEM_DEFINE(irq_sem, 0, 1);
-
-static volatile bool ss_moving = true;     /* start fast until motion module reports otherwise */
-static K_SEM_DEFINE(range_tick, 0, 1);
 
 static void cb_txdone(const dwt_cb_data_t *d) { ARG_UNUSED(d); last_evt = EVT_TXFRS; k_sem_give(&irq_sem); }
 static void cb_rxok  (const dwt_cb_data_t *d) { ARG_UNUSED(d); last_evt = EVT_RXFCG; k_sem_give(&irq_sem); }
@@ -147,7 +137,7 @@ static void cb_rxerr (const dwt_cb_data_t *d) { ARG_UNUSED(d); last_evt = EVT_RX
  * Returns EVT_RXTO when the kernel timeout expires (no event received).
  * IRQ is always DISABLED on return so the caller can safely do SPI work.
  */
-static irq_evt_t wait_event(k_timeout_t timeout)
+irq_evt_t wait_event(k_timeout_t timeout)
 {
     k_sem_reset(&irq_sem);
     last_evt = EVT_NONE;
@@ -246,7 +236,7 @@ static bool do_one_range(int32_t *out_mm)
  * timeout, RX error, wrong magic, or an anchor_id mismatch. Relies on the
  * rx-after-tx delay / timeout / antenna delay configured by ss_twr_fn.
  */
-static bool do_one_range_anchor(uint8_t aid, float *range_m, float *ax, float *ay)
+bool do_one_range_anchor(uint8_t aid, float *range_m, float *ax, float *ay)
 {
     dwt_setinterrupt(INT_RX_PHASE, 0, DWT_ENABLE_INT_ONLY);
 
@@ -396,7 +386,7 @@ static void fmt_coord(char *buf, size_t len, float v)
  * (<=20 bytes for the NUS limit) and enqueue to the BLE sender. A future
  * UWB-to-master sender replaces only this function body.
  */
-static void position_publish(float x, float y)
+void position_publish(float x, float y)
 {
     char xs[16], ys[16];
 
@@ -427,6 +417,9 @@ static void ss_twr_fn(void *p1, void *p2, void *p3)
         twr_log("CAL REQUIRED\n");
     }
 
+    /* Section (b) — the free-running ranging sweep — has been removed.
+     * The runner thread (uwb_net_runner.c) now owns the ranging cadence.
+     * This loop only services calibration requests. */
     while (1) {
         uint32_t ref_mm;
         if (cal_take_request(&ref_mm)) {
@@ -442,57 +435,14 @@ static void ss_twr_fn(void *p1, void *p2, void *p3)
 
         if (!ranging) {
             cal_wait_request();   /* block until a cal command arrives */
-            continue;
-        }
-
-        uint32_t cycle_start = k_uptime_get_32();
-
-        struct pos_meas meas[POS_NUM_ANCHORS];
-        size_t n = 0;
-
-        for (size_t i = 0; i < POS_NUM_ANCHORS; i++) {
-            float r, ax, ay;
-            if (do_one_range_anchor(ANCHOR_IDS[i], &r, &ax, &ay)) {
-                meas[n].x = ax;
-                meas[n].y = ay;
-                meas[n].range_m = r;
-                n++;
-            }
-            if (i + 1 < POS_NUM_ANCHORS) {
-                k_sleep(K_MSEC(INTER_ANCHOR_DELAY_MS));
-            }
-        }
-
-        twr_log("R:%zu\n", n);
-
-        struct pos_result pos;
-        if (n >= 3 && pos_solve(meas, n, &pos)) {
-            position_publish(pos.x, pos.y);
-        } else if (n >= 3) {
-            twr_log("LLS fail\n");
-        }
-
-        /* Hold the configured cadence as a true period: subtract the time the
-         * ranging cycle itself took. If the cycle already overran the period,
-         * skip the wait and start the next one immediately. */
-        uint32_t wait_ms = ss_moving ? RNG_FAST_MS : RNG_SLOW_MS;
-        uint32_t elapsed = k_uptime_get_32() - cycle_start;
-        if (elapsed < wait_ms) {
-            k_sem_take(&range_tick, K_MSEC(wait_ms - elapsed));
         }
     }
 }
 
-/* ---- Public API ------------------------------------------------------------ */
-
+/* Compatibility shim: motion.c calls this; route to the runner's tier API. */
 void uwb_set_moving(bool moving)
 {
-    bool was_moving = ss_moving;
-
-    ss_moving = moving;
-    if (moving && !was_moving) {
-        k_sem_give(&range_tick);   /* cut a slow wait short */
-    }
+    uwb_net_set_tier(moving ? UWB_TIER_FAST : UWB_TIER_IDLE);
 }
 
 void uwb_ss_initiator_start(void)
