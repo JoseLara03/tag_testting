@@ -2,3 +2,5 @@ build*/
 CLAUDE.md
 docs/
 .vscode/
+*.exe
+/tmp/
