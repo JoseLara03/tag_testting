@@ -19,10 +19,34 @@ static const struct bt_data sd[] = {
             sizeof(CONFIG_BT_DEVICE_NAME) - 1),
 };
 
+static ble_state_cb_t state_cb;
+
+void ble_log_set_state_cb(ble_state_cb_t cb)
+{
+    state_cb = cb;
+}
+
+/* Deferred advertising restart — must NOT be called from the BT RX thread
+ * because bt_le_adv_start() sends an HCI command and waits for the completion
+ * event, which is also processed by the BT RX thread → deadlock. */
+static struct k_work adv_work;
+
+static void adv_work_fn(struct k_work *work)
+{
+    ARG_UNUSED(work);
+    bt_le_adv_start(BT_LE_ADV_CONN_FAST_2, ad, ARRAY_SIZE(ad), sd, ARRAY_SIZE(sd));
+    if (state_cb) {
+        state_cb(BLE_STATE_ADVERTISING);
+    }
+}
+
 static void on_connected(struct bt_conn *conn, uint8_t err)
 {
     if (!err) {
         current_conn = bt_conn_ref(conn);
+        if (state_cb) {
+            state_cb(BLE_STATE_CONNECTED);
+        }
     }
 }
 
@@ -32,6 +56,7 @@ static void on_disconnected(struct bt_conn *conn, uint8_t reason)
         bt_conn_unref((struct bt_conn *)current_conn);
         current_conn = NULL;
     }
+    k_work_submit(&adv_work);
 }
 
 BT_CONN_CB_DEFINE(conn_callbacks) = {
@@ -39,9 +64,19 @@ BT_CONN_CB_DEFINE(conn_callbacks) = {
     .disconnected = on_disconnected,
 };
 
+static ble_rx_handler_t rx_handler;
+
+void ble_log_set_rx_handler(ble_rx_handler_t handler)
+{
+    rx_handler = handler;
+}
+
 static void nus_received(struct bt_conn *conn, const uint8_t *data, uint16_t len)
 {
-    /* TX-only — ignore incoming data */
+    ARG_UNUSED(conn);
+    if (rx_handler) {
+        rx_handler(data, len);
+    }
 }
 
 static void nus_send_enabled(enum bt_nus_send_status status)
@@ -59,6 +94,8 @@ static struct bt_nus_cb nus_cb = {
 int ble_log_init(void)
 {
     int err;
+
+    k_work_init(&adv_work, adv_work_fn);
 
     err = bt_enable(NULL);
     if (err) {

@@ -5,11 +5,11 @@
 
 #define CONFIG_OPTION CONFIG_OPTION_07
 
-/* Calibrated UWB antenna delay (device time units), split equally between TX
- * and RX. Determined by SS-TWR ranging against a DWM3001CDK anchor at a known
- * reference distance (see src/uwb_ss_initiator.c). The sum (TX+RX) is the
- * device antenna delay; increasing it decreases the reported distance.
- * TODO: persist this in nRF52 NVS instead of hard-coding (out of scope now). */
+/* Factory-reference antenna delay (device time units), split equally between
+ * TX and RX. This is ONLY the seed/fallback used by the calibration routine on
+ * an uncalibrated unit — the active value is now per-unit and stored in NVS by
+ * src/cal.c (see the `cal <mm>` BLE command). Each unit must be calibrated
+ * before ranging starts (CONFIG_OPTION-specific). */
 #define TX_ANT_DLY 16371
 #define RX_ANT_DLY 16371
 
