@@ -38,7 +38,7 @@
 
 /* Anchors to range each cycle (static; <=4). Positioning needs >=3 of these
  * to respond in a cycle to produce a fix. Edit and rebuild to change the set. */
-static const uint8_t ANCHOR_IDS[] = { 1, 2, 3, 4 };
+static const uint8_t ANCHOR_IDS[] = { 0, 1, 2, 3 };
 #define POS_NUM_ANCHORS  ARRAY_SIZE(ANCHOR_IDS)
 
 /* Settle time between anchors within one cycle (radio turnaround margin). */
@@ -463,9 +463,13 @@ static void ss_twr_fn(void *p1, void *p2, void *p3)
             }
         }
 
+        twr_log("R:%zu\n", n);
+
         struct pos_result pos;
         if (n >= 3 && pos_solve(meas, n, &pos)) {
             position_publish(pos.x, pos.y);
+        } else if (n >= 3) {
+            twr_log("LLS fail\n");
         }
 
         /* Hold the configured cadence as a true period: subtract the time the
