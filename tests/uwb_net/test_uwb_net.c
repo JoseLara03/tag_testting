@@ -95,11 +95,68 @@ static void test_grant_discover(void)
     CHECK(c2.state == UWB_ST_SCAN);
 }
 
+/* Helper: drive a fresh ctx into RANGING with the given tier. */
+static void to_ranging(struct uwb_net_ctx *c, uwb_tier_t tier)
+{
+    uwb_net_init(c, EUI);
+    struct uwb_net_event b = ev_beacon(0, false, 0); uwb_net_handle(c, &b);
+    struct uwb_net_event g = ev_grant(0x0007, 3, tier, UWB_NET_LEASE_SF); uwb_net_handle(c, &g);
+    struct uwb_net_event d; memset(&d, 0, sizeof(d)); d.kind = UWB_EV_DISCOVERED; d.n_anchors = 4;
+    uwb_net_handle(c, &d);   /* -> RANGING */
+}
+
+static void test_ranging(void)
+{
+    struct uwb_net_ctx c; to_ranging(&c, UWB_TIER_FAST);
+
+    /* FAST beacon, lease healthy, in map, due -> sweep + sleep, no keepalive. */
+    struct uwb_net_event b = ev_beacon(2, true, 3);
+    uint32_t a = uwb_net_handle(&c, &b);
+    CHECK(a & UWB_ACT_RUN_SWEEP);
+    CHECK(!(a & UWB_ACT_SEND_KEEPALIVE));
+    CHECK(c.slot_index == 3);
+
+    /* SLOW tier, frame_counter not a multiple of 5 -> sleep, no sweep. */
+    struct uwb_net_ctx cs; to_ranging(&cs, UWB_TIER_SLOW);
+    struct uwb_net_event b1 = ev_beacon(1, true, 3);
+    CHECK(uwb_net_handle(&cs, &b1) == UWB_ACT_SLEEP);
+    struct uwb_net_event b5 = ev_beacon(5, true, 3);
+    CHECK(uwb_net_handle(&cs, &b5) & UWB_ACT_RUN_SWEEP);
+
+    /* Lease decays to half -> keepalive flag set, lease renewed. */
+    struct uwb_net_ctx ck; to_ranging(&ck, UWB_TIER_FAST);
+    ck.lease_remaining = UWB_NET_LEASE_SF / 2;     /* at threshold */
+    struct uwb_net_event bk = ev_beacon(2, true, 3);
+    CHECK(uwb_net_handle(&ck, &bk) & UWB_ACT_SEND_KEEPALIVE);
+    CHECK(ck.lease_remaining == UWB_NET_LEASE_SF);  /* renewed optimistically */
+
+    /* Beacon miss x M -> SCAN, never a TX action. */
+    struct uwb_net_ctx cm; to_ranging(&cm, UWB_TIER_FAST);
+    struct uwb_net_event miss; memset(&miss, 0, sizeof(miss)); miss.kind = UWB_EV_BEACON_MISS;
+    CHECK(uwb_net_handle(&cm, &miss) == UWB_ACT_NONE);
+    CHECK(uwb_net_handle(&cm, &miss) == UWB_ACT_NONE);
+    CHECK(uwb_net_handle(&cm, &miss) == UWB_ACT_TO_SCAN);
+    CHECK(cm.state == UWB_ST_SCAN);
+
+    /* Addr absent from map -> SCAN immediately. */
+    struct uwb_net_ctx cr; to_ranging(&cr, UWB_TIER_FAST);
+    struct uwb_net_event gone = ev_beacon(2, false, 0);
+    CHECK(uwb_net_handle(&cr, &gone) == UWB_ACT_TO_SCAN);
+    CHECK(cr.state == UWB_ST_SCAN);
+
+    /* Sweep returns too few anchors -> re-discover. */
+    struct uwb_net_ctx cd; to_ranging(&cd, UWB_TIER_FAST);
+    struct uwb_net_event sw; memset(&sw, 0, sizeof(sw)); sw.kind = UWB_EV_SWEPT; sw.n_anchors = 2;
+    CHECK(uwb_net_handle(&cd, &sw) == UWB_ACT_RUN_DISCOVER);
+    CHECK(cd.state == UWB_ST_DISCOVER);
+}
+
 int main(void)
 {
     test_init_and_cadence();
     test_scan_join();
     test_grant_discover();
+    test_ranging();
     printf(g_fail ? "FAILED %d\n" : "OK\n", g_fail);
     return g_fail ? 1 : 0;
 }

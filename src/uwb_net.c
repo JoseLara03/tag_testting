@@ -92,6 +92,45 @@ uint32_t uwb_net_handle(struct uwb_net_ctx *c, const struct uwb_net_event *ev)
         }
         return UWB_ACT_NONE;
 
+    case UWB_ST_RANGING:
+        if (ev->kind == UWB_EV_BEACON_MISS) {
+            if (++c->miss_count >= UWB_NET_MISS_MAX) {
+                c->state = UWB_ST_SCAN; c->miss_count = 0;
+                return UWB_ACT_TO_SCAN;
+            }
+            return UWB_ACT_NONE;            /* never TX on a missed beacon */
+        }
+        if (ev->kind == UWB_EV_SWEPT) {
+            if (ev->n_anchors < UWB_NET_MIN_ANCHORS) {
+                c->state = UWB_ST_DISCOVER;
+                return UWB_ACT_RUN_DISCOVER;
+            }
+            return UWB_ACT_NONE;
+        }
+        if (ev->kind == UWB_EV_BEACON) {
+            c->miss_count = 0;
+            c->frame_counter = ev->frame_counter;
+            if (!ev->in_map) {              /* lease reclaimed */
+                c->state = UWB_ST_SCAN;
+                return UWB_ACT_TO_SCAN;
+            }
+            c->slot_index = ev->map_slot;
+            if (c->lease_remaining > 0) c->lease_remaining--;
+
+            uint32_t act = 0;
+            if (c->lease_remaining <= (UWB_NET_LEASE_SF / 2)) {
+                act |= UWB_ACT_SEND_KEEPALIVE;
+                c->lease_remaining = UWB_NET_LEASE_SF;   /* optimistic renew */
+            }
+            if (uwb_tier_due(c->tier, c->frame_counter)) {
+                act |= UWB_ACT_RUN_SWEEP;
+            } else {
+                act |= UWB_ACT_SLEEP;
+            }
+            return act;
+        }
+        return UWB_ACT_NONE;
+
     default:
         return UWB_ACT_NONE;
     }
