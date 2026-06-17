@@ -182,6 +182,23 @@ static void test_corruption(void)
     CHECK(!uwb_frame_is_response(buf, UWB_FRAME_LEN_RESP - 1));
 }
 
+static void test_new_constants(void)
+{
+    CHECK(UWB_FRAME_TYPE_BEACON    == 0xE5);
+    CHECK(UWB_FRAME_TYPE_JOIN      == 0xE6);
+    CHECK(UWB_FRAME_TYPE_GRANT     == 0xE7);
+    CHECK(UWB_FRAME_TYPE_KEEPALIVE == 0xE8);
+    CHECK(UWB_FRAME_TYPE_RELEASE   == 0xE9);
+    CHECK(UWB_ADDR_GATEWAY == 0x0000);
+    CHECK(UWB_ADDR_UNASSOC == 0xFFFE);
+    CHECK(UWB_FRAME_N_CFP  == 12);
+    CHECK(UWB_FRAME_LEN_BEACON == 15 + 2 * 12);  /* 39 */
+    CHECK(UWB_FRAME_LEN_JOIN   == 19);
+    CHECK(UWB_FRAME_LEN_GRANT  == 24);
+    CHECK(UWB_FRAME_LEN_KEEPALIVE == 12);
+    CHECK(UWB_FRAME_LEN_RELEASE   == 10);
+}
+
 int main(void)
 {
     test_scaffold();
@@ -190,6 +207,7 @@ int main(void)
     test_response();
     test_multipoll();
     test_corruption();
+    test_new_constants();
     if (g_fail) { printf("%d CHECK(s) FAILED\n", g_fail); return 1; }
     printf("ALL TESTS PASSED\n");
     return 0;

@@ -10,6 +10,20 @@
 #define UWB_FRAME_TYPE_MPOL   0xE3
 #define UWB_FRAME_TYPE_RESP   0xE4
 
+/* ---- TDMA MAC message types (contract v1) ---- */
+#define UWB_FRAME_TYPE_BEACON    0xE5
+#define UWB_FRAME_TYPE_JOIN      0xE6
+#define UWB_FRAME_TYPE_GRANT     0xE7
+#define UWB_FRAME_TYPE_KEEPALIVE 0xE8
+#define UWB_FRAME_TYPE_RELEASE   0xE9
+
+#define UWB_ADDR_GATEWAY  0x0000u
+#define UWB_ADDR_UNASSOC  0xFFFEu   /* tag src before it is granted a short addr */
+
+#define UWB_PROTO_VER     1
+#define UWB_FRAME_N_CFP   12        /* ranging slots per superframe (v1) */
+#define UWB_FRAME_N_CAP   4         /* CAP Aloha mini-slots (v1) */
+
 #define UWB_FRAME_PANID       0xCADE  /* written as literal bytes 0xCA,0xDE */
 #define UWB_FRAME_ADDR_BCAST  0xFFFF
 #define UWB_FRAME_MAX_ANCHORS 4
@@ -21,6 +35,13 @@
 
 /* Multi-poll is variable length: header(10) + num(1) + n*(addr2+delay2) + ts(4). */
 #define UWB_FRAME_LEN_MPOL(n)  (15 + 4 * (n))
+
+#define UWB_FRAME_LEN_BEACON     (15 + 2 * UWB_FRAME_N_CFP)
+#define UWB_FRAME_LEN_JOIN       19
+#define UWB_FRAME_LEN_GRANT      24
+#define UWB_FRAME_LEN_KEEPALIVE  12
+#define UWB_FRAME_LEN_RELEASE    10
+#define UWB_FRAME_EUI_LEN        8
 
 struct uwb_anchor_slot {
     uint16_t addr;      /* anchor short address */
