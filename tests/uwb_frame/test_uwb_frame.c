@@ -199,6 +199,32 @@ static void test_new_constants(void)
     CHECK(UWB_FRAME_LEN_RELEASE   == 10);
 }
 
+static void test_beacon(void)
+{
+    uint16_t map[UWB_FRAME_N_CFP] = {0};
+    for (int i = 0; i < UWB_FRAME_N_CFP; i++) map[i] = 0xFFFF;  /* all idle */
+    map[3] = 0x1234;  /* our slot */
+
+    uint8_t buf[64];
+    int n = uwb_frame_beacon_build(buf, sizeof(buf), 0xAABBCCDD, map, UWB_FRAME_N_CFP);
+    CHECK(n == UWB_FRAME_LEN_BEACON);
+    CHECK(buf[5] == 0xFF && buf[6] == 0xFF);       /* dest broadcast */
+    CHECK(buf[7] == 0x00 && buf[8] == 0x00);       /* src gateway */
+    CHECK(buf[9] == UWB_FRAME_TYPE_BEACON);
+    CHECK(buf[10] == UWB_PROTO_VER);
+    CHECK(buf[11] == 0xDD && buf[14] == 0xAA);     /* counter LE */
+    CHECK(uwb_frame_is_beacon(buf, n));
+
+    uint8_t ver, ns; uint32_t fc; uint16_t out[UWB_FRAME_N_CFP];
+    CHECK(uwb_frame_parse_beacon(buf, n, &ver, &fc, out, &ns) == 0);
+    CHECK(ver == UWB_PROTO_VER && fc == 0xAABBCCDD && ns == UWB_FRAME_N_CFP);
+    CHECK(out[3] == 0x1234 && out[0] == 0xFFFF);
+    CHECK(uwb_frame_beacon_find_addr(out, ns, 0x1234) == 3);
+    CHECK(uwb_frame_beacon_find_addr(out, ns, 0x9999) == -1);
+
+    CHECK(uwb_frame_beacon_build(buf, 5, 0, map, UWB_FRAME_N_CFP) == -EMSGSIZE);
+}
+
 int main(void)
 {
     test_scaffold();
@@ -208,6 +234,7 @@ int main(void)
     test_multipoll();
     test_corruption();
     test_new_constants();
+    test_beacon();
     if (g_fail) { printf("%d CHECK(s) FAILED\n", g_fail); return 1; }
     printf("ALL TESTS PASSED\n");
     return 0;

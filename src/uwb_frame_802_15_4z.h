@@ -31,7 +31,7 @@
 #define UWB_FRAME_HDR_LEN     10  /* bytes 0-9 common header */
 #define UWB_FRAME_LEN_DISC    14
 #define UWB_FRAME_LEN_RESP    20
-#define UWB_FRAME_MAX_LEN     31  /* 4-anchor multi-poll, excl. FCS */
+#define UWB_FRAME_MAX_LEN     39  /* BEACON with 12 slots, excl. FCS */
 
 /* Multi-poll is variable length: header(10) + num(1) + n*(addr2+delay2) + ts(4). */
 #define UWB_FRAME_LEN_MPOL(n)  (15 + 4 * (n))
@@ -68,6 +68,15 @@ int uwb_frame_parse_discovery_response(const uint8_t *buf, size_t len,
 int uwb_frame_parse_multipoll(const uint8_t *buf, size_t len,
                               struct uwb_anchor_slot *slots_out,
                               uint8_t *num_slots, uint32_t *tx_ts);
+
+/* ---- BEACON frame builders and parsers ---- */
+int  uwb_frame_beacon_build(uint8_t *buf, size_t buf_len, uint32_t frame_counter,
+                            const uint16_t *slot_map, uint8_t n_slots);
+int  uwb_frame_parse_beacon(const uint8_t *buf, size_t len, uint8_t *proto_ver,
+                            uint32_t *frame_counter, uint16_t *slot_map_out,
+                            uint8_t *n_slots);
+bool uwb_frame_is_beacon(const uint8_t *buf, size_t len);
+int  uwb_frame_beacon_find_addr(const uint16_t *slot_map, uint8_t n_slots, uint16_t addr);
 
 /* ---- Validators ---- */
 bool uwb_frame_is_valid(const uint8_t *buf, size_t len);

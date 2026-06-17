@@ -199,3 +199,57 @@ uint16_t uwb_frame_get_src_addr(const uint8_t *buf)  { return get_u16(&buf[OFF_S
 uint16_t uwb_frame_get_dest_addr(const uint8_t *buf) { return get_u16(&buf[OFF_DEST]); }
 uint8_t  uwb_frame_get_seq_num(const uint8_t *buf)   { return buf[OFF_SEQ]; }
 void     uwb_frame_set_seq_num(uint8_t *buf, uint8_t seq) { buf[OFF_SEQ] = seq; }
+
+/* ---- BEACON frame support ---- */
+
+/* Common header writer for BEACON (validates buffer size). */
+static int write_hdr_beacon(uint8_t *buf, size_t buf_len, size_t need,
+                            uint16_t dest, uint16_t src, uint8_t type)
+{
+    if (!buf) return -EINVAL;
+    if (buf_len < need) return -EMSGSIZE;
+    buf[OFF_FC0] = 0x41; buf[OFF_FC1] = 0x88; buf[OFF_SEQ] = 0;
+    buf[OFF_PAN] = 0xCA; buf[OFF_PAN + 1] = 0xDE;
+    put_u16(&buf[OFF_DEST], dest);
+    put_u16(&buf[OFF_SRC], src);
+    buf[OFF_TYPE] = type;
+    return 0;
+}
+
+int uwb_frame_beacon_build(uint8_t *buf, size_t buf_len, uint32_t frame_counter,
+                           const uint16_t *slot_map, uint8_t n_slots)
+{
+    size_t need = 15u + 2u * (size_t)n_slots;
+    int rc = write_hdr_beacon(buf, buf_len, need, UWB_FRAME_ADDR_BCAST,
+                              UWB_ADDR_GATEWAY, UWB_FRAME_TYPE_BEACON);
+    if (rc) return rc;
+    if (!slot_map) return -EINVAL;
+    buf[10] = UWB_PROTO_VER;
+    put_u32(&buf[11], frame_counter);
+    for (uint8_t i = 0; i < n_slots; i++) put_u16(&buf[15 + 2 * i], slot_map[i]);
+    return (int)need;
+}
+
+bool uwb_frame_is_beacon(const uint8_t *buf, size_t len)
+{
+    return len >= 15 && uwb_frame_is_valid(buf, len) && buf[OFF_TYPE] == UWB_FRAME_TYPE_BEACON;
+}
+
+int uwb_frame_parse_beacon(const uint8_t *buf, size_t len, uint8_t *proto_ver,
+                           uint32_t *frame_counter, uint16_t *slot_map_out, uint8_t *n_slots)
+{
+    if (!uwb_frame_is_beacon(buf, len)) return -EINVAL;
+    if (((len - 15) % 2) != 0) return -EINVAL;
+    uint8_t ns = (uint8_t)((len - 15) / 2);
+    if (proto_ver) *proto_ver = buf[10];
+    if (frame_counter) *frame_counter = get_u32(&buf[11]);
+    if (slot_map_out) for (uint8_t i = 0; i < ns; i++) slot_map_out[i] = get_u16(&buf[15 + 2 * i]);
+    if (n_slots) *n_slots = ns;
+    return 0;
+}
+
+int uwb_frame_beacon_find_addr(const uint16_t *slot_map, uint8_t n_slots, uint16_t addr)
+{
+    for (uint8_t i = 0; i < n_slots; i++) if (slot_map[i] == addr) return (int)i;
+    return -1;
+}
