@@ -18,6 +18,7 @@ target_sources(app PRIVATE
     src/motion.c
     src/tag_ui.c
     src/uwb_frame_802_15_4z.c
+    src/uwb_net.c
     drivers/lis2hh12-pid/lis2hh12_reg.c
     platform/port.c
     platform/deca_spi.c
