@@ -44,6 +44,15 @@ uint32_t uwb_net_handle(struct uwb_net_ctx *c, const struct uwb_net_event *ev)
         return UWB_ACT_NONE;
 
     case UWB_ST_JOINING:
+        if (ev->kind == UWB_EV_GRANT) {
+            c->short_addr      = ev->g_short_addr;
+            c->slot_index      = ev->g_slot;
+            c->tier            = (uwb_tier_t)ev->g_tier;
+            c->lease_remaining = ev->g_lease;
+            c->miss_count      = 0;
+            c->state           = UWB_ST_DISCOVER;
+            return UWB_ACT_RUN_DISCOVER;
+        }
         if (ev->kind == UWB_EV_GRANT_MISS) {
             if (++c->join_retries >= UWB_NET_JOIN_RETRY_MAX) {
                 c->state = UWB_ST_SCAN;
@@ -55,7 +64,33 @@ uint32_t uwb_net_handle(struct uwb_net_ctx *c, const struct uwb_net_event *ev)
             c->miss_count = 0;
             c->frame_counter = ev->frame_counter;
         }
-        return UWB_ACT_NONE;   /* GRANT handled in Task 7 */
+        return UWB_ACT_NONE;
+
+    case UWB_ST_DISCOVER:
+        if (ev->kind == UWB_EV_DISCOVERED) {
+            c->n_anchors = ev->n_anchors;
+            if (ev->n_anchors >= UWB_NET_MIN_ANCHORS) {
+                c->state = UWB_ST_RANGING;
+                return UWB_ACT_NONE;
+            }
+            return UWB_ACT_RUN_DISCOVER;    /* retry */
+        }
+        if (ev->kind == UWB_EV_BEACON_MISS) {
+            if (++c->miss_count >= UWB_NET_MISS_MAX) {
+                c->state = UWB_ST_SCAN; c->miss_count = 0;
+                return UWB_ACT_TO_SCAN;
+            }
+            return UWB_ACT_NONE;
+        }
+        if (ev->kind == UWB_EV_BEACON) {
+            c->miss_count = 0;
+            c->frame_counter = ev->frame_counter;
+            if (!ev->in_map) {             /* gateway reclaimed our seat */
+                c->state = UWB_ST_SCAN;
+                return UWB_ACT_TO_SCAN;
+            }
+        }
+        return UWB_ACT_NONE;
 
     default:
         return UWB_ACT_NONE;
