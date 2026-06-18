@@ -60,9 +60,11 @@ uint32_t uwb_net_handle(struct uwb_net_ctx *c, const struct uwb_net_event *ev)
             }
             return UWB_ACT_SEND_JOIN;
         }
-        if (ev->kind == UWB_EV_BEACON) {
+        if (ev->kind == UWB_EV_BEACON &&
+            ev->proto_ver == UWB_NET_PROTO_VER) {
             c->miss_count = 0;
             c->frame_counter = ev->frame_counter;
+            return UWB_ACT_SEND_JOIN;   /* retry each beacon until GRANT */
         }
         return UWB_ACT_NONE;
 
@@ -89,6 +91,7 @@ uint32_t uwb_net_handle(struct uwb_net_ctx *c, const struct uwb_net_event *ev)
                 c->state = UWB_ST_SCAN;
                 return UWB_ACT_TO_SCAN;
             }
+            return UWB_ACT_RUN_DISCOVER;   /* retry until >= MIN_ANCHORS */
         }
         return UWB_ACT_NONE;
 

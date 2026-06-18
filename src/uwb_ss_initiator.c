@@ -434,7 +434,7 @@ static void ss_twr_fn(void *p1, void *p2, void *p3)
         } else if (!ranging) {
             cal_wait_request();   /* block until a cal command arrives */
         } else {
-            k_sleep(K_MSEC(100));  /* yield while awaiting optional cal request */
+            k_sleep(K_MSEC(100)); /* yield while awaiting optional cal request */
         }
     }
 }
@@ -449,7 +449,7 @@ void uwb_ss_initiator_start(void)
 {
     k_thread_create(&ss_ble_tx_tid, ss_ble_tx_stack,
                     K_THREAD_STACK_SIZEOF(ss_ble_tx_stack),
-                    ble_tx_fn, NULL, NULL, NULL,
+                    ble_tx_fn,  NULL, NULL, NULL,
                     BLE_TX_PRIO, 0, K_NO_WAIT);
 
     k_thread_create(&ss_twr_tid, ss_twr_stack,

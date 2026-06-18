@@ -17,11 +17,20 @@
 #include "port.h"
 #include "deca_device_api.h"
 #include "phy_config.h"
+#include "ble_log.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/random/random.h>
+#include <stdio.h>
 #include <string.h>
 #include <errno.h>
+
+/* Temporary diagnostic helper — remove after C7.3 verified. */
+static void dbg(const char *msg) { ble_log_send(msg); }
+
+/* Interrupt mask for beacon/grant RX; mirrors INT_RX_PHASE in uwb_ss_initiator.c. */
+#define INT_RX_PHASE  (DWT_INT_RXFCG_BIT_MASK | DWT_INT_RXFTO_BIT_MASK | \
+                       DWT_INT_RXPTO_BIT_MASK  | SYS_STATUS_ALL_RX_ERR)
 
 /* ---- v1 timing constants (protocol contract §2.1) ---- */
 #define T_SUPERFRAME_MS   200u
@@ -84,6 +93,12 @@ void uwb_radio_sleep_until(uint32_t wake_ms)
  */
 int uwb_radio_rx_beacon(uint8_t *buf, size_t buf_len, uint32_t timeout_ms)
 {
+    /* Beacon window: no hardware RX/preamble timeout; the kernel timeout in
+     * wait_event() is the only gate.  ss_twr_fn leaves RESP_RX_TIMEOUT_UUS
+     * (2 ms) armed, which would fire before any beacon arrives. */
+    dwt_setrxtimeout(0);
+    dwt_setpreambledetecttimeout(0);
+    dwt_setinterrupt(INT_RX_PHASE, 0, DWT_ENABLE_INT_ONLY);
     dwt_rxenable(DWT_START_RX_IMMEDIATE);
 
     irq_evt_t evt = wait_event(K_MSEC(timeout_ms));
@@ -93,16 +108,17 @@ int uwb_radio_rx_beacon(uint8_t *buf, size_t buf_len, uint32_t timeout_ms)
         return -ETIMEDOUT;
     }
 
-    uint16_t flen = dwt_getframelength();
+    uint16_t flen = dwt_getframelength();   /* includes 2-byte FCS */
 
-    if (flen == 0 || flen > (uint16_t)buf_len) {
+    if (flen <= FCS_LEN || (flen - FCS_LEN) > (uint16_t)buf_len) {
         dwt_writesysstatuslo(DWT_INT_RXFCG_BIT_MASK);
         return -EIO;
     }
 
-    dwt_readrxdata(buf, flen, 0);
+    uint16_t dlen = (uint16_t)(flen - FCS_LEN);
+    dwt_readrxdata(buf, dlen, 0);
     dwt_writesysstatuslo(DWT_INT_RXFCG_BIT_MASK);
-    return (int)flen;
+    return (int)dlen;
 }
 
 /*
@@ -117,6 +133,7 @@ int uwb_radio_tx_cap(const uint8_t *buf, size_t len, uint8_t minislot)
 
     dwt_writetxdata((uint16_t)len, (uint8_t *)(uintptr_t)buf, 0);
     dwt_writetxfctrl((uint16_t)(len + 2U), 0, 0);   /* +2 for FCS */
+    dwt_setinterrupt(DWT_INT_TXFRS_BIT_MASK, 0, DWT_ENABLE_INT_ONLY);
     dwt_starttx(DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED);
 
     irq_evt_t evt = wait_event(K_MSEC(50));
@@ -197,6 +214,13 @@ static void runner_fn(void *p1, void *p2, void *p3)
                                              T_SUPERFRAME_MS);
         uint32_t t0_ms = uwb_radio_now_ms();
 
+        /* Diagnostic: report every beacon_len result (len or timeout). */
+        {
+            char tmp[20];
+            snprintf(tmp, sizeof(tmp), "BL:%d\n", beacon_len);
+            dbg(tmp);
+        }
+
         /* 3. Build the event. */
         struct uwb_net_event ev = { 0 };
 
@@ -231,6 +255,7 @@ static void runner_fn(void *p1, void *p2, void *p3)
         /* 4. Execute actions. */
 
         if (act & UWB_ACT_SEND_JOIN) {
+            dbg("JOIN>\n");
             uint8_t join_buf[UWB_FRAME_LEN_JOIN];
             int jlen = uwb_frame_join_build(join_buf, sizeof(join_buf),
                                             runner_eui,
@@ -238,7 +263,12 @@ static void runner_fn(void *p1, void *p2, void *p3)
             if (jlen > 0) {
                 /* Pick a random mini-slot (0 .. N_CAP-1) for Aloha. */
                 uint8_t mslot = (uint8_t)(sys_rand32_get() % N_CAP);
-                uwb_radio_tx_cap(join_buf, (size_t)jlen, mslot);
+                int tx_rc = uwb_radio_tx_cap(join_buf, (size_t)jlen, mslot);
+                {
+                    char tmp[16];
+                    snprintf(tmp, sizeof(tmp), "TX:%d\n", tx_rc);
+                    dbg(tmp);
+                }
 
                 /* Listen briefly for a GRANT addressed to our EUI. */
                 uint8_t grant_buf[UWB_FRAME_LEN_GRANT];
@@ -270,7 +300,7 @@ static void runner_fn(void *p1, void *p2, void *p3)
                 } else {
                     gev.kind = UWB_EV_GRANT_MISS;
                 }
-                uwb_net_handle(&ctx, &gev);
+                act |= uwb_net_handle(&ctx, &gev);
             }
         }
 
@@ -346,5 +376,47 @@ void uwb_net_runner_start(const uint8_t eui[8])
     k_thread_create(&runner_tid, runner_stack,
                     K_THREAD_STACK_SIZEOF(runner_stack),
                     runner_fn, NULL, NULL, NULL,
+                    RUNNER_PRIO, 0, K_NO_WAIT);
+}
+
+/* =========================================================================
+ * B4.2 test helper — broadcasts DISCOVERY (0xE2) every 500 ms so the anchor
+ * discovery-reply path can be verified without a gateway.
+ * Replace uwb_net_runner_start() with uwb_disc_test_start() in main.c,
+ * then revert when done.
+ * ========================================================================= */
+
+K_THREAD_STACK_DEFINE(disc_test_stack, 1024);
+static struct k_thread disc_test_tid;
+
+static void disc_test_fn(void *p1, void *p2, void *p3)
+{
+    ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
+
+    uint8_t seq = 0;
+
+    while (1) {
+        uint8_t buf[UWB_FRAME_LEN_DISC];
+        int n = uwb_frame_discovery_build(buf, sizeof(buf),
+                                          UWB_ADDR_UNASSOC, 0u);
+        if (n > 0) {
+            uwb_frame_set_seq_num(buf, seq++);
+            dwt_writetxdata((uint16_t)n, buf, 0);
+            dwt_writetxfctrl((uint16_t)(n + 2U), 0, 0);   /* +2 FCS */
+            dwt_starttx(DWT_START_TX_IMMEDIATE);
+            /* Wait for TX done (up to 10 ms) then clear status. */
+            irq_evt_t evt = wait_event(K_MSEC(10));
+            (void)evt;
+            dwt_writesysstatuslo(DWT_INT_TXFRS_BIT_MASK);
+        }
+        k_sleep(K_MSEC(500));
+    }
+}
+
+void uwb_disc_test_start(void)
+{
+    k_thread_create(&disc_test_tid, disc_test_stack,
+                    K_THREAD_STACK_SIZEOF(disc_test_stack),
+                    disc_test_fn, NULL, NULL, NULL,
                     RUNNER_PRIO, 0, K_NO_WAIT);
 }

@@ -63,7 +63,6 @@ int main(void)
         }
         /* Start cal thread (also registers DW3000 callbacks). */
         uwb_ss_initiator_start();
-        /* Start TDMA MAC runner thread (must follow uwb_ss_initiator_start). */
         uwb_net_runner_start(eui);
         if (motion_init() != 0) {
             ble_log_send("motion init fail\n");
