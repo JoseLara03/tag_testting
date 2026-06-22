@@ -444,10 +444,11 @@ static void ss_twr_fn(void *p1, void *p2, void *p3)
     }
 }
 
-/* Compatibility shim: motion.c calls this; route to the runner's tier API. */
+/* Compatibility shim: motion.c calls this; route to the runner's tier API.
+ * Static -> SLOW (1 s cadence); moving -> FAST (200 ms cadence). */
 void uwb_set_moving(bool moving)
 {
-    uwb_net_set_tier(moving ? UWB_TIER_FAST : UWB_TIER_IDLE);
+    uwb_net_set_tier(moving ? UWB_TIER_FAST : UWB_TIER_SLOW);
 }
 
 void uwb_ss_initiator_start(void)

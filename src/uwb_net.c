@@ -26,9 +26,11 @@ void uwb_net_init(struct uwb_net_ctx *c, const uint8_t eui[8])
 
 uint32_t uwb_net_handle(struct uwb_net_ctx *c, const struct uwb_net_event *ev)
 {
-    /* Motion is orthogonal: it only updates the requested tier. */
+    /* Motion updates the requested tier and applies it locally so the ranging
+     * cadence changes immediately without waiting for a gateway re-grant. */
     if (ev->kind == UWB_EV_MOTION) {
         c->req_tier = (uwb_tier_t)ev->req_tier;
+        c->tier     = (uwb_tier_t)ev->req_tier;
         return UWB_ACT_NONE;
     }
 
