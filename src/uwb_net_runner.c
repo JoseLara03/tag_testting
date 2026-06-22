@@ -40,12 +40,8 @@
 #define RESP_RX_TIMEOUT_UUS          2000U
 #define PRE_TIMEOUT                   128U
 
-/* Settle time between consecutive anchor polls in a sweep.  Each non-target
- * anchor still spends ~1 ms processing the previous exchange (CIA wait +
- * diagnostics + frame read) with its RX disarmed; without this gap their poll
- * arrives while they are deaf and only anchor 0 ever answers.  Mirrors the
- * calibration path's INTER_ANCHOR_DELAY_US. */
-#define INTER_ANCHOR_DELAY_US       1500U
+/* Settle time between consecutive anchor polls in a sweep. */
+#define INTER_ANCHOR_DELAY_US        500U
 
 #define DISCOVERY_WINDOW_MS      10U   /* total RX collection window */
 #define DISCOVERY_RX_SLOT_MS      3U   /* per-attempt uwb_radio_rx_beacon timeout */
@@ -84,9 +80,6 @@ static volatile bool        tier_pending;
 /* ---- EUI stored at start ---- */
 static uint8_t runner_eui[UWB_FRAME_EUI_LEN];
 
-/* ---- Anchor set (static; 4 known anchors) ---- */
-static const uint8_t ANCHOR_IDS[] = { 0, 1, 2, 3 };
-#define RUNNER_NUM_ANCHORS  ARRAY_SIZE(ANCHOR_IDS)
 
 /* ---- DW3000 ISR callbacks (mirror the initiator's; same irq_sem/last_evt) ----
  * NOTE: These are NOT registered here — ss_twr_fn in uwb_ss_initiator.c already
@@ -319,9 +312,8 @@ finish:
 static int anchor_sweep(struct pos_meas *out, size_t max)
 {
     /* uwb_radio_rx_beacon() disables both HW timeouts (setrxtimeout(0),
-     * setpreambledetecttimeout(0)) for open-ended beacon listening.  Those
-     * settings persist, so without this restore every failed TWR exchange
-     * burns the full K_MSEC(20) kernel timeout instead of the 2 ms HW one. */
+     * setpreambledetecttimeout(0)) for open-ended beacon/discovery listening.
+     * Those settings persist, so restore them here before TWR. */
     dwt_setrxaftertxdelay(POLL_TX_TO_RESP_RX_DLY_UUS);
     dwt_setrxtimeout(RESP_RX_TIMEOUT_UUS);
     dwt_setpreambledetecttimeout(PRE_TIMEOUT);
@@ -329,17 +321,17 @@ static int anchor_sweep(struct pos_meas *out, size_t max)
     uint32_t t_sweep = k_uptime_get_32();
     size_t n = 0;
 
-    for (size_t i = 0; i < RUNNER_NUM_ANCHORS && n < max; i++) {
+    for (size_t i = 0; i < n_selected && n < max; i++) {
         if (i > 0) {
             k_sleep(K_USEC(INTER_ANCHOR_DELAY_US));
         }
 
         uint32_t t_twr = k_uptime_get_32();
         float r, ax, ay;
-        bool ok = do_one_range_anchor(ANCHOR_IDS[i], &r, &ax, &ay);
+        bool ok = do_one_range_anchor(selected[i], &r, &ax, &ay);
         uint32_t twr_ms = k_uptime_get_32() - t_twr;
 
-        twr_log("A%u:%ums %s\n", ANCHOR_IDS[i], twr_ms, ok ? "ok" : "to");
+        twr_log("A%u:%ums %s\n", selected[i], twr_ms, ok ? "ok" : "to");
 
         if (ok) {
             out[n].x       = ax;
