@@ -47,6 +47,10 @@
  * calibration path's INTER_ANCHOR_DELAY_US. */
 #define INTER_ANCHOR_DELAY_US       1500U
 
+#define DISCOVERY_WINDOW_MS      10U   /* total RX collection window */
+#define DISCOVERY_RX_SLOT_MS      3U   /* per-attempt uwb_radio_rx_beacon timeout */
+#define REDISCOVER_INTERVAL_SF   10U   /* superframes between periodic re-discovery */
+
 /* ---- Anchor-pool / CIR selection ---- */
 #define ANCHOR_POOL_MAX           6
 #define ANCHOR_SELECT_MAX         4
@@ -245,6 +249,70 @@ int uwb_radio_tx_cap(const uint8_t *buf, size_t len, uint8_t minislot)
 }
 
 /*
+ * Broadcast a DISCOVERY frame and collect DISCOVERY_RESPONSE frames for
+ * DISCOVERY_WINDOW_MS.  Updates anchor_pool EMA scores and rebuilds selected[].
+ * src_addr: tag's current short address (UWB_ADDR_UNASSOC before joining).
+ * Note: anchor ID is taken from the low byte of src_addr in each response.
+ * FUTURE WORK: anti-collision — anchors currently respond with Aloha;
+ *   planned fix is per-anchor mini-slot (id × T_MINISLOT_MS).
+ */
+static int run_discovery(uint16_t src_addr)
+{
+    /* Reset seen flags for decay tracking */
+    for (int i = 0; i < ANCHOR_POOL_MAX; i++) {
+        anchor_pool[i].seen = false;
+    }
+
+    /* Broadcast DISCOVERY frame */
+    uint8_t disc_buf[UWB_FRAME_LEN_DISC];
+    int dlen = uwb_frame_discovery_build(disc_buf, sizeof(disc_buf), src_addr, 0u);
+
+    if (dlen > 0) {
+        dwt_writetxdata((uint16_t)dlen, disc_buf, 0);
+        dwt_writetxfctrl((uint16_t)(dlen + 2U), 0, 0);
+        dwt_setinterrupt(DWT_INT_TXFRS_BIT_MASK, 0, DWT_ENABLE_INT_ONLY);
+        dwt_starttx(DWT_START_TX_IMMEDIATE);
+        irq_evt_t evt = wait_event(K_MSEC(10));
+        dwt_writesysstatuslo(DWT_INT_TXFRS_BIT_MASK |
+                             SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+        if (evt != EVT_TXFRS) {
+            goto finish;
+        }
+    }
+
+    /* Collect DISCOVERY_RESPONSE frames within DISCOVERY_WINDOW_MS.
+     * uwb_radio_rx_beacon() disables HW timeouts (setrxtimeout(0)) — correct
+     * for this open-ended collection window; anchor_sweep() restores them. */
+    {
+        uint32_t t_end = k_uptime_get_32() + DISCOVERY_WINDOW_MS;
+        uint8_t  resp_buf[UWB_FRAME_LEN_RESP];
+
+        while ((int32_t)(t_end - k_uptime_get_32()) > 0) {
+            uint32_t rem = (uint32_t)(t_end - k_uptime_get_32());
+            if (rem > DISCOVERY_RX_SLOT_MS) {
+                rem = DISCOVERY_RX_SLOT_MS;
+            }
+            int rlen = uwb_radio_rx_beacon(resp_buf, sizeof(resp_buf), rem);
+            if (rlen > 0 && uwb_frame_is_response(resp_buf, (size_t)rlen)) {
+                uint16_t src  = 0;
+                int32_t  cir_p = 0;
+                uint16_t cir_q = 0;
+                if (uwb_frame_parse_discovery_response(resp_buf, (size_t)rlen,
+                                                        &src, &cir_p, &cir_q) == 0) {
+                    anchor_pool_update((uint8_t)src, cir_p, cir_q);
+                }
+            }
+        }
+    }
+
+finish:
+    anchor_pool_decay_missed();
+    anchor_pool_rebuild_selected();
+    twr_log("DISC:%u\n", n_selected);
+    return n_selected;
+}
+
+/*
  * Sweep all known anchors; fill `out` with measurements; return count.
  * Shared implementation for both discover and sweep.
  */
@@ -287,7 +355,8 @@ static int anchor_sweep(struct pos_meas *out, size_t max)
 
 int uwb_radio_discover(struct pos_meas *out, size_t max)
 {
-    return anchor_sweep(out, max);
+    ARG_UNUSED(out); ARG_UNUSED(max);
+    return run_discovery(UWB_ADDR_UNASSOC);
 }
 
 int uwb_radio_sweep(struct pos_meas *out, size_t max)
