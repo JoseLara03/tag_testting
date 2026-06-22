@@ -368,6 +368,9 @@ static void runner_fn(void *p1, void *p2, void *p3)
 
     uwb_net_init(&ctx, runner_eui);
 
+    static uint8_t sf_since_discover = REDISCOVER_INTERVAL_SF; /* force on first boot */
+    static uint8_t last_sweep_n      = 0;
+
     /* DW3000 callbacks and timing — must be set before the loop.
      * The initiator thread (ss_twr_fn) also calls dwt_setcallbacks; the runner
      * starts later (called from main after uwb_ss_initiator_start), so this
@@ -483,38 +486,52 @@ static void runner_fn(void *p1, void *p2, void *p3)
         }
 
         if (act & UWB_ACT_RUN_DISCOVER) {
-            struct pos_meas meas[POS_MAX_ANCHORS];
-            int n = uwb_radio_discover(meas, POS_MAX_ANCHORS);
+            int n = run_discovery(ctx.short_addr);
+            sf_since_discover = 0;
             struct uwb_net_event dev = {
-                .kind     = UWB_EV_DISCOVERED,
+                .kind      = UWB_EV_DISCOVERED,
                 .n_anchors = (uint8_t)(n > 0 ? n : 0),
             };
             uwb_net_handle(&ctx, &dev);
         }
 
         if (act & UWB_ACT_RUN_SWEEP) {
-            /* Sleep until our CFP slot start. */
-            uint32_t slot_start = t0_ms
-                + T_BEACON_MS + T_GUARD_MS
-                + (uint32_t)N_CAP * T_MINISLOT_MS + T_GUARD_MS
-                + (uint32_t)ctx.slot_index * (T_SLOT_MS + T_GUARD_MS);
+            bool rediscover_due = (sf_since_discover >= REDISCOVER_INTERVAL_SF)
+                               || (last_sweep_n < ANCHOR_SELECT_MIN);
 
-            uwb_radio_sleep_until(slot_start);
+            if (rediscover_due) {
+                /* Re-discovery replaces the sweep this cycle; no position fix.
+                 * Do NOT send UWB_EV_DISCOVERED to the FSM — that event is only
+                 * valid in UWB_ST_DISCOVER state.  If selected[] is still < MIN
+                 * after this round, the next sweep returns n_anchors < 3 which
+                 * sends UWB_EV_SWEPT → FSM falls back to UWB_ST_DISCOVER naturally. */
+                run_discovery(ctx.short_addr);
+                sf_since_discover = 0;
+            } else {
+                /* Sleep until our CFP slot start. */
+                uint32_t slot_start = t0_ms
+                    + T_BEACON_MS + T_GUARD_MS
+                    + (uint32_t)N_CAP * T_MINISLOT_MS + T_GUARD_MS
+                    + (uint32_t)ctx.slot_index * (T_SLOT_MS + T_GUARD_MS);
 
-            struct pos_meas meas[POS_MAX_ANCHORS];
-            int n = uwb_radio_sweep(meas, POS_MAX_ANCHORS);
+                uwb_radio_sleep_until(slot_start);
 
-            struct pos_result pos;
+                struct pos_meas meas[POS_MAX_ANCHORS];
+                int n = uwb_radio_sweep(meas, POS_MAX_ANCHORS);
+                last_sweep_n = (uint8_t)n;
+                sf_since_discover++;
 
-            if (n >= 3 && pos_solve(meas, (size_t)n, &pos)) {
-                position_publish(pos.x, pos.y);
+                struct pos_result pos;
+                if (n >= 3 && pos_solve(meas, (size_t)n, &pos)) {
+                    position_publish(pos.x, pos.y);
+                }
+
+                struct uwb_net_event sev = {
+                    .kind      = UWB_EV_SWEPT,
+                    .n_anchors = (uint8_t)(n > 0 ? n : 0),
+                };
+                uwb_net_handle(&ctx, &sev);
             }
-
-            struct uwb_net_event sev = {
-                .kind      = UWB_EV_SWEPT,
-                .n_anchors = (uint8_t)(n > 0 ? n : 0),
-            };
-            uwb_net_handle(&ctx, &sev);
         }
 
         if (act & UWB_ACT_SLEEP) {
