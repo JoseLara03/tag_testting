@@ -44,8 +44,27 @@
  * anchor still spends ~1 ms processing the previous exchange (CIA wait +
  * diagnostics + frame read) with its RX disarmed; without this gap their poll
  * arrives while they are deaf and only anchor 0 ever answers.  Mirrors the
- * calibration path's INTER_ANCHOR_DELAY_MS. */
-#define INTER_ANCHOR_DELAY_MS          5U
+ * calibration path's INTER_ANCHOR_DELAY_US. */
+#define INTER_ANCHOR_DELAY_US       1500U
+
+/* ---- Anchor-pool / CIR selection ---- */
+#define ANCHOR_POOL_MAX           6
+#define ANCHOR_SELECT_MAX         4
+#define ANCHOR_SELECT_MIN         3
+#define EMA_ALPHA              0.3f
+#define EMA_DECAY              0.5f
+#define CIR_QUALITY_WEIGHT     1.0f
+
+typedef struct {
+    uint8_t id;
+    float   ema_score;
+    bool    valid;
+    bool    seen;   /* transient: set during discovery, cleared before each round */
+} anchor_entry_t;
+
+static anchor_entry_t anchor_pool[ANCHOR_POOL_MAX];
+static uint8_t        selected[ANCHOR_SELECT_MAX];
+static uint8_t        n_selected;
 
 /* ---- Runner thread parameters ---- */
 #define RUNNER_PRIO    2
@@ -69,6 +88,84 @@ static const uint8_t ANCHOR_IDS[] = { 0, 1, 2, 3 };
  * NOTE: These are NOT registered here — ss_twr_fn in uwb_ss_initiator.c already
  * registers cb_txdone / cb_rxok / cb_rxto / cb_rxerr via dwt_setcallbacks and
  * port_set_dwic_isr.  The runner reuses the same irq_sem/wait_event path. */
+
+/* =========================================================================
+ * Anchor pool helpers
+ * ========================================================================= */
+
+static void anchor_pool_update(uint8_t id, int32_t cir_power, uint16_t cir_quality)
+{
+    float score = (float)cir_power + CIR_QUALITY_WEIGHT * (float)cir_quality;
+
+    /* Update existing entry */
+    for (int i = 0; i < ANCHOR_POOL_MAX; i++) {
+        if (anchor_pool[i].valid && anchor_pool[i].id == id) {
+            anchor_pool[i].ema_score = EMA_ALPHA * score +
+                                       (1.0f - EMA_ALPHA) * anchor_pool[i].ema_score;
+            anchor_pool[i].seen = true;
+            return;
+        }
+    }
+    /* New anchor: find empty slot */
+    for (int i = 0; i < ANCHOR_POOL_MAX; i++) {
+        if (!anchor_pool[i].valid) {
+            anchor_pool[i].id        = id;
+            anchor_pool[i].ema_score = score;
+            anchor_pool[i].valid     = true;
+            anchor_pool[i].seen      = true;
+            return;
+        }
+    }
+    /* Pool full: evict lowest-scoring entry */
+    int worst = 0;
+    for (int i = 1; i < ANCHOR_POOL_MAX; i++) {
+        if (anchor_pool[i].ema_score < anchor_pool[worst].ema_score) {
+            worst = i;
+        }
+    }
+    anchor_pool[worst].id        = id;
+    anchor_pool[worst].ema_score = score;
+    anchor_pool[worst].seen      = true;
+}
+
+static void anchor_pool_decay_missed(void)
+{
+    for (int i = 0; i < ANCHOR_POOL_MAX; i++) {
+        if (anchor_pool[i].valid && !anchor_pool[i].seen) {
+            anchor_pool[i].ema_score *= EMA_DECAY;
+        }
+    }
+}
+
+static void anchor_pool_rebuild_selected(void)
+{
+    /* Collect valid pool indices */
+    uint8_t order[ANCHOR_POOL_MAX];
+    uint8_t count = 0;
+
+    for (int i = 0; i < ANCHOR_POOL_MAX; i++) {
+        if (anchor_pool[i].valid) {
+            order[count++] = (uint8_t)i;
+        }
+    }
+
+    /* Insertion sort descending by ema_score (pool ≤ 6, O(n²) is fine) */
+    for (int i = 1; i < count; i++) {
+        uint8_t key = order[i];
+        int j = i - 1;
+        while (j >= 0 &&
+               anchor_pool[order[j]].ema_score < anchor_pool[key].ema_score) {
+            order[j + 1] = order[j];
+            j--;
+        }
+        order[j + 1] = key;
+    }
+
+    n_selected = (count < ANCHOR_SELECT_MAX) ? count : ANCHOR_SELECT_MAX;
+    for (int i = 0; i < n_selected; i++) {
+        selected[i] = anchor_pool[order[i]].id;
+    }
+}
 
 /* =========================================================================
  * uwb_radio_ops implementation
@@ -153,25 +250,38 @@ int uwb_radio_tx_cap(const uint8_t *buf, size_t len, uint8_t minislot)
  */
 static int anchor_sweep(struct pos_meas *out, size_t max)
 {
+    /* uwb_radio_rx_beacon() disables both HW timeouts (setrxtimeout(0),
+     * setpreambledetecttimeout(0)) for open-ended beacon listening.  Those
+     * settings persist, so without this restore every failed TWR exchange
+     * burns the full K_MSEC(20) kernel timeout instead of the 2 ms HW one. */
+    dwt_setrxaftertxdelay(POLL_TX_TO_RESP_RX_DLY_UUS);
+    dwt_setrxtimeout(RESP_RX_TIMEOUT_UUS);
+    dwt_setpreambledetecttimeout(PRE_TIMEOUT);
+
+    uint32_t t_sweep = k_uptime_get_32();
     size_t n = 0;
 
     for (size_t i = 0; i < RUNNER_NUM_ANCHORS && n < max; i++) {
-        float r, ax, ay;
-
-        /* Let the previous exchange clear the air and give every anchor time
-         * to re-arm RX before the next poll (the first poll needs no gap — it
-         * follows the beacon, when all anchors are already listening). */
         if (i > 0) {
-            k_sleep(K_MSEC(INTER_ANCHOR_DELAY_MS));
+            k_sleep(K_USEC(INTER_ANCHOR_DELAY_US));
         }
 
-        if (do_one_range_anchor(ANCHOR_IDS[i], &r, &ax, &ay)) {
+        uint32_t t_twr = k_uptime_get_32();
+        float r, ax, ay;
+        bool ok = do_one_range_anchor(ANCHOR_IDS[i], &r, &ax, &ay);
+        uint32_t twr_ms = k_uptime_get_32() - t_twr;
+
+        twr_log("A%u:%ums %s\n", ANCHOR_IDS[i], twr_ms, ok ? "ok" : "to");
+
+        if (ok) {
             out[n].x       = ax;
             out[n].y       = ay;
             out[n].range_m = r;
             n++;
         }
     }
+
+    twr_log("SW:%ums/%u\n", k_uptime_get_32() - t_sweep, (unsigned)n);
     return (int)n;
 }
 
