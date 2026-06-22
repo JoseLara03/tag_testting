@@ -65,6 +65,8 @@ typedef struct {
 static anchor_entry_t anchor_pool[ANCHOR_POOL_MAX];
 static uint8_t        selected[ANCHOR_SELECT_MAX];
 static uint8_t        n_selected;
+static uint8_t        sf_since_discover = REDISCOVER_INTERVAL_SF; /* force on first boot */
+static uint8_t        last_sweep_n      = 0;
 
 /* ---- Runner thread parameters ---- */
 #define RUNNER_PRIO    2
@@ -367,9 +369,6 @@ static void runner_fn(void *p1, void *p2, void *p3)
     struct uwb_net_ctx ctx;
 
     uwb_net_init(&ctx, runner_eui);
-
-    static uint8_t sf_since_discover = REDISCOVER_INTERVAL_SF; /* force on first boot */
-    static uint8_t last_sweep_n      = 0;
 
     /* DW3000 callbacks and timing — must be set before the loop.
      * The initiator thread (ss_twr_fn) also calls dwt_setcallbacks; the runner
