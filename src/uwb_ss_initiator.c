@@ -244,8 +244,13 @@ bool do_one_range_anchor(uint8_t aid, float *range_m, float *ax, float *ay)
     pos_poll_msg[POS_ANCHOR_ID_IDX] = aid;
     dwt_writetxdata(sizeof(pos_poll_msg), pos_poll_msg, 0);
     dwt_writetxfctrl(sizeof(pos_poll_msg) + FCS_LEN, 0, 1);
-    dwt_starttx(DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED);
+    int tx_rc = dwt_starttx(DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED);
     frame_seq_nb++;
+
+    if (tx_rc != DWT_SUCCESS) {
+        dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+        return false;
+    }
 
     irq_evt_t evt = wait_event(K_MSEC(20));
 

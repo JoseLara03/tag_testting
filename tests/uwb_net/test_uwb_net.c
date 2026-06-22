@@ -95,6 +95,35 @@ static void test_grant_discover(void)
     CHECK(c2.state == UWB_ST_SCAN);
 }
 
+/* Regression: a tag stuck in DISCOVER must keep renewing its lease, otherwise
+ * the gateway reclaims its seat after UWB_NET_LEASE_SF superframes and the tag
+ * is bounced back to SCAN (the ~10 s re-join cycle observed on hardware). */
+static void test_discover_keeps_lease(void)
+{
+    struct uwb_net_ctx c; uwb_net_init(&c, EUI);
+    struct uwb_net_event b = ev_beacon(0, false, 0);
+    uwb_net_handle(&c, &b);                              /* -> JOINING */
+    struct uwb_net_event g = ev_grant(0x0007, 3, UWB_TIER_FAST, UWB_NET_LEASE_SF);
+    uwb_net_handle(&c, &g);                              /* -> DISCOVER, lease=50 */
+    CHECK(c.state == UWB_ST_DISCOVER);
+
+    /* Drive far more beacons than the lease while discovery never reaches
+     * MIN_ANCHORS. The tag must stay in DISCOVER and must emit a keepalive
+     * before the lease could have expired. */
+    bool saw_keepalive = false;
+    for (int i = 0; i < UWB_NET_LEASE_SF * 3; i++) {
+        struct uwb_net_event bi = ev_beacon((uint32_t)(i + 1), true, 3);
+        uint32_t a = uwb_net_handle(&c, &bi);
+        CHECK(a & UWB_ACT_RUN_DISCOVER);
+        CHECK(c.state == UWB_ST_DISCOVER);   /* never bounced to SCAN */
+        if (a & UWB_ACT_SEND_KEEPALIVE) saw_keepalive = true;
+        /* Local lease must never reach 0 (would mean gateway reclaim). */
+        CHECK(c.lease_remaining > 0);
+    }
+    CHECK(saw_keepalive);
+    CHECK(c.slot_index == 3);
+}
+
 /* Helper: drive a fresh ctx into RANGING with the given tier. */
 static void to_ranging(struct uwb_net_ctx *c, uwb_tier_t tier)
 {
@@ -156,6 +185,7 @@ int main(void)
     test_init_and_cadence();
     test_scan_join();
     test_grant_discover();
+    test_discover_keeps_lease();
     test_ranging();
     printf(g_fail ? "FAILED %d\n" : "OK\n", g_fail);
     return g_fail ? 1 : 0;

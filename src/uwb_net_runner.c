@@ -17,16 +17,10 @@
 #include "port.h"
 #include "deca_device_api.h"
 #include "phy_config.h"
-#include "ble_log.h"
-
 #include <zephyr/kernel.h>
 #include <zephyr/random/random.h>
-#include <stdio.h>
 #include <string.h>
 #include <errno.h>
-
-/* Temporary diagnostic helper — remove after C7.3 verified. */
-static void dbg(const char *msg) { ble_log_send(msg); }
 
 /* Interrupt mask for beacon/grant RX; mirrors INT_RX_PHASE in uwb_ss_initiator.c. */
 #define INT_RX_PHASE  (DWT_INT_RXFCG_BIT_MASK | DWT_INT_RXFTO_BIT_MASK | \
@@ -45,6 +39,13 @@ static void dbg(const char *msg) { ble_log_send(msg); }
 #define POLL_TX_TO_RESP_RX_DLY_UUS   1000U
 #define RESP_RX_TIMEOUT_UUS          2000U
 #define PRE_TIMEOUT                   128U
+
+/* Settle time between consecutive anchor polls in a sweep.  Each non-target
+ * anchor still spends ~1 ms processing the previous exchange (CIA wait +
+ * diagnostics + frame read) with its RX disarmed; without this gap their poll
+ * arrives while they are deaf and only anchor 0 ever answers.  Mirrors the
+ * calibration path's INTER_ANCHOR_DELAY_MS. */
+#define INTER_ANCHOR_DELAY_MS          5U
 
 /* ---- Runner thread parameters ---- */
 #define RUNNER_PRIO    2
@@ -157,6 +158,13 @@ static int anchor_sweep(struct pos_meas *out, size_t max)
     for (size_t i = 0; i < RUNNER_NUM_ANCHORS && n < max; i++) {
         float r, ax, ay;
 
+        /* Let the previous exchange clear the air and give every anchor time
+         * to re-arm RX before the next poll (the first poll needs no gap — it
+         * follows the beacon, when all anchors are already listening). */
+        if (i > 0) {
+            k_sleep(K_MSEC(INTER_ANCHOR_DELAY_MS));
+        }
+
         if (do_one_range_anchor(ANCHOR_IDS[i], &r, &ax, &ay)) {
             out[n].x       = ax;
             out[n].y       = ay;
@@ -214,13 +222,6 @@ static void runner_fn(void *p1, void *p2, void *p3)
                                              T_SUPERFRAME_MS);
         uint32_t t0_ms = uwb_radio_now_ms();
 
-        /* Diagnostic: report every beacon_len result (len or timeout). */
-        {
-            char tmp[20];
-            snprintf(tmp, sizeof(tmp), "BL:%d\n", beacon_len);
-            dbg(tmp);
-        }
-
         /* 3. Build the event. */
         struct uwb_net_event ev = { 0 };
 
@@ -255,7 +256,6 @@ static void runner_fn(void *p1, void *p2, void *p3)
         /* 4. Execute actions. */
 
         if (act & UWB_ACT_SEND_JOIN) {
-            dbg("JOIN>\n");
             uint8_t join_buf[UWB_FRAME_LEN_JOIN];
             int jlen = uwb_frame_join_build(join_buf, sizeof(join_buf),
                                             runner_eui,
@@ -263,12 +263,7 @@ static void runner_fn(void *p1, void *p2, void *p3)
             if (jlen > 0) {
                 /* Pick a random mini-slot (0 .. N_CAP-1) for Aloha. */
                 uint8_t mslot = (uint8_t)(sys_rand32_get() % N_CAP);
-                int tx_rc = uwb_radio_tx_cap(join_buf, (size_t)jlen, mslot);
-                {
-                    char tmp[16];
-                    snprintf(tmp, sizeof(tmp), "TX:%d\n", tx_rc);
-                    dbg(tmp);
-                }
+                uwb_radio_tx_cap(join_buf, (size_t)jlen, mslot);
 
                 /* Listen briefly for a GRANT addressed to our EUI. */
                 uint8_t grant_buf[UWB_FRAME_LEN_GRANT];

@@ -91,7 +91,19 @@ uint32_t uwb_net_handle(struct uwb_net_ctx *c, const struct uwb_net_event *ev)
                 c->state = UWB_ST_SCAN;
                 return UWB_ACT_TO_SCAN;
             }
-            return UWB_ACT_RUN_DISCOVER;   /* retry until >= MIN_ANCHORS */
+            c->slot_index = ev->map_slot;
+
+            /* The seat's lease ages every superframe on the gateway, including
+             * while we are still discovering.  Renew it here too — otherwise a
+             * tag that needs more than the lease to gather >= MIN_ANCHORS is
+             * reclaimed and bounced back to SCAN before it can ever range. */
+            uint32_t act = UWB_ACT_RUN_DISCOVER;   /* retry until >= MIN_ANCHORS */
+            if (c->lease_remaining > 0) c->lease_remaining--;
+            if (c->lease_remaining <= (UWB_NET_LEASE_SF / 2)) {
+                act |= UWB_ACT_SEND_KEEPALIVE;
+                c->lease_remaining = UWB_NET_LEASE_SF;   /* optimistic renew */
+            }
+            return act;
         }
         return UWB_ACT_NONE;
 
