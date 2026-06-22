@@ -17,22 +17,30 @@ The user builds and flashes the firmware themselves and will report any errors o
 
 ```
 src/
-  main.c            — minimal bring-up: LED status, BLE NUS, DW3000 init (see Application Behavior)
-  ble_log.c/h       — BLE NUS wrapper (TX-only; blocks until notifications enabled; retries on -ENOMEM)
-  nfc_tag.c/h       — NFC T4T emulation; default URI https://google.mx; forwards phone writes via ble_log_send()
-  uwb.c/h           — DW3000 init with retry logic; exposes uwb_get_dev_id()
-  batt.c/h          — BQ274xx periodic read (k_timer 10 s → k_work); sends "BATT: xxmV xx%\n" over BLE NUS
-  lis2hh12_if.c/h   — LIS2HH12 I2C callback registration
+  main.c                — bring-up: LED, BLE NUS, DW3000 init, cal load, UWB ranging start
+  ble_log.c/h           — BLE NUS wrapper (TX-only; blocks until notifications enabled; retries on -ENOMEM)
+  nfc_tag.c/h           — NFC T4T emulation; default URI https://google.mx; forwards phone writes via ble_log_send()
+  uwb.c/h               — DW3000 init with retry logic; exposes uwb_get_dev_id()
+  batt.c/h              — BQ274xx periodic read (k_timer 10 s → k_work); sends "BATT: xxmV xx%\n" over BLE NUS
+  lis2hh12_if.c/h       — LIS2HH12 I2C callback registration
+  uwb_ss_initiator.c/h  — SS-TWR initiator: do_one_range_anchor(), position_publish(), twr_log() + 8-slot msgq
+  uwb_net_runner.c/h    — Dynamic anchor selection runner: run_discovery(), anchor_sweep(), uwb_radio_ops impl
+  uwb_net.c/h           — MAC FSM: state machine driving DISCOVER / SWEEP / JOIN / KEEPALIVE actions
+  uwb_frame_802_15_4z.c/h — Frame builders/parsers: E0 poll, E1 ranging resp, E2 discovery, E4 disc-resp, E5 beacon
+  pos_solver.c/h        — 2D trilateration via CMSIS-DSP least-squares; pos_solve() returns x/y in metres
+  cal.c/h               — Antenna delay calibration: NVS persistence, cal command handler
+  cal_math.c/h          — Calibration math: outlier rejection (median/MAD), delay correction
+  phy_config.h          — PHY constants: TX_ANT_DLY, RX_ANT_DLY seed (16371), channel/preamble settings
 platform/
-  port.c/h          — DW3000 GPIO/reset/wakeup HAL; DW3000_IRQ_Pin=30, RST=37, WUP=15
-  deca_spi.c/h      — SPI1 driver (4 MHz init → 32 MHz fast); static EasyDMA RX buffer
+  port.c/h              — DW3000 GPIO/reset/wakeup HAL; DW3000_IRQ_Pin=30, RST=37, WUP=15
+  deca_spi.c/h          — SPI1 driver (4 MHz init → 32 MHz fast); static EasyDMA RX buffer
   deca_probe_interface.c/h — dwt_probe_s function pointers for Decawave library
-  deca_mutex.c      — decamutexon/off critical sections around UWB ISR
-  deca_sleep.c      — deca_sleep (ms) / deca_usleep (µs) wrappers
+  deca_mutex.c          — decamutexon/off critical sections around UWB ISR
+  deca_sleep.c          — deca_sleep (ms) / deca_usleep (µs) wrappers
 drivers/
-  lis2hh12-pid/     — ST register-map driver (lis2hh12_reg.c/h)
+  lis2hh12-pid/         — ST register-map driver (lis2hh12_reg.c/h)
 Shared/
-  dwt_uwb_driver/   — Decawave precompiled library (libdwt_uwb_driver-m4-sfp-6.0.7.a) + headers
+  dwt_uwb_driver/       — Decawave precompiled library (libdwt_uwb_driver-m4-sfp-6.0.7.a) + headers
 ```
 
 New source files must be added to `CMakeLists.txt` via `target_sources(app PRIVATE ...)`.  
@@ -67,18 +75,19 @@ To enable a new subsystem, add the `CONFIG_*` line to `prj.conf`.
 
 ## Application Behavior (main.c)
 
-Stripped down to the minimum needed to verify DW3000 SPI bring-up over BLE NUS:
+Full UWB ranging + dynamic anchor selection system:
 
 1. Get WS2812 RGB LED device; hang on failure.
 2. `ble_log_init()` — starts BLE advertising.
 3. `ble_log_wait_ready()` — blocks until BLE central enables NUS TX notifications.
 4. LED **cyan** — initializing DW3000.
 5. `uwb_init(3)` — three retries; sends `probe fail N/3` or `init fail N/3` on each failure, `OK ID=0x........` on success, `all 3 fail` on total failure.
-6. On success: LED **green**, send `ID=0x........\n` over NUS.
-7. On failure: LED **red**, send `DW3000: init failed\n` over NUS.
-8. `k_sleep(K_FOREVER)`.
+6. On failure: LED **red**, send `DW3000: init failed\n` over NUS, hang.
+7. Load calibration from NVS — sends `CAL loaded` or `CAL REQUIRED` (fires before BLE connects; use `cal status` to read after connecting).
+8. `uwb_ss_initiator_start()` — starts the SS-TWR thread; also starts `uwb_net_runner_start()` which runs the dynamic anchor selection loop.
+9. LED **green** — ranging active. BLE NUS output is `P:x.xx,y.yy\n` once per superframe when ≥3 anchors are visible and calibration is loaded.
 
-NFC, battery, accelerometer, and button handling are intentionally not initialised; the goal of this build is end-to-end DW3000 ID read.
+NFC, battery, accelerometer, and button handling are not initialised.
 
 ## Key Patterns
 
@@ -91,6 +100,12 @@ NFC, battery, accelerometer, and button handling are intentionally not initialis
 - **Adding a peripheral to I2C0:** Add the node under `&i2c0` in `nRF52833_tag.dts`; the bus is already enabled with the correct pins.
 - **BQ274xx fuel gauge:** In nCS 3.2.4 the driver lives under `drivers/sensor/ti/bq274xx/` and implements the **sensor API**, not the fuel_gauge API. Use `sensor_sample_fetch(dev)` then `sensor_channel_get(dev, SENSOR_CHAN_GAUGE_VOLTAGE, &val)` and `sensor_channel_get(dev, SENSOR_CHAN_GAUGE_STATE_OF_CHARGE, &val)`. Voltage: `val.val1` = V, `val.val2` = µV fractional → mV = `val1 * 1000 + val2 / 1000`. SoC: `val.val1` = %. The driver requires `CONFIG_SENSOR=y`; `CONFIG_FUEL_GAUGE=y` and `CONFIG_BQ274XX=y` are in the board defconfig. The gauge is not ready without a battery connected — `device_is_ready()` returns false on USB-only power. Battery parameters (DTS node `fuel_gauge: bq274xx@55` under `&i2c0`): design-voltage=4200 mV, design-capacity=400 mAh, taper-current=40 mA, terminate-voltage=3000 mV.
 - **NFC T4T:** `nfc_tag_init()` encodes a default URI, registers an RW payload buffer, and starts emulation. The `NFC_T4T_EVENT_NDEF_UPDATED` callback runs in the nrfxlib NFC thread (not ISR) — `ble_log_send()` is safe to call from it. Writes before BLE connects are silently dropped. The NFCT node must be enabled in the board DTS (`&nfct { status = "okay"; }`) for `HAS_HW_NRF_NFCT` to be set, which is required for `NFC_PLATFORM` and `NRFX_NFCT` to build. URI prefix codes follow NFC Forum RTD: 0x03 = `"http://"`, 0x04 = `"https://"` (already includes `://`). Do not pass `"//host"` as the URI string when using these prefix codes.
+- **Dynamic anchor selection:** `uwb_net_runner.c` maintains an anchor pool (up to 6 entries) with EMA-filtered CIR quality scores. `run_discovery()` broadcasts an E2 frame and collects E4 DISCOVERY_RESPONSE frames within a `DISCOVERY_WINDOW_MS` window; `anchor_pool_rebuild_selected()` picks the top 3–4 anchors by EMA score into `selected[]`. `anchor_sweep()` ranges only those anchors via SS-TWR. Re-discovery runs every 10 superframes or when fewer than 3 anchors respond. `last_sweep_n` must be primed to the discovery count after the first discovery so the sweep gate (`last_sweep_n < ANCHOR_SELECT_MIN`) does not immediately re-trigger discovery.
+- **Discovery window sizing:** The anchor firmware delays its E4 response by `DISC_BASE_UUS + anchor_id × DISC_SLOT_UUS` (currently 2000 + id × 3500 µs). `DISCOVERY_WINDOW_MS` in `uwb_net_runner.c` must exceed the highest anchor's slot: for anchor IDs 0–3 the maximum is 12.5 ms, so `DISCOVERY_WINDOW_MS = 15`. Formula: `ceil((DISC_BASE_UUS + max_id × DISC_SLOT_UUS) / 1000 + 2_ms_margin)`. If anchors with higher IDs are added, increase this constant.
+- **BLE message queue budget:** `ss_twr_msgq` has 8 slots (K_NO_WAIT — overflow is silent). A full sweep of 4 anchors produces at most 4 ranging messages + 1 position = 5 slots; stay well under 8. Do not add per-anchor diagnostic lines during sweep — they consume slots and can starve the `P:` position output.
+- **Position output:** `position_publish(x, y)` in `uwb_ss_initiator.c` formats and enqueues `P:x.xx,y.yy\n` via `twr_log()`. Called from `uwb_net_runner.c` after a successful `pos_solve()`. Output appears only when ≥3 anchors respond and calibration is loaded. `pos_solve()` uses CMSIS-DSP `arm_mat_inverse_f32`; returns false on singular matrix (anchors collinear or sharing coordinates).
+- **Anchor coordinates:** Each anchor stores `anchor_x`, `anchor_y`, `anchor_z` in flash (address `0x1E000`, `flash_record_t` with magic + CRC). Set via anchor console: `set anchor_x <float>`, `set anchor_y <float>`, then `save`. Values are written into E1 ranging response bytes 19–22 (X) and 23–26 (Y) as IEEE 754 float32 LE. Anchors must be non-collinear — if any two share (0,0) or all three are on the same line, `pos_solve` returns false.
+- **Multi-tag prerequisites (future work):** Two tags operating simultaneously require: (1) slot-indexed TX stagger for DISCOVERY broadcasts (`ctx.slot_index × offset_us`) to avoid simultaneous E2 collisions at the radio level; (2) addressed E4 DISCOVERY_RESPONSE (carrying the requesting tag's short address) plus DW3000 frame filtering (PAN ID + short address) on each tag to prevent RX cross-contamination. Problem 1 (TX collision) is critical and must be fixed before Problem 2 is testable.
 - **UWB antenna delay (calibration):** Per-unit, solved on-device and persisted in NVS — see `src/cal.c`/`src/cal_math.c`. Trigger over BLE NUS with `cal <mm>` (reference distance in millimetres); the initiator (`src/uwb_ss_initiator.c`) collects ~100 ranges, rejects outliers (median/MAD), and corrects the combined TX+RX delay toward the reference by a linear step (~2.34 mm per combined unit) over up to 4 iterations until the residual is ≤15 mm, then stores a CRC-checked, PHY-tagged `cal_record` in NVS (DTS `storage_partition`, resolved via devicetree because this NCS Partition Manager build gives all flash to a single `app` region). Other commands: `cal status`, `cal clear`, `cal selftest` (runs `cal_math_selftest()` → `SELFTEST 0` on success). **NVS is mandatory:** without a valid record for the current PHY the ranging thread reports `CAL REQUIRED` and does not range until a `cal` run succeeds. `TX_ANT_DLY = RX_ANT_DLY = 16371` in `src/phy_config.h` is now only the factory-reference seed/fallback for an uncalibrated unit. Values are PHY-dependent (calibrated for `CONFIG_OPTION_07`: Ch5, PLEN-1024, 850k); `phy_option` in the record invalidates a stored value if the PHY changes. Note: the `CAL loaded`/`CAL REQUIRED` message sent from `main.c` at boot fires before a central connects and is dropped — use `cal status` to read state after connecting.
 
 ## Flash Memory Layout

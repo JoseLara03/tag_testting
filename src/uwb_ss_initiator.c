@@ -91,7 +91,7 @@ struct twr_msg {
  * examples/uwb_ds_initiator.c, which is not currently compiled. */
 K_MSGQ_DEFINE(ss_twr_msgq, sizeof(struct twr_msg), 8, 4);
 
-static void twr_log(const char *fmt, ...)
+void twr_log(const char *fmt, ...)
 {
     struct twr_msg m;
     va_list ap;

@@ -43,7 +43,7 @@
 /* Settle time between consecutive anchor polls in a sweep. */
 #define INTER_ANCHOR_DELAY_US        500U
 
-#define DISCOVERY_WINDOW_MS      10U   /* total RX collection window */
+#define DISCOVERY_WINDOW_MS      15U   /* total RX collection window; covers anchor_id=3 (12.5 ms slot) */
 #define DISCOVERY_RX_SLOT_MS      3U   /* per-attempt uwb_radio_rx_beacon timeout */
 #define REDISCOVER_INTERVAL_SF   10U   /* superframes between periodic re-discovery */
 
@@ -303,7 +303,6 @@ static int run_discovery(uint16_t src_addr)
 finish:
     anchor_pool_decay_missed();
     anchor_pool_rebuild_selected();
-    twr_log("DISC:%u\n", n_selected);
     return n_selected;
 }
 
@@ -333,8 +332,6 @@ static int anchor_sweep(struct pos_meas *out, size_t max)
         bool ok = do_one_range_anchor(selected[i], &r, &ax, &ay);
         uint32_t twr_ms = k_uptime_get_32() - t_twr;
 
-        twr_log("A%u:%ums %s\n", selected[i], twr_ms, ok ? "ok" : "to");
-
         if (ok) {
             out[n].x       = ax;
             out[n].y       = ay;
@@ -343,7 +340,6 @@ static int anchor_sweep(struct pos_meas *out, size_t max)
         }
     }
 
-    twr_log("SW:%ums/%u\n", k_uptime_get_32() - t_sweep, (unsigned)n);
     return (int)n;
 }
 
@@ -487,6 +483,7 @@ static void runner_fn(void *p1, void *p2, void *p3)
         if (act & UWB_ACT_RUN_DISCOVER) {
             int n = run_discovery(ctx.short_addr);
             sf_since_discover = 0;
+            last_sweep_n = (uint8_t)(n > 0 ? n : 0);   /* prime so next sweep isn't rediscover_due */
             struct uwb_net_event dev = {
                 .kind      = UWB_EV_DISCOVERED,
                 .n_anchors = (uint8_t)(n > 0 ? n : 0),

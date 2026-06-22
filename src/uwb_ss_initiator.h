@@ -32,6 +32,9 @@ bool do_one_range_anchor(uint8_t aid, float *range_m, float *ax, float *ay);
 /* Publish a solved position over BLE NUS ("P:x.xx,y.yy\n"). */
 void position_publish(float x, float y);
 
+/* Enqueue a BLE NUS log message (≤19 chars + NUL; drops if queue full). */
+void twr_log(const char *fmt, ...);
+
 /* Compatibility shim: called by motion.c; forwards to uwb_net_set_tier.
  * true  -> UWB_TIER_FAST, false -> UWB_TIER_IDLE. */
 void uwb_set_moving(bool moving);
