@@ -11,6 +11,7 @@
 #include "motion.h"
 #include "tag_ui.h"
 #include "cal.h"
+#include "wdt.h"
 
 static const struct device *strip = DEVICE_DT_GET(DT_ALIAS(led_strip));
 
@@ -41,6 +42,10 @@ int main(void)
     }
     ble_log_set_state_cb(on_ble_state);
 
+    /* Arm the boot-guard watchdog: if DW3000 bring-up hangs or fails, the
+     * watchdog is never fed and the SoC resets in ~10 s, retrying the boot. */
+    tag_wdt_start_boot_guard();
+
     /* Cyan: initializing DW3000 on SPI1 */
     pixel = (struct led_rgb){.r = 0, .g = 10, .b = 10};
     led_strip_update_rgb(strip, &pixel, 1);
@@ -68,6 +73,9 @@ int main(void)
             ble_log_send("motion init fail\n");
         }
         tag_ui_init();
+        /* Boot succeeded: keep the (un-stoppable) watchdog fed for the
+         * device lifetime. */
+        tag_wdt_run_feeder();
     } else {
         /* Red: DW3000 SPI1 init failed */
         pixel = (struct led_rgb){.r = 10, .g = 0, .b = 0};
