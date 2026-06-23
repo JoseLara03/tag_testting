@@ -30,7 +30,7 @@
 #define T_SUPERFRAME_MS   200u
 #define T_BEACON_MS         2u   /* ~1.5 ms, round up */
 #define T_GUARD_MS          1u   /* ~0.5 ms, round up */
-#define T_SLOT_MS          15u
+#define T_SLOT_MS          24u   /* sized to the measured worst sweep (22 ms n=4) + guard; no slot overlap */
 #define T_MINISLOT_MS       2u   /* ~1.5 ms, round up */
 #define N_CAP               UWB_FRAME_N_CAP   /* 4 */
 #define N_CFP               UWB_FRAME_N_CFP   /* 12 */
@@ -41,7 +41,7 @@
 #define PRE_TIMEOUT                   128U
 
 /* Settle time between consecutive anchor polls in a sweep. */
-#define INTER_ANCHOR_DELAY_US        500U
+#define INTER_ANCHOR_DELAY_US        10U
 
 #define DISCOVERY_WINDOW_MS      15U   /* total RX collection window; covers anchor_id=3 (12.5 ms slot) */
 #define DISCOVERY_RX_SLOT_MS      3U   /* per-attempt uwb_radio_rx_beacon timeout */
@@ -385,10 +385,30 @@ static void runner_fn(void *p1, void *p2, void *p3)
             tier_pending = false;
         }
 
-        /* 2. RX beacon for up to one full superframe. */
+        /* 2. Listen for THE beacon for up to one superframe, discarding cross-
+         * traffic.  uwb_radio_rx_beacon() returns on the FIRST frame of any
+         * type; with multiple tags active another tag's poll/response/keepalive
+         * frequently arrives before the gateway beacon.  Without this re-arm
+         * loop each such frame is misread as a beacon miss, and MISS_MAX in a
+         * row bounce the tag back to SCAN (RESCAN miss).  Keep re-arming until a
+         * real beacon arrives or the superframe budget elapses. */
         uint8_t beacon_buf[UWB_FRAME_MAX_LEN];
-        int beacon_len = uwb_radio_rx_beacon(beacon_buf, sizeof(beacon_buf),
-                                             T_SUPERFRAME_MS);
+        int beacon_len = -ETIMEDOUT;
+        uint32_t bcn_deadline = uwb_radio_now_ms() + T_SUPERFRAME_MS + T_BEACON_MS;
+        for (;;) {
+            int32_t rem = (int32_t)(bcn_deadline - uwb_radio_now_ms());
+            if (rem <= 0) {
+                break;
+            }
+            int len = uwb_radio_rx_beacon(beacon_buf, sizeof(beacon_buf),
+                                          (uint32_t)rem);
+            if (len == UWB_FRAME_LEN_BEACON &&
+                uwb_frame_is_beacon(beacon_buf, (size_t)len)) {
+                beacon_len = len;
+                break;
+            }
+            /* non-beacon frame or rx timeout/error: keep waiting for the beacon */
+        }
         uint32_t t0_ms = uwb_radio_now_ms();
 
         /* 3. Build the event. */
@@ -534,7 +554,16 @@ static void runner_fn(void *p1, void *p2, void *p3)
             uwb_radio_sleep_until(t0_ms + T_SUPERFRAME_MS);
         }
 
-        /* UWB_ACT_TO_SCAN: FSM already transitioned; nothing extra needed. */
+        if (act & UWB_ACT_TO_SCAN) {
+            /* Lost-sync telemetry: seat = gateway reclaimed our lease (CAP
+             * keepalive not getting through); miss = >= MISS_MAX consecutive
+             * beacons lost. */
+            if (ev.kind == UWB_EV_BEACON && !ev.in_map) {
+                twr_log("RESCAN seat\n");
+            } else {
+                twr_log("RESCAN miss\n");
+            }
+        }
     }
 }
 
