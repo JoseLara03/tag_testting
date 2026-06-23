@@ -15,22 +15,8 @@
 
 static const struct device *strip = DEVICE_DT_GET(DT_ALIAS(led_strip));
 
-static void on_ble_state(ble_state_t state)
-{
-    struct led_rgb px;
-
-    if (state == BLE_STATE_CONNECTED) {
-        px = (struct led_rgb){.r = 0, .g = 10, .b = 0};   /* green  */
-    } else {
-        px = (struct led_rgb){.r = 0, .g = 0, .b = 10};   /* blue = advertising */
-    }
-    led_strip_update_rgb(strip, &px, 1);
-}
-
 int main(void)
 {
-    struct led_rgb pixel;
-
     if (!device_is_ready(strip)) {
         k_sleep(K_FOREVER);
         return 0;
@@ -40,23 +26,14 @@ int main(void)
         k_sleep(K_FOREVER);
         return 0;
     }
-    ble_log_set_state_cb(on_ble_state);
 
     /* Arm the boot-guard watchdog: if DW3000 bring-up hangs or fails, the
      * watchdog is never fed and the SoC resets in ~10 s, retrying the boot. */
     tag_wdt_start_boot_guard();
 
-    /* Cyan: initializing DW3000 on SPI1 */
-    pixel = (struct led_rgb){.r = 0, .g = 10, .b = 10};
-    led_strip_update_rgb(strip, &pixel, 1);
-
     if (uwb_init(3) == 0) {
-        /* Green: DW3000 SPI1 OK */
-        pixel = (struct led_rgb){.r = 0, .g = 10, .b = 0};
-        led_strip_update_rgb(strip, &pixel, 1);
         ble_log_send("Config OK\n");
 
-        /* Derive 8-byte EUI from nRF52833 FICR unique device IDs. */
         uint8_t eui[8];
         sys_put_le32(NRF_FICR->DEVICEID[0], &eui[0]);
         sys_put_le32(NRF_FICR->DEVICEID[1], &eui[4]);
@@ -66,19 +43,16 @@ int main(void)
         } else {
             ble_log_send("CAL REQUIRED\n");
         }
-        /* Start cal thread (also registers DW3000 callbacks). */
         uwb_ss_initiator_start();
         uwb_net_runner_start(eui);
         if (motion_init() != 0) {
             ble_log_send("motion init fail\n");
         }
         tag_ui_init();
-        /* Boot succeeded: keep the (un-stoppable) watchdog fed for the
-         * device lifetime. */
         tag_wdt_run_feeder();
     } else {
-        /* Red: DW3000 SPI1 init failed */
-        pixel = (struct led_rgb){.r = 10, .g = 0, .b = 0};
+        /* Red: fatal DW3000 init failure — the only signal with no BLE. */
+        struct led_rgb pixel = (struct led_rgb){.r = 10, .g = 0, .b = 0};
         led_strip_update_rgb(strip, &pixel, 1);
         ble_log_send("DW3000: init failed\n");
     }
