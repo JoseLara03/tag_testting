@@ -106,8 +106,10 @@ void reset_DWIC(void)
 
 void wakeup_device_with_io(void)
 {
+    /* DW3000 requires the WAKEUP pin held high for at least 500 µs to wake from
+     * SLEEP/DEEPSLEEP (DW3 SDK examples, NOTE 5).  600 µs gives margin. */
     gpio_pin_set(gpio0, DW3000_WUP_Pin, 1);
-    k_busy_wait(200); /* 200 µs — too short for k_usleep */
+    k_busy_wait(600);
     gpio_pin_set(gpio0, DW3000_WUP_Pin, 0);
 }
 

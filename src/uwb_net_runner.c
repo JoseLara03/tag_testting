@@ -29,7 +29,9 @@
 
 /* ---- v1 timing constants (protocol contract §2.1) ---- */
 #define T_SUPERFRAME_MS   200u
-#define DW_WAKE_GUARD_MS    3u   /* wake the DW3000 this long before the next beacon */
+#define DW_WAKE_GUARD_MS    5u   /* wake the DW3000 this long before the next beacon
+                                  * (covers >=500 us WAKEUP pulse + 2 ms settle +
+                                  * checkidlerc + dwt_restoreconfig) */
 #define T_BEACON_MS         2u   /* ~1.5 ms, round up */
 #define T_GUARD_MS          1u   /* ~0.5 ms, round up */
 #define T_SLOT_MS          24u   /* sized to the measured worst sweep (22 ms n=4) + guard; no slot overlap */
@@ -369,22 +371,42 @@ int uwb_radio_sweep(struct pos_meas *out, size_t max)
 static void dw_enter_sleep(void)
 {
     decaIrqStatus_t s = decamutexon();
-    /* DWT_CONFIG: restore configuration from AON on wake.
-     * Wake on the WAKEUP pin; enable sleep (SLEEP, not deep sleep). */
-    dwt_configuresleep(DWT_CONFIG, DWT_WAKE_WUP | DWT_SLP_EN | DWT_SLEEP);
-    dwt_entersleep(DWT_DW_IDLE);   /* auto INIT2IDLE -> IDLE_PLL on wake */
+    /* mode: DWT_PGFCAL re-enables the receiver on wake (per the DW3 SDK
+     *       tx_sleep examples — "added to make sure receiver is re-enabled on
+     *       wake").  Without it the RX is dead after wake → RESCAN miss.
+     * wake: DWT_PRES_SLEEP preserves SLEEP_EN; wake on WAKEUP pin and CS;
+     *       DWT_SLEEP selects SLEEP (config retained) over deep sleep. */
+    dwt_configuresleep(DWT_CONFIG | DWT_PGFCAL,
+                       DWT_PRES_SLEEP | DWT_WAKE_CSN | DWT_WAKE_WUP |
+                       DWT_SLEEP | DWT_SLP_EN);
+    /* DWT_DW_IDLE_RC: clear auto-INIT2IDLE so the chip parks in the stable
+     * IDLE_RC state on wake instead of auto-transitioning RC->PLL.  This makes
+     * dwt_checkidlerc() deterministic and lets dwt_restoreconfig() run on a
+     * settled clock; the auto RC->PLL race was corrupting the RX config on an
+     * occasional wake, killing the receiver permanently (RESCAN miss after a
+     * few minutes).  The next dwt_rxenable() brings the device up to IDLE_PLL. */
+    dwt_entersleep(DWT_DW_IDLE_RC);
     decamutexoff(s);
 }
 
 static void dw_wake(void)
 {
-    wakeup_device_with_io();   /* GPIO pulse + settling; no SPI, no mutex needed */
+    wakeup_device_with_io();   /* WAKEUP-pin pulse (>=500 us); no mutex needed */
+    k_msleep(2);               /* settle: INIT_RC -> IDLE_RC (ref: Sleep(2)) */
+
     decaIrqStatus_t s = decamutexon();
-    /* Wait for the device to reach IDLE_RC after wake (~ms worst case). */
+    /* Make sure the device is in IDLE_RC before touching config. */
     for (int i = 0; i < 50 && !dwt_checkidlerc(); i++) {
         k_busy_wait(100);
     }
-    /* Re-apply the runner-owned config (belt-and-suspenders over AON). */
+    /* Restore the configuration not auto-restored from AON.  In driver 6.0.7
+     * this is the equivalent of the newer SDK's dwt_restore_common() +
+     * dwt_restore_txrx().  Paired with DWT_PGFCAL in dwt_configuresleep, this
+     * re-enables the receiver on wake.  SPI stays at the operating (fast) rate,
+     * as in the DW3 SDK tx_sleep examples. */
+    dwt_restoreconfig();
+
+    /* Re-apply the runner-owned TWR params + antenna delays. */
     dwt_setrxaftertxdelay(POLL_TX_TO_RESP_RX_DLY_UUS);
     dwt_setrxtimeout(RESP_RX_TIMEOUT_UUS);
     dwt_setpreambledetecttimeout(PRE_TIMEOUT);
