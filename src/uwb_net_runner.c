@@ -368,18 +368,18 @@ int uwb_radio_sweep(struct pos_meas *out, size_t max)
 
 static void dw_enter_sleep(void)
 {
-    decamutexon();
+    decaIrqStatus_t s = decamutexon();
     /* DWT_CONFIG: restore configuration from AON on wake.
      * Wake on the WAKEUP pin; enable sleep (SLEEP, not deep sleep). */
     dwt_configuresleep(DWT_CONFIG, DWT_WAKE_WUP | DWT_SLP_EN | DWT_SLEEP);
     dwt_entersleep(DWT_DW_IDLE);   /* auto INIT2IDLE -> IDLE_PLL on wake */
-    decamutexoff();
+    decamutexoff(s);
 }
 
 static void dw_wake(void)
 {
     wakeup_device_with_io();   /* GPIO pulse + settling; no SPI, no mutex needed */
-    decamutexon();
+    decaIrqStatus_t s = decamutexon();
     /* Wait for the device to reach IDLE_RC after wake (~ms worst case). */
     for (int i = 0; i < 50 && !dwt_checkidlerc(); i++) {
         k_busy_wait(100);
@@ -393,7 +393,7 @@ static void dw_wake(void)
     cal_get_ant_dly(&tx, &rx);
     dwt_settxantennadelay(tx);
     dwt_setrxantennadelay(rx);
-    decamutexoff();
+    decamutexoff(s);
 }
 
 /* =========================================================================
