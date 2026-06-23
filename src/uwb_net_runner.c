@@ -371,15 +371,15 @@ static void dw_enter_sleep(void)
     decamutexon();
     /* DWT_CONFIG: restore configuration from AON on wake.
      * Wake on the WAKEUP pin; enable sleep (SLEEP, not deep sleep). */
-    dwt_configuresleep(DWT_CONFIG, DWT_WAKE_WUP | DWT_SLP_EN);
+    dwt_configuresleep(DWT_CONFIG, DWT_WAKE_WUP | DWT_SLP_EN | DWT_SLEEP);
     dwt_entersleep(DWT_DW_IDLE);   /* auto INIT2IDLE -> IDLE_PLL on wake */
     decamutexoff();
 }
 
 static void dw_wake(void)
 {
+    wakeup_device_with_io();   /* GPIO pulse + settling; no SPI, no mutex needed */
     decamutexon();
-    wakeup_device_with_io();
     /* Wait for the device to reach IDLE_RC after wake (~ms worst case). */
     for (int i = 0; i < 50 && !dwt_checkidlerc(); i++) {
         k_busy_wait(100);
