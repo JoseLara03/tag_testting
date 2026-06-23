@@ -5,6 +5,7 @@
 #include <zephyr/sys/byteorder.h>
 #include <hal/nrf_ficr.h>
 #include "ble_log.h"
+#include "batt.h"
 #include "uwb.h"
 #include "uwb_ss_initiator.h"
 #include "uwb_net_runner.h"
@@ -26,6 +27,8 @@ int main(void)
         k_sleep(K_FOREVER);
         return 0;
     }
+
+    ble_log_set_state_cb(batt_on_ble_state);
 
     /* Arm the boot-guard watchdog: if DW3000 bring-up hangs or fails, the
      * watchdog is never fed and the SoC resets in ~10 s, retrying the boot. */
@@ -49,6 +52,7 @@ int main(void)
             ble_log_send("motion init fail\n");
         }
         tag_ui_init();
+        batt_monitor_start();
         tag_wdt_run_feeder();
     } else {
         /* Red: fatal DW3000 init failure — the only signal with no BLE. */
