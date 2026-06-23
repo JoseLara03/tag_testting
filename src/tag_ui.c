@@ -43,6 +43,14 @@ static void led_show_battery(void)
 
     snprintf(msg, sizeof(msg), "BATT: %d%%\n", soc);
     ble_log_send(msg);
+
+    int ma;
+    if (batt_read_current(&ma) == 0) {
+        char imsg[16];
+        snprintf(imsg, sizeof(imsg), "I:%dmA\n", ma);
+        ble_log_send(imsg);
+    }
+
     if (soc >= 75) {
         led_set(0, 10, 0);          /* green */
     } else if (soc >= 50) {

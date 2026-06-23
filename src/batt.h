@@ -6,4 +6,8 @@
  * (e.g. -ENODEV when the gauge is not ready / no battery attached). */
 int batt_read_soc(int *soc);
 
+/* Read average battery current in milliamps (discharge as a positive
+ * magnitude). Returns 0 on success; negative errno on failure. */
+int batt_read_current(int *ma);
+
 #endif /* BATT_H_ */
