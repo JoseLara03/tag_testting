@@ -1,8 +1,10 @@
 #include <string.h>
+#include <stdio.h>
 #include "tag_cmd.h"
 #include "ble_log.h"
 #include "cal.h"
 #include "uwb_net_runner.h"
+#include "batt.h"
 
 static void tag_cmd_on_rx(const uint8_t *data, uint16_t len)
 {
@@ -22,6 +24,17 @@ static void tag_cmd_on_rx(const uint8_t *data, uint16_t len)
 		} else if (strcmp(buf, "pwr sleep off") == 0) {
 			uwb_radio_set_sleep_enabled(false);
 			ble_log_send("PWR sleep off\n");
+		} else if (strcmp(buf, "pwr idle") == 0) {
+			int me = 0, mn = 0, mx = 0;
+			uint32_t cnt = 0;
+			if (batt_get_idle_window(&me, &mn, &mx, &cnt)) {
+				char msg[24];
+				snprintf(msg, sizeof(msg), "Idle:%d %d/%d n%u\n",
+					 me, mn, mx, cnt);
+				ble_log_send(msg);
+			} else {
+				ble_log_send("Idle none\n");
+			}
 		} else {
 			ble_log_send(uwb_radio_sleep_enabled() ? "PWR sleep on\n"
 							       : "PWR sleep off\n");

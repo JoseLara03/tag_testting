@@ -54,7 +54,6 @@ int batt_read_current(int *ma)
 
 static struct batt_window idle_win;
 static volatile bool      batt_connected;
-static volatile bool      report_pending;
 
 static void batt_work_fn(struct k_work *work)
 {
@@ -65,17 +64,10 @@ static void batt_work_fn(struct k_work *work)
         return;   /* no gauge / no battery: skip this tick */
     }
 
-    if (batt_connected) {
-        if (report_pending) {
-            int mn = 0, me = 0, mx = 0; uint32_t n = 0;
-            if (batt_window_get(&idle_win, &mn, &me, &mx, &n)) {
-                char msg[20];
-                snprintf(msg, sizeof(msg), "Idle:%d %d/%d n%u\n", me, mn, mx, n);
-                ble_log_send(msg);
-            }
-            report_pending = false;
-        }
-    } else {
+    /* Only accumulate while BLE is off: a live connection adds the BLE radio's
+     * current and would skew the field-current estimate. The window is read on
+     * demand via batt_get_idle_window() (the `pwr idle` command). */
+    if (!batt_connected) {
         batt_window_add(&idle_win, ma);
     }
 }
@@ -99,10 +91,16 @@ void batt_monitor_start(void)
 void batt_on_ble_state(ble_state_t state)
 {
     if (state == BLE_STATE_CONNECTED) {
-        batt_connected = true;
-        report_pending = true;   /* dump the idle window on the next tick */
+        batt_connected = true;   /* stop accumulating; window holds the just-
+                                  * finished disconnected period for `pwr idle` */
     } else {
         batt_connected = false;
         batt_window_reset(&idle_win);   /* start a fresh disconnected window */
     }
+}
+
+int batt_get_idle_window(int *mean_ma, int *min_ma, int *max_ma, uint32_t *count)
+{
+    /* batt_window_get order is (min, mean, max, count). */
+    return batt_window_get(&idle_win, min_ma, mean_ma, max_ma, count);
 }
