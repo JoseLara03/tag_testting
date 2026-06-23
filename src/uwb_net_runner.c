@@ -17,6 +17,7 @@
 #include "port.h"
 #include "deca_device_api.h"
 #include "phy_config.h"
+#include "cal.h"
 #include <zephyr/kernel.h>
 #include <zephyr/random/random.h>
 #include <string.h>
@@ -28,6 +29,7 @@
 
 /* ---- v1 timing constants (protocol contract §2.1) ---- */
 #define T_SUPERFRAME_MS   200u
+#define DW_WAKE_GUARD_MS    3u   /* wake the DW3000 this long before the next beacon */
 #define T_BEACON_MS         2u   /* ~1.5 ms, round up */
 #define T_GUARD_MS          1u   /* ~0.5 ms, round up */
 #define T_SLOT_MS          24u   /* sized to the measured worst sweep (22 ms n=4) + guard; no slot overlap */
@@ -361,6 +363,40 @@ int uwb_radio_sweep(struct pos_meas *out, size_t max)
 }
 
 /* =========================================================================
+ * DW3000 SLEEP / WAKE helpers (used by runner only; gated by dw_sleep_enabled)
+ * ========================================================================= */
+
+static void dw_enter_sleep(void)
+{
+    decamutexon();
+    /* DWT_CONFIG: restore configuration from AON on wake.
+     * Wake on the WAKEUP pin; enable sleep (SLEEP, not deep sleep). */
+    dwt_configuresleep(DWT_CONFIG, DWT_WAKE_WUP | DWT_SLP_EN);
+    dwt_entersleep(DWT_DW_IDLE);   /* auto INIT2IDLE -> IDLE_PLL on wake */
+    decamutexoff();
+}
+
+static void dw_wake(void)
+{
+    decamutexon();
+    wakeup_device_with_io();
+    /* Wait for the device to reach IDLE_RC after wake (~ms worst case). */
+    for (int i = 0; i < 50 && !dwt_checkidlerc(); i++) {
+        k_busy_wait(100);
+    }
+    /* Re-apply the runner-owned config (belt-and-suspenders over AON). */
+    dwt_setrxaftertxdelay(POLL_TX_TO_RESP_RX_DLY_UUS);
+    dwt_setrxtimeout(RESP_RX_TIMEOUT_UUS);
+    dwt_setpreambledetecttimeout(PRE_TIMEOUT);
+
+    uint16_t tx, rx;
+    cal_get_ant_dly(&tx, &rx);
+    dwt_settxantennadelay(tx);
+    dwt_setrxantennadelay(rx);
+    decamutexoff();
+}
+
+/* =========================================================================
  * Runner thread
  * ========================================================================= */
 
@@ -557,7 +593,17 @@ static void runner_fn(void *p1, void *p2, void *p3)
         }
 
         if (act & UWB_ACT_SLEEP) {
-            uwb_radio_sleep_until(t0_ms + T_SUPERFRAME_MS);
+            uint32_t wake_ms = t0_ms + T_SUPERFRAME_MS;
+            if (dw_sleep_enabled) {
+                dw_enter_sleep();
+                if ((int32_t)(wake_ms - DW_WAKE_GUARD_MS - uwb_radio_now_ms()) > 0) {
+                    uwb_radio_sleep_until(wake_ms - DW_WAKE_GUARD_MS);
+                }
+                dw_wake();
+                uwb_radio_sleep_until(wake_ms);   /* re-align to the superframe edge */
+            } else {
+                uwb_radio_sleep_until(wake_ms);
+            }
         }
 
         if (act & UWB_ACT_TO_SCAN) {
