@@ -12,6 +12,7 @@
 #include "motion.h"
 #include "tag_ui.h"
 #include "cal.h"
+#include "tag_cmd.h"
 #include "wdt.h"
 
 static const struct device *strip = DEVICE_DT_GET(DT_ALIAS(led_strip));
@@ -46,6 +47,7 @@ int main(void)
         } else {
             ble_log_send("CAL REQUIRED\n");
         }
+        tag_cmd_init();
         uwb_ss_initiator_start();
         uwb_net_runner_start(eui);
         if (motion_init() != 0) {

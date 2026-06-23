@@ -82,6 +82,12 @@ static volatile bool        tier_pending;
 /* ---- EUI stored at start ---- */
 static uint8_t runner_eui[UWB_FRAME_EUI_LEN];
 
+/* ---- Layer-1 power saving flag ---- */
+static volatile bool dw_sleep_enabled = true;
+
+void uwb_radio_set_sleep_enabled(bool en) { dw_sleep_enabled = en; }
+bool uwb_radio_sleep_enabled(void)        { return dw_sleep_enabled; }
+
 
 /* ---- DW3000 ISR callbacks (mirror the initiator's; same irq_sem/last_evt) ----
  * NOTE: These are NOT registered here — ss_twr_fn in uwb_ss_initiator.c already

@@ -64,7 +64,7 @@ static int nvs_bringup(void)
 }
 
 /* ---- command parser (runs in BT RX thread) -------------------------------- */
-static void cal_on_rx(const uint8_t *data, uint16_t len)
+void cal_on_rx(const uint8_t *data, uint16_t len)
 {
     char buf[24];
     uint16_t n = (len < sizeof(buf) - 1) ? len : (sizeof(buf) - 1);
@@ -114,8 +114,6 @@ static void cal_on_rx(const uint8_t *data, uint16_t len)
 /* ---- public API ------------------------------------------------------------ */
 bool cal_init(void)
 {
-    ble_log_set_rx_handler(cal_on_rx);
-
     if (nvs_bringup() != 0) {
         active_valid = false;
         return false;
