@@ -17,6 +17,9 @@
 #include "port.h"
 #include "deca_device_api.h"
 #include "phy_config.h"
+#include "cal.h"
+#include "rx_stats.h"
+#include "beacon_track_core.h"
 #include <zephyr/kernel.h>
 #include <zephyr/random/random.h>
 #include <string.h>
@@ -28,6 +31,15 @@
 
 /* ---- v1 timing constants (protocol contract §2.1) ---- */
 #define T_SUPERFRAME_MS   200u
+#define DW_WAKE_GUARD_MS    5u   /* wake the DW3000 this long before the next beacon
+                                  * (covers >=500 us WAKEUP pulse + 2 ms settle +
+                                  * checkidlerc + dwt_restoreconfig) */
+
+/* Narrow beacon window (Spec 2) — all adjustable. GUARD ≈ 2× the measured
+ * ~±2.6 ms arrival jitter; the wake margin reuses DW_WAKE_GUARD_MS. */
+#define BT_GUARD_MS    5u
+#define BT_WARMUP_N    8u
+#define BT_EMA_SHIFT   3u
 #define T_BEACON_MS         2u   /* ~1.5 ms, round up */
 #define T_GUARD_MS          1u   /* ~0.5 ms, round up */
 #define T_SLOT_MS          24u   /* sized to the measured worst sweep (22 ms n=4) + guard; no slot overlap */
@@ -81,6 +93,12 @@ static volatile bool        tier_pending;
 
 /* ---- EUI stored at start ---- */
 static uint8_t runner_eui[UWB_FRAME_EUI_LEN];
+
+/* ---- Layer-1 power saving flag ---- */
+static volatile bool dw_sleep_enabled = true;
+
+void uwb_radio_set_sleep_enabled(bool en) { dw_sleep_enabled = en; }
+bool uwb_radio_sleep_enabled(void)        { return dw_sleep_enabled; }
 
 
 /* ---- DW3000 ISR callbacks (mirror the initiator's; same irq_sem/last_evt) ----
@@ -355,6 +373,60 @@ int uwb_radio_sweep(struct pos_meas *out, size_t max)
 }
 
 /* =========================================================================
+ * DW3000 SLEEP / WAKE helpers (used by runner only; gated by dw_sleep_enabled)
+ * ========================================================================= */
+
+static void dw_enter_sleep(void)
+{
+    decaIrqStatus_t s = decamutexon();
+    /* mode: DWT_PGFCAL re-enables the receiver on wake (per the DW3 SDK
+     *       tx_sleep examples — "added to make sure receiver is re-enabled on
+     *       wake").  Without it the RX is dead after wake → RESCAN miss.
+     * wake: DWT_PRES_SLEEP preserves SLEEP_EN; wake on WAKEUP pin and CS;
+     *       DWT_SLEEP selects SLEEP (config retained) over deep sleep. */
+    dwt_configuresleep(DWT_CONFIG | DWT_PGFCAL,
+                       DWT_PRES_SLEEP | DWT_WAKE_CSN | DWT_WAKE_WUP |
+                       DWT_SLEEP | DWT_SLP_EN);
+    /* DWT_DW_IDLE_RC: clear auto-INIT2IDLE so the chip parks in the stable
+     * IDLE_RC state on wake instead of auto-transitioning RC->PLL.  This makes
+     * dwt_checkidlerc() deterministic and lets dwt_restoreconfig() run on a
+     * settled clock; the auto RC->PLL race was corrupting the RX config on an
+     * occasional wake, killing the receiver permanently (RESCAN miss after a
+     * few minutes).  The next dwt_rxenable() brings the device up to IDLE_PLL. */
+    dwt_entersleep(DWT_DW_IDLE_RC);
+    decamutexoff(s);
+}
+
+static void dw_wake(void)
+{
+    wakeup_device_with_io();   /* WAKEUP-pin pulse (>=500 us); no mutex needed */
+    k_msleep(2);               /* settle: INIT_RC -> IDLE_RC (ref: Sleep(2)) */
+
+    decaIrqStatus_t s = decamutexon();
+    /* Make sure the device is in IDLE_RC before touching config. */
+    for (int i = 0; i < 50 && !dwt_checkidlerc(); i++) {
+        k_busy_wait(100);
+    }
+    /* Restore the configuration not auto-restored from AON.  In driver 6.0.7
+     * this is the equivalent of the newer SDK's dwt_restore_common() +
+     * dwt_restore_txrx().  Paired with DWT_PGFCAL in dwt_configuresleep, this
+     * re-enables the receiver on wake.  SPI stays at the operating (fast) rate,
+     * as in the DW3 SDK tx_sleep examples. */
+    dwt_restoreconfig();
+
+    /* Re-apply the runner-owned TWR params + antenna delays. */
+    dwt_setrxaftertxdelay(POLL_TX_TO_RESP_RX_DLY_UUS);
+    dwt_setrxtimeout(RESP_RX_TIMEOUT_UUS);
+    dwt_setpreambledetecttimeout(PRE_TIMEOUT);
+
+    uint16_t tx, rx;
+    cal_get_ant_dly(&tx, &rx);
+    dwt_settxantennadelay(tx);
+    dwt_setrxantennadelay(rx);
+    decamutexoff(s);
+}
+
+/* =========================================================================
  * Runner thread
  * ========================================================================= */
 
@@ -365,6 +437,10 @@ static void runner_fn(void *p1, void *p2, void *p3)
     struct uwb_net_ctx ctx;
 
     uwb_net_init(&ctx, runner_eui);
+
+    struct beacon_track bt;
+    beacon_track_reset(&bt, T_SUPERFRAME_MS, BT_GUARD_MS, BT_WARMUP_N, BT_EMA_SHIFT);
+    bool radio_asleep = false;   /* tracks whether the DW3000 is in deep sleep */
 
     /* DW3000 callbacks and timing — must be set before the loop.
      * The initiator thread (ss_twr_fn) also calls dwt_setcallbacks; the runner
@@ -385,16 +461,36 @@ static void runner_fn(void *p1, void *p2, void *p3)
             tier_pending = false;
         }
 
-        /* 2. Listen for THE beacon for up to one superframe, discarding cross-
-         * traffic.  uwb_radio_rx_beacon() returns on the FIRST frame of any
-         * type; with multiple tags active another tag's poll/response/keepalive
-         * frequently arrives before the gateway beacon.  Without this re-arm
-         * loop each such frame is misread as a beacon miss, and MISS_MAX in a
-         * row bounce the tag back to SCAN (RESCAN miss).  Keep re-arming until a
-         * real beacon arrives or the superframe budget elapses. */
+        /* 2. Listen for THE beacon, discarding cross-traffic.  In TRACKING the
+         * beacon tracker predicts arrival and we sleep the radio until just
+         * before it, then arm a short window; in ACQUIRING we listen the whole
+         * superframe (as before) to (re)lock.  uwb_radio_rx_beacon() returns on
+         * the FIRST frame of any type, so the re-arm loop keeps waiting through
+         * cross-traffic until the real beacon or the deadline. */
         uint8_t beacon_buf[UWB_FRAME_MAX_LEN];
         int beacon_len = -ETIMEDOUT;
-        uint32_t bcn_deadline = uwb_radio_now_ms() + T_SUPERFRAME_MS + T_BEACON_MS;
+
+        bool     bt_narrow;
+        uint32_t bt_arm_ms, bt_window_ms;
+        beacon_track_plan(&bt, &bt_narrow, &bt_arm_ms, &bt_window_ms);
+
+        uint32_t bcn_deadline;
+        if (bt_narrow) {
+            /* Sleep (radio stays in deep sleep) until just before the predicted
+             * beacon, leaving DW_WAKE_GUARD_MS for the wake to settle. */
+            if ((int32_t)(bt_arm_ms - DW_WAKE_GUARD_MS - uwb_radio_now_ms()) > 0) {
+                uwb_radio_sleep_until(bt_arm_ms - DW_WAKE_GUARD_MS);
+            }
+            if (radio_asleep) { dw_wake(); radio_asleep = false; }
+            bcn_deadline = bt_arm_ms + bt_window_ms;
+        } else {
+            if (radio_asleep) { dw_wake(); radio_asleep = false; }
+            bcn_deadline = uwb_radio_now_ms() + T_SUPERFRAME_MS + T_BEACON_MS;
+        }
+
+        uint32_t bcn_rx_ms = 0;
+
+        rx_stats_arm();
         for (;;) {
             int32_t rem = (int32_t)(bcn_deadline - uwb_radio_now_ms());
             if (rem <= 0) {
@@ -405,6 +501,7 @@ static void runner_fn(void *p1, void *p2, void *p3)
             if (len == UWB_FRAME_LEN_BEACON &&
                 uwb_frame_is_beacon(beacon_buf, (size_t)len)) {
                 beacon_len = len;
+                bcn_rx_ms = uwb_radio_now_ms();
                 break;
             }
             /* non-beacon frame or rx timeout/error: keep waiting for the beacon */
@@ -433,11 +530,17 @@ static void runner_fn(void *p1, void *p2, void *p3)
                 ev.frame_counter = frame_ctr;
                 ev.in_map        = (slot_idx >= 0);
                 ev.map_slot      = (slot_idx >= 0) ? (uint8_t)slot_idx : 0;
+                rx_stats_beacon();
+                beacon_track_beacon(&bt, bcn_rx_ms);
             } else {
                 ev.kind = UWB_EV_BEACON_MISS;
+                rx_stats_miss();
+                beacon_track_miss(&bt);
             }
         } else {
             ev.kind = UWB_EV_BEACON_MISS;
+            rx_stats_miss();
+            beacon_track_miss(&bt);
         }
 
         uint32_t act = uwb_net_handle(&ctx, &ev);
@@ -551,7 +654,16 @@ static void runner_fn(void *p1, void *p2, void *p3)
         }
 
         if (act & UWB_ACT_SLEEP) {
-            uwb_radio_sleep_until(t0_ms + T_SUPERFRAME_MS);
+            if (dw_sleep_enabled) {
+                /* Deep-sleep the radio; the wake/arm timing is owned by step 2's
+                 * beacon-window planner (which sleeps the MCU until just before
+                 * the predicted beacon, or wakes immediately for a full listen in
+                 * ACQUIRING).  No timed wake here. */
+                dw_enter_sleep();
+                radio_asleep = true;
+            } else {
+                uwb_radio_sleep_until(t0_ms + T_SUPERFRAME_MS);
+            }
         }
 
         if (act & UWB_ACT_TO_SCAN) {

@@ -29,4 +29,7 @@ void cal_wait_request(void);
 /* Persist a solved result and activate it. 0 on success. */
 int cal_store(uint16_t tx, uint16_t rx, uint32_t ref_mm, uint16_t residual_mm);
 
+/* NUS command parser for `cal ...` commands. Invoked by the tag_cmd dispatcher. */
+void cal_on_rx(const uint8_t *data, uint16_t len);
+
 #endif /* CAL_H */

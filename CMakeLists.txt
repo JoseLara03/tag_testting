@@ -7,6 +7,7 @@ target_sources(app PRIVATE
     src/main.c
     src/ble_log.c
     src/batt.c
+    src/batt_window.c
     src/lis2hh12_if.c
     src/uwb.c
     src/nfc_tag.c
@@ -20,6 +21,10 @@ target_sources(app PRIVATE
     src/uwb_frame_802_15_4z.c
     src/uwb_net.c
     src/uwb_net_runner.c
+    src/tag_cmd.c
+    src/rx_stats_core.c
+    src/rx_stats.c
+    src/beacon_track_core.c
     src/wdt.c
     drivers/lis2hh12-pid/lis2hh12_reg.c
     platform/port.c
