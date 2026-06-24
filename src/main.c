@@ -15,6 +15,8 @@
 #include "tag_cmd.h"
 #include "rx_stats.h"
 #include "wdt.h"
+#include "storage.h"
+#include "nfc_tag.h"
 
 static const struct device *strip = DEVICE_DT_GET(DT_ALIAS(led_strip));
 
@@ -31,6 +33,7 @@ int main(void)
     }
 
     ble_log_set_state_cb(batt_on_ble_state);
+    storage_init();
 
     /* Arm the boot-guard watchdog: if DW3000 bring-up hangs or fails, the
      * watchdog is never fed and the SoC resets in ~10 s, retrying the boot. */
@@ -48,6 +51,7 @@ int main(void)
         } else {
             ble_log_send("CAL REQUIRED\n");
         }
+        nfc_tag_init();
         tag_cmd_init();
         rx_stats_reset();
         uwb_ss_initiator_start();
