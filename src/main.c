@@ -13,6 +13,7 @@
 #include "tag_ui.h"
 #include "cal.h"
 #include "tag_cmd.h"
+#include "rx_stats.h"
 #include "wdt.h"
 
 static const struct device *strip = DEVICE_DT_GET(DT_ALIAS(led_strip));
@@ -55,6 +56,7 @@ int main(void)
         }
         tag_ui_init();
         batt_monitor_start();
+        rx_stats_reset();
         tag_wdt_run_feeder();
     } else {
         /* Red: fatal DW3000 init failure — the only signal with no BLE. */

@@ -22,6 +22,8 @@ target_sources(app PRIVATE
     src/uwb_net.c
     src/uwb_net_runner.c
     src/tag_cmd.c
+    src/rx_stats_core.c
+    src/rx_stats.c
     src/wdt.c
     drivers/lis2hh12-pid/lis2hh12_reg.c
     platform/port.c
