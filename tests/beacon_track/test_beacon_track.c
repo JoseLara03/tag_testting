@@ -39,8 +39,8 @@ int main(void)
     CHECK(beacon_track_period_ms(&c) == 200u);
     beacon_track_beacon(&c, 208u);                  /* gap 208, err +8, +8>>3 = +1 */
     CHECK(beacon_track_period_ms(&c) == 201u);
-    beacon_track_beacon(&c, 416u);                  /* gap 208, err +7, +7>>3 = 0 */
-    CHECK(beacon_track_period_ms(&c) == 201u);
+    beacon_track_beacon(&c, 416u);                  /* gap 208, err +7, 7/8=0 -> nudge +1 */
+    CHECK(beacon_track_period_ms(&c) == 202u);      /* no dead band: nonzero err always moves */
 
     /* --- Test C: miss -> ACQUIRING, warmup reset, period_est retained, re-lock --- */
     beacon_track_reset(&c, 200u, 5u, 3u, 3u);
@@ -64,6 +64,23 @@ int main(void)
     beacon_track_plan(&c, &narrow, &arm, &win);
     CHECK(narrow == true);
     CHECK(arm == 2100u + 200u - 5u);                /* 2295 */
+
+    /* --- Test D: negative convergence, no dead-band stranding ---
+     * Real case: seed 200ms, true gateway period 195ms.  Each gap gives
+     * err = -5; the EMA must still drive period_est down to 195, otherwise the
+     * window is mis-centred 5ms late and ~half the (early-jitter) beacons fall
+     * off the front edge and miss.  (A round-toward-zero shift strands it at
+     * 200.) */
+    beacon_track_reset(&c, 200u, 5u, 2u, 3u);
+    {
+        uint32_t t = 0u;
+        beacon_track_beacon(&c, t);                 /* first, no gap */
+        for (int i = 0; i < 20; i++) {
+            t += 195u;
+            beacon_track_beacon(&c, t);
+        }
+    }
+    CHECK(beacon_track_period_ms(&c) == 195u);      /* converged, not stuck at 200 */
 
     printf("beacon_track_core: %d failure(s)\n", fails);
     return fails == 0 ? 0 : 1;

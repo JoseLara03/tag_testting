@@ -33,7 +33,15 @@ void beacon_track_beacon(struct beacon_track *c, uint32_t now_ms)
         /* int32 deltas are wrap-safe for ~ms intervals. */
         int32_t gap = (int32_t)(now_ms - c->last_beacon_ms);
         int32_t err = gap - (int32_t)c->period_est_ms;
-        int32_t correction = (err >= 0) ? (err >> c->ema_shift) : -((-err) >> c->ema_shift);
+        /* Portable EMA: divide (truncates toward zero in C99) for the smoothing,
+         * then nudge by one when the quotient rounds a non-zero error to zero, so
+         * a small steady error (e.g. seed 200 vs true 195) still converges instead
+         * of stranding the estimate in a dead band and mis-centring the window. */
+        int32_t step = (int32_t)1 << c->ema_shift;
+        int32_t correction = err / step;
+        if (correction == 0 && err != 0) {
+            correction = (err > 0) ? 1 : -1;
+        }
         c->period_est_ms = (uint32_t)((int32_t)c->period_est_ms + correction);
     }
     c->last_beacon_ms = now_ms;
