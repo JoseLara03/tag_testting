@@ -18,6 +18,7 @@
 #include "deca_device_api.h"
 #include "phy_config.h"
 #include "cal.h"
+#include "rx_stats.h"
 #include <zephyr/kernel.h>
 #include <zephyr/random/random.h>
 #include <string.h>
@@ -459,6 +460,7 @@ static void runner_fn(void *p1, void *p2, void *p3)
         uint8_t beacon_buf[UWB_FRAME_MAX_LEN];
         int beacon_len = -ETIMEDOUT;
         uint32_t bcn_deadline = uwb_radio_now_ms() + T_SUPERFRAME_MS + T_BEACON_MS;
+        rx_stats_arm();
         for (;;) {
             int32_t rem = (int32_t)(bcn_deadline - uwb_radio_now_ms());
             if (rem <= 0) {
@@ -497,11 +499,14 @@ static void runner_fn(void *p1, void *p2, void *p3)
                 ev.frame_counter = frame_ctr;
                 ev.in_map        = (slot_idx >= 0);
                 ev.map_slot      = (slot_idx >= 0) ? (uint8_t)slot_idx : 0;
+                rx_stats_beacon();
             } else {
                 ev.kind = UWB_EV_BEACON_MISS;
+                rx_stats_miss();
             }
         } else {
             ev.kind = UWB_EV_BEACON_MISS;
+            rx_stats_miss();
         }
 
         uint32_t act = uwb_net_handle(&ctx, &ev);
