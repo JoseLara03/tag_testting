@@ -1,4 +1,5 @@
 #include "rx_stats_core.h"
+#include <stddef.h>
 
 /* Convert a signed cycle delta to microseconds. The int64 intermediate avoids
  * overflow (a delta of up to ~1 superframe of cycles times 1e6). */
