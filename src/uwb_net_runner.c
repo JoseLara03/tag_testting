@@ -488,6 +488,8 @@ static void runner_fn(void *p1, void *p2, void *p3)
             bcn_deadline = uwb_radio_now_ms() + T_SUPERFRAME_MS + T_BEACON_MS;
         }
 
+        uint32_t bcn_rx_ms = 0;
+
         rx_stats_arm();
         for (;;) {
             int32_t rem = (int32_t)(bcn_deadline - uwb_radio_now_ms());
@@ -499,6 +501,7 @@ static void runner_fn(void *p1, void *p2, void *p3)
             if (len == UWB_FRAME_LEN_BEACON &&
                 uwb_frame_is_beacon(beacon_buf, (size_t)len)) {
                 beacon_len = len;
+                bcn_rx_ms = uwb_radio_now_ms();
                 break;
             }
             /* non-beacon frame or rx timeout/error: keep waiting for the beacon */
@@ -528,7 +531,7 @@ static void runner_fn(void *p1, void *p2, void *p3)
                 ev.in_map        = (slot_idx >= 0);
                 ev.map_slot      = (slot_idx >= 0) ? (uint8_t)slot_idx : 0;
                 rx_stats_beacon();
-                beacon_track_beacon(&bt, t0_ms);
+                beacon_track_beacon(&bt, bcn_rx_ms);
             } else {
                 ev.kind = UWB_EV_BEACON_MISS;
                 rx_stats_miss();

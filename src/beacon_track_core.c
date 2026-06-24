@@ -33,7 +33,8 @@ void beacon_track_beacon(struct beacon_track *c, uint32_t now_ms)
         /* int32 deltas are wrap-safe for ~ms intervals. */
         int32_t gap = (int32_t)(now_ms - c->last_beacon_ms);
         int32_t err = gap - (int32_t)c->period_est_ms;
-        c->period_est_ms = (uint32_t)((int32_t)c->period_est_ms + (err >> c->ema_shift));
+        int32_t correction = (err >= 0) ? (err >> c->ema_shift) : -((-err) >> c->ema_shift);
+        c->period_est_ms = (uint32_t)((int32_t)c->period_est_ms + correction);
     }
     c->last_beacon_ms = now_ms;
     c->have_last      = true;
