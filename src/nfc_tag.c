@@ -63,12 +63,12 @@ static void on_nfc_write(const uint8_t *file_buf, uint32_t nlen)
     uint8_t result_buf[NFC_NDEF_PARSER_REQUIRED_MEM(1)] __aligned(4);
     uint32_t result_len  = sizeof(result_buf);
 
-    if (nlen < 2U) {
+    if (nlen == 0U) {
         return;
     }
 
     const uint8_t *msg_data = file_buf + 2; /* skip 2-byte NLEN field */
-    uint32_t msg_len        = nlen - 2U;
+    uint32_t msg_len        = nlen;
 
     if (nfc_ndef_msg_parse(result_buf, &result_len, msg_data, &msg_len) != 0) {
         return;
