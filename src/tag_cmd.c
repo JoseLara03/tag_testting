@@ -56,6 +56,9 @@ static void tag_cmd_on_rx(const uint8_t *data, uint16_t len)
 			} else {
 				ble_log_send("RX none\n");
 			}
+		} else if (strcmp(buf, "pwr rxrst") == 0) {
+			rx_stats_reset();
+			ble_log_send("RX reset\n");
 		} else {
 			ble_log_send(uwb_radio_sleep_enabled() ? "PWR sleep on\n"
 							       : "PWR sleep off\n");
