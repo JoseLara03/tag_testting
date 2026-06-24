@@ -49,6 +49,7 @@ int main(void)
             ble_log_send("CAL REQUIRED\n");
         }
         tag_cmd_init();
+        rx_stats_reset();
         uwb_ss_initiator_start();
         uwb_net_runner_start(eui);
         if (motion_init() != 0) {
@@ -56,7 +57,6 @@ int main(void)
         }
         tag_ui_init();
         batt_monitor_start();
-        rx_stats_reset();
         tag_wdt_run_feeder();
     } else {
         /* Red: fatal DW3000 init failure — the only signal with no BLE. */

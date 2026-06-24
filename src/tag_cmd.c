@@ -42,6 +42,8 @@ static void tag_cmd_on_rx(const uint8_t *data, uint16_t len)
 			if (rx_stats_get(&on_mean, &on_max, &off_min, &off_max,
 					 &cnt, &miss)) {
 				char msg[24];
+				uint32_t cnt_d = cnt > 99999u ? 99999u : cnt;
+				uint32_t miss_d = miss > 9999u ? 9999u : miss;
 				snprintf(msg, sizeof(msg), "RXon %d/%dms\n",
 					 on_mean, on_max);
 				ble_log_send(msg);
@@ -49,7 +51,7 @@ static void tag_cmd_on_rx(const uint8_t *data, uint16_t len)
 				ble_log_send(msg);
 				snprintf(msg, sizeof(msg), "RXoffmax %dus\n", off_max);
 				ble_log_send(msg);
-				snprintf(msg, sizeof(msg), "RXn %u m%u\n", cnt, miss);
+				snprintf(msg, sizeof(msg), "RXn %u m%u\n", cnt_d, miss_d);
 				ble_log_send(msg);
 			} else {
 				ble_log_send("RX none\n");
