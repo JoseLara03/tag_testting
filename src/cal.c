@@ -2,29 +2,17 @@
 #include "cal_math.h"
 #include "ble_log.h"
 #include "phy_config.h"   /* CONFIG_OPTION */
+#include "storage.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
-#include <zephyr/fs/nvs.h>
-#include <zephyr/drivers/flash.h>
 #include <errno.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 
-/* NVS lives in the DTS `storage_partition` (label "storage", 24 KB @ 0x7a000).
- * We resolve geometry straight from devicetree rather than via the flash_map /
- * FIXED_PARTITION_ID API: this is an NCS Partition Manager build where PM owns
- * the whole flash as a single `app` region and the DTS partitions are not
- * registered with flash_map, so FIXED_PARTITION_ID(storage_partition) does not
- * exist. The region sits above the (small) application image and is unused by
- * PM, so it is safe to use for NVS on this single-image bench build. */
-#define CAL_NVS_NODE        DT_NODELABEL(storage_partition)
 #define CAL_NVS_ID          1
-
-static struct nvs_fs fs;
-static bool          fs_ready;
 
 static struct cal_record active;
 static bool             active_valid;
@@ -32,36 +20,6 @@ static bool             active_valid;
 static K_SEM_DEFINE(cal_req_sem, 0, 1);
 static volatile uint32_t cal_req_ref_mm;
 static volatile bool     cal_req_pending;
-
-/* ---- NVS bring-up ---------------------------------------------------------- */
-static int nvs_bringup(void)
-{
-    const struct device *flash_dev =
-        DEVICE_DT_GET(DT_MTD_FROM_FIXED_PARTITION(CAL_NVS_NODE));
-    if (!device_is_ready(flash_dev)) {
-        return -ENODEV;
-    }
-
-    off_t  offset = (off_t)DT_REG_ADDR(CAL_NVS_NODE);
-    size_t size   = (size_t)DT_REG_SIZE(CAL_NVS_NODE);
-
-    struct flash_pages_info info;
-    int rc = flash_get_page_info_by_offs(flash_dev, offset, &info);
-    if (rc) {
-        return rc;
-    }
-
-    fs.flash_device = flash_dev;
-    fs.offset       = offset;
-    fs.sector_size  = info.size;
-    fs.sector_count = (uint16_t)(size / info.size);
-
-    rc = nvs_mount(&fs);
-    if (rc == 0) {
-        fs_ready = true;
-    }
-    return rc;
-}
 
 /* ---- command parser (runs in BT RX thread) -------------------------------- */
 void cal_on_rx(const uint8_t *data, uint16_t len)
@@ -114,14 +72,10 @@ void cal_on_rx(const uint8_t *data, uint16_t len)
 /* ---- public API ------------------------------------------------------------ */
 bool cal_init(void)
 {
-    if (nvs_bringup() != 0) {
-        active_valid = false;
-        return false;
-    }
-
     struct cal_record r;
-    ssize_t got = nvs_read(&fs, CAL_NVS_ID, &r, sizeof(r));
-    if (got == sizeof(r) && cal_record_valid(&r, (uint8_t)CONFIG_OPTION)) {
+    int got = storage_read(CAL_NVS_ID, &r, sizeof(r));
+
+    if (got == (int)sizeof(r) && cal_record_valid(&r, (uint8_t)CONFIG_OPTION)) {
         active = r;
         active_valid = true;
         return true;
@@ -143,10 +97,8 @@ bool cal_is_valid(void)
 
 int cal_clear(void)
 {
-    if (!fs_ready) {
-        return -1;
-    }
-    int rc = nvs_delete(&fs, CAL_NVS_ID);
+    int rc = storage_delete(CAL_NVS_ID);
+
     if (rc == 0) {
         active_valid = false;
     }
@@ -170,11 +122,8 @@ void cal_wait_request(void)
 
 int cal_store(uint16_t tx, uint16_t rx, uint32_t ref_mm, uint16_t residual_mm)
 {
-    if (!fs_ready) {
-        return -1;
-    }
-
     struct cal_record r = {0};
+
     r.phy_option  = (uint8_t)CONFIG_OPTION;
     r.tx_ant_dly  = tx;
     r.rx_ant_dly  = rx;
@@ -182,9 +131,10 @@ int cal_store(uint16_t tx, uint16_t rx, uint32_t ref_mm, uint16_t residual_mm)
     r.residual_mm = residual_mm;
     cal_record_finalize(&r);
 
-    ssize_t rc = nvs_write(&fs, CAL_NVS_ID, &r, sizeof(r));
+    int rc = storage_write(CAL_NVS_ID, &r, sizeof(r));
+
     if (rc < 0) {
-        return (int)rc;
+        return rc;
     }
     active = r;
     active_valid = true;
