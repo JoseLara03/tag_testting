@@ -62,8 +62,13 @@ static void on_nfc_write(const uint8_t *file_buf, uint32_t nlen)
     /* file_buf = ndef_buf; first 2 bytes are NLEN, then the NDEF message */
     uint8_t result_buf[NFC_NDEF_PARSER_REQUIRED_MEM(1)] __aligned(4);
     uint32_t result_len  = sizeof(result_buf);
+
+    if (nlen < 2U) {
+        return;
+    }
+
     const uint8_t *msg_data = file_buf + 2; /* skip 2-byte NLEN field */
-    uint32_t msg_len        = nlen;
+    uint32_t msg_len        = nlen - 2U;
 
     if (nfc_ndef_msg_parse(result_buf, &result_len, msg_data, &msg_len) != 0) {
         return;
@@ -109,7 +114,7 @@ static void on_nfc_write(const uint8_t *file_buf, uint32_t nlen)
     current_name[text_len] = '\0';
 
     storage_write(NFC_NAME_NVS_ID, current_name, text_len + 1U);
-    encode_name();
+    (void)encode_name();
 }
 
 static void nfc_callback(void *context, nfc_t4t_event_t event,
