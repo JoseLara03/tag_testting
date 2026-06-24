@@ -25,8 +25,10 @@ void rx_stats_core_reset(struct rx_stats_core *c,
 
 /* Record a received beacon. arm_cyc = cycle stamp when the listen window was
  * armed; now_cyc = cycle stamp at beacon arrival. Records on-duration
- * (now-arm) and, if a previous beacon is known, arrival offset
- * (now - (prev + nominal)). Advances the phase reference to now_cyc. */
+ * (now-arm) and, if a previous beacon is known, the sub-superframe arrival
+ * offset: the inter-beacon gap folded by the nearest whole number of superframes
+ * (so a beacon skipped without a recorded miss does not show as ~+1 superframe).
+ * Advances the phase reference to now_cyc. */
 void rx_stats_core_beacon(struct rx_stats_core *c,
                           uint32_t arm_cyc, uint32_t now_cyc);
 

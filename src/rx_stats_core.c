@@ -28,7 +28,17 @@ void rx_stats_core_beacon(struct rx_stats_core *c,
     batt_window_add(&c->on_win, cyc_to_us(c, (int32_t)(now_cyc - arm_cyc)));
 
     if (c->prev_valid) {
-        int32_t off = (int32_t)(now_cyc - (c->prev_beacon_cyc + c->nominal_sf_cyc));
+        /* Fold the inter-beacon gap by the number of whole superframes elapsed.
+         * The gateway beacon is periodic, so a beacon skipped without a recorded
+         * miss (e.g. the tag was busy with re-discovery for a superframe) still
+         * preserves phase modulo the superframe. Reporting the raw gap would show
+         * a spurious ~+1-superframe offset and swamp the true sub-superframe
+         * jitter we care about. */
+        int32_t delta = (int32_t)(now_cyc - c->prev_beacon_cyc);
+        int32_t sf    = (int32_t)c->nominal_sf_cyc;
+        int32_t n_sf  = (delta + sf / 2) / sf;   /* nearest whole superframes */
+        if (n_sf < 1) { n_sf = 1; }              /* a later beacon is >=1 SF away */
+        int32_t off = delta - n_sf * sf;
         batt_window_add(&c->off_win, cyc_to_us(c, off));
     }
 

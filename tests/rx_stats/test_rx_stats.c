@@ -55,6 +55,18 @@ int main(void)
     CHECK(off_min == -300 && off_max == 500);
     CHECK(n == 5);
 
+    /* Skipped-but-not-missed beacon (steady-state re-discovery): the gateway
+     * beacon is periodic, so a ~2-superframe gap with NO recorded miss must FOLD
+     * to the true sub-superframe phase, not report a spurious ~+1 superframe.
+     * fresh: beacon at 100000 (no offset); next at 100000 + 2*SF - 10 = 499990.
+     * delta = 399990, n = round(399990/200000) = 2, off = 399990 - 400000 = -10. */
+    rx_stats_core_reset(&c, SF_CYC, HZ);
+    rx_stats_core_beacon(&c, 0u, 100000u);          /* first, no offset */
+    rx_stats_core_beacon(&c, 300000u, 499990u);     /* +2 SF gap, -10 us phase */
+    rx_stats_core_get(&c, &on_mean, &on_max, &off_min, &off_max, &n, &miss);
+    CHECK(off_min == -10 && off_max == -10);        /* folded, not ~+200000 */
+    CHECK(n == 2);
+
     /* Reset clears everything. */
     rx_stats_core_reset(&c, SF_CYC, HZ);
     CHECK(rx_stats_core_get(&c, NULL, NULL, NULL, NULL, NULL, NULL) == 0);
