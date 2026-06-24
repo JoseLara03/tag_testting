@@ -5,6 +5,7 @@
 #include "cal.h"
 #include "uwb_net_runner.h"
 #include "batt.h"
+#include "rx_stats.h"
 
 static void tag_cmd_on_rx(const uint8_t *data, uint16_t len)
 {
@@ -34,6 +35,24 @@ static void tag_cmd_on_rx(const uint8_t *data, uint16_t len)
 				ble_log_send(msg);
 			} else {
 				ble_log_send("Idle none\n");
+			}
+		} else if (strcmp(buf, "pwr rx") == 0) {
+			int on_mean = 0, on_max = 0, off_min = 0, off_max = 0;
+			uint32_t cnt = 0, miss = 0;
+			if (rx_stats_get(&on_mean, &on_max, &off_min, &off_max,
+					 &cnt, &miss)) {
+				char msg[24];
+				snprintf(msg, sizeof(msg), "RXon %d/%dms\n",
+					 on_mean, on_max);
+				ble_log_send(msg);
+				snprintf(msg, sizeof(msg), "RXoffmin %dus\n", off_min);
+				ble_log_send(msg);
+				snprintf(msg, sizeof(msg), "RXoffmax %dus\n", off_max);
+				ble_log_send(msg);
+				snprintf(msg, sizeof(msg), "RXn %u m%u\n", cnt, miss);
+				ble_log_send(msg);
+			} else {
+				ble_log_send("RX none\n");
 			}
 		} else {
 			ble_log_send(uwb_radio_sleep_enabled() ? "PWR sleep on\n"
