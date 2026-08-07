@@ -43,7 +43,13 @@ bool uwb_radio_request_pending(void);
  * idle, per the handover contract. It is also safe to call if the claim was
  * withdrawn between that poll and this call -- the withdrawal is caught under
  * the same lock and uwb_radio_yield() returns immediately without handing
- * over anything. */
-void uwb_radio_yield(void);
+ * over anything.
+ *
+ * Returns true if the radio was actually handed over and has now come back,
+ * false if the claim had already been withdrawn and nothing changed hands. Run
+ * the reacquire sequence only when it returns true: after a false the radio was
+ * never touched by anyone else, and rebuilding state the claimant never
+ * disturbed costs real airtime. */
+bool uwb_radio_yield(void);
 
 #endif /* UWB_RADIO_OWNER_H_ */

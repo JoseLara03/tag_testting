@@ -461,24 +461,30 @@ static void runner_fn(void *p1, void *p2, void *p3)
              * spurious EVT_RXERR against an exchange it never started. */
             dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
 
-            uwb_radio_yield();   /* blocks until the claimant releases */
+            /* Blocks until the claimant releases -- unless the claim was
+             * withdrawn in between, in which case it returns false at once and
+             * the radio never left us. */
+            if (uwb_radio_yield()) {
+                /* Seconds may have passed and the antenna delays may have
+                 * changed. Re-establish everything the claimant could have
+                 * disturbed. */
+                dwt_setrxaftertxdelay(POLL_TX_TO_RESP_RX_DLY_UUS);
+                dwt_setrxtimeout(RESP_RX_TIMEOUT_UUS);
+                dwt_setpreambledetecttimeout(PRE_TIMEOUT);
 
-            /* Seconds may have passed and the antenna delays may have changed.
-             * Re-establish everything the claimant could have disturbed. */
-            dwt_setrxaftertxdelay(POLL_TX_TO_RESP_RX_DLY_UUS);
-            dwt_setrxtimeout(RESP_RX_TIMEOUT_UUS);
-            dwt_setpreambledetecttimeout(PRE_TIMEOUT);
+                uint16_t rtx, rrx;
+                cal_get_ant_dly(&rtx, &rrx);
+                dwt_settxantennadelay(rtx);
+                dwt_setrxantennadelay(rrx);
 
-            uint16_t rtx, rrx;
-            cal_get_ant_dly(&rtx, &rrx);
-            dwt_settxantennadelay(rtx);
-            dwt_setrxantennadelay(rrx);
-
-            /* The arrival prediction is stale after that long off the air. A
-             * narrow window aimed at a dead instant would miss repeatedly and
-             * trip RESCAN, so go back to ACQUIRING. */
-            beacon_track_reset(&bt, T_SUPERFRAME_MS, BT_GUARD_MS,
-                               BT_WARMUP_N, BT_EMA_SHIFT);
+                /* The arrival prediction is stale after that long off the air.
+                 * A narrow window aimed at a dead instant would miss repeatedly
+                 * and trip RESCAN, so go back to ACQUIRING. That costs
+                 * BT_WARMUP_N superframes of full-window RX, which is why it is
+                 * gated on an actual handover. */
+                beacon_track_reset(&bt, T_SUPERFRAME_MS, BT_GUARD_MS,
+                                   BT_WARMUP_N, BT_EMA_SHIFT);
+            }
         }
 
         /* 1. Inject any pending tier change before the beacon window. */

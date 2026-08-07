@@ -71,16 +71,17 @@ bool uwb_radio_request_pending(void)
     return pending;
 }
 
-void uwb_radio_yield(void)
+bool uwb_radio_yield(void)
 {
     k_mutex_lock(&lock, K_FOREVER);
 
     if (state != OWNER_REQUESTED) {
         /* The claim was withdrawn between the runner's poll and this call.
          * Handing over now would park us forever waiting for a claimant that
-         * already gave up. */
+         * already gave up. Nothing was handed over, so the caller must not pay
+         * the cost of reacquiring a radio it never lost. */
         k_mutex_unlock(&lock);
-        return;
+        return false;
     }
 
     state = OWNER_HANDED;
@@ -91,4 +92,5 @@ void uwb_radio_yield(void)
     }
 
     k_mutex_unlock(&lock);
+    return true;
 }
