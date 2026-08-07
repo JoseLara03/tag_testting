@@ -20,6 +20,7 @@ target_sources(app PRIVATE
     src/uwb_ss_initiator.c
     src/motion.c
     src/tag_ui.c
+    src/tag_ui_color.c
     src/uwb_frame_802_15_4z.c
     src/uwb_net.c
     src/uwb_net_runner.c

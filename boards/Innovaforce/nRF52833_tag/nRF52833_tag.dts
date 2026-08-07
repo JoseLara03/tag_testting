@@ -129,6 +129,18 @@
 			};
 		};
 
+		/* LED0 drives the charge-status LED on the board. In "charging"
+		 * mode the PMIC lights it itself from the charger block, so no
+		 * firmware, thread or I2C polling is involved. LED1 and LED2 are
+		 * not wired, but the binding requires all three modes; "host"
+		 * leaves them software-controlled and dark. */
+		npm1304_leds: leds {
+			compatible = "nordic,npm1304-led";
+			nordic,led0-mode = "charging";
+			nordic,led1-mode = "host";
+			nordic,led2-mode = "host";
+		};
+
 		/* 100 mA into the 400 mAh cell is 0.25C. Revisit current-microamp
 		 * when the cell changes.
 		 *
