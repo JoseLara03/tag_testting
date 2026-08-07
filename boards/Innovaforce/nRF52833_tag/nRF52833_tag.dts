@@ -129,8 +129,20 @@
 			};
 		};
 
+		/* 100 mA into the 400 mAh cell is 0.25C. Revisit current-microamp
+		 * when the cell changes.
+		 *
+		 * thermistor-ohms = 0 disables the NTC because the pad is not
+		 * exposed on this PCB, so the PMIC cannot read cell temperature
+		 * and charging runs with no thermal cutoff. That is a hardware
+		 * constraint, not a missing setting — do not "fix" it here.
+		 *
+		 * charging-enable is what actually switches the charger on;
+		 * without it the block is configured but idle and the battery
+		 * current reads 0 mA with VBUS connected. */
 		npm1304_charger: charger {
 			compatible = "nordic,npm1304-charger";
+			charging-enable;
 			term-microvolt = <4200000>;
 			current-microamp = <100000>;
 			vbus-limit-microamp = <500000>;
