@@ -27,6 +27,19 @@ static void led_set(uint8_t r, uint8_t g, uint8_t b)
 #define LED_OFF()     led_set(0, 0, 0)
 #define LED_ORANGE()  led_set(10, 4, 0)
 
+/* Current draw is measured directly by the PMIC and needs no battery model,
+ * so it is reported on every path — including the ones with no percentage. */
+static void log_current(void)
+{
+    int ma;
+
+    if (batt_read_current(&ma) == 0) {
+        char imsg[16];
+        snprintf(imsg, sizeof(imsg), "I:%dmA\n", ma);
+        ble_log_send(imsg);
+    }
+}
+
 /* Discrete SoC -> color (matches the design spec). */
 static void led_show_battery(void)
 {
@@ -34,22 +47,24 @@ static void led_show_battery(void)
     int err = batt_read_soc(&soc);
     char msg[20];
 
+    if (err == -EBUSY) {
+        ble_log_send("BATT: charging\n");
+        log_current();
+        led_set(0, 8, 8);           /* cyan: on the charger, no valid SoC */
+        return;
+    }
+
     if (err != 0) {
         snprintf(msg, sizeof(msg), "BATT err %d\n", err);
         ble_log_send(msg);
+        log_current();
         led_set(0, 0, 10);          /* dim blue: no gauge data */
         return;
     }
 
     snprintf(msg, sizeof(msg), "BATT: %d%%\n", soc);
     ble_log_send(msg);
-
-    int ma;
-    if (batt_read_current(&ma) == 0) {
-        char imsg[16];
-        snprintf(imsg, sizeof(imsg), "I:%dmA\n", ma);
-        ble_log_send(imsg);
-    }
+    log_current();
 
     if (soc >= 75) {
         led_set(0, 10, 0);          /* green */

@@ -1,13 +1,50 @@
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/sensor.h>
+#include <zephyr/drivers/sensor/npm13xx_charger.h>
 #include "batt.h"
+#include "batt_curve.h"
 #include "batt_window.h"
 
-static const struct device *fg = DEVICE_DT_GET(DT_NODELABEL(fuel_gauge));
+static const struct device *fg = DEVICE_DT_GET(DT_NODELABEL(npm1304_charger));
+
+/* True while the charger is plugged in. This attribute does its own register
+ * read, so it needs no preceding sensor_sample_fetch(). If the query fails,
+ * report "not charging": a possibly-inflated percentage beats none at all. */
+static bool vbus_present(void)
+{
+    struct sensor_value val;
+
+    if (sensor_attr_get(fg, (enum sensor_channel)SENSOR_CHAN_NPM13XX_CHARGER_VBUS_STATUS,
+                        (enum sensor_attribute)SENSOR_ATTR_NPM13XX_CHARGER_VBUS_PRESENT,
+                        &val) < 0) {
+        return false;
+    }
+
+    return val.val1 != 0;
+}
+
+static int batt_read_millivolts(int *mv)
+{
+    struct sensor_value val;
+
+    if (!device_is_ready(fg)) {
+        return -ENODEV;
+    }
+    if (sensor_sample_fetch(fg) < 0) {
+        return -EIO;
+    }
+    if (sensor_channel_get(fg, SENSOR_CHAN_GAUGE_VOLTAGE, &val) < 0) {
+        return -EIO;
+    }
+
+    *mv = (val.val1 * 1000) + (val.val2 / 1000);
+    return 0;
+}
 
 int batt_read_soc(int *soc)
 {
-    struct sensor_value val;
+    int mv;
+    int err;
 
     if (soc == NULL) {
         return -EINVAL;
@@ -15,14 +52,20 @@ int batt_read_soc(int *soc)
     if (!device_is_ready(fg)) {
         return -ENODEV;
     }
-    if (sensor_sample_fetch(fg) < 0) {
-        return -EIO;
-    }
-    if (sensor_channel_get(fg, SENSOR_CHAN_GAUGE_STATE_OF_CHARGE, &val) < 0) {
-        return -EIO;
+
+    /* While charging, the terminal voltage is driven by the charger, not by
+     * the cell's state — mapping it through the curve would report near-full
+     * for a half-empty battery. Say "charging" instead of lying. */
+    if (vbus_present()) {
+        return -EBUSY;
     }
 
-    *soc = val.val1;   /* val1 = percent */
+    err = batt_read_millivolts(&mv);
+    if (err != 0) {
+        return err;
+    }
+
+    *soc = lipo_mv_to_pct(mv);
     return 0;
 }
 

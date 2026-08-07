@@ -1,6 +1,7 @@
 /dts-v1/;
 #include <nordic/nrf52833_qdaa.dtsi>
 #include <zephyr/dt-bindings/led/led.h>
+#include <dt-bindings/regulator/npm13xx.h>
 #include "nRF52833_tag-pinctrl.dtsi"
 
 / {
@@ -91,13 +92,51 @@
 	pinctrl-1 = <&i2c0_sleep>;
 	pinctrl-names = "default", "sleep";
 
-	fuel_gauge: bq274xx@55 {
-		compatible = "ti,bq274xx";
-		reg = <0x55>;
-		design-voltage = <4200>;
-		design-capacity = <400>;
-		taper-current = <40>;
-		terminate-voltage = <3000>;
+	/* nPM1304 PMIC. No GPIO lines are wired between the nPM1304 and the
+	 * nRF52833, so no host-int-gpios / pmic-int-pin properties are set;
+	 * the charger is read by polling only. */
+	npm1304_pmic: pmic@6b {
+		compatible = "nordic,npm1304";
+		reg = <0x6b>;
+
+		regulators {
+			compatible = "nordic,npm1304-regulator";
+
+			BUCK1 {
+				regulator-min-microvolt = <1600000>;
+				regulator-max-microvolt = <1600000>;
+				regulator-boot-on;
+			};
+
+			BUCK2 {
+				regulator-min-microvolt = <3300000>;
+				regulator-max-microvolt = <3300000>;
+				regulator-boot-on;
+			};
+
+			LDO1 {
+				regulator-min-microvolt = <2500000>;
+				regulator-max-microvolt = <2500000>;
+				regulator-initial-mode = <NPM13XX_LDSW_MODE_LDO>;
+				regulator-boot-on;
+			};
+
+			LDO2 {
+				regulator-min-microvolt = <1800000>;
+				regulator-max-microvolt = <1800000>;
+				regulator-initial-mode = <NPM13XX_LDSW_MODE_LDO>;
+				regulator-boot-on;
+			};
+		};
+
+		npm1304_charger: charger {
+			compatible = "nordic,npm1304-charger";
+			term-microvolt = <4200000>;
+			current-microamp = <100000>;
+			vbus-limit-microamp = <500000>;
+			thermistor-ohms = <0>;
+			thermistor-beta = <0>;
+		};
 	};
 };
 

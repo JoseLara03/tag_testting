@@ -1,9 +1,17 @@
 #ifndef BATT_H_
 #define BATT_H_
 
-/* Read battery state of charge as a percentage (0-100).
- * Returns 0 on success and writes *soc; negative errno on failure
- * (e.g. -ENODEV when the gauge is not ready / no battery attached). */
+/* Read battery state of charge as a percentage (0-100), estimated from the
+ * cell voltage via the LiPo discharge curve in batt_curve.h.
+ *
+ * Returns 0 on success; -EBUSY while the charger is connected (the terminal
+ * voltage then says nothing about the charge, so no percentage is produced);
+ * -ENODEV / -EIO / -EINVAL otherwise.
+ *
+ * This is an estimate, not a fuel gauge: in the 3700-3850 mV plateau, where
+ * roughly half the capacity lives, expect around +/-10 percentage points. A
+ * true reading would need the nRF Fuel Gauge library plus a battery model
+ * profiled from this exact cell. */
 int batt_read_soc(int *soc);
 
 /* Read average battery current in milliamps (discharge as a positive
