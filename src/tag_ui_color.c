@@ -1,7 +1,7 @@
 #include "tag_ui_color.h"
 
-/* Base brightness of each level colour, at full (unshifted) intensity. The
- * strip is viewed up close, so these are deliberately low. */
+/* Brightness of each level colour. The strip is viewed up close, so these are
+ * deliberately low. */
 static const struct {
     int min_soc;
     uint8_t r, g, b;
@@ -14,7 +14,7 @@ static const struct {
 
 #define LEVELS_N ((int)(sizeof(levels) / sizeof(levels[0])))
 
-void soc_to_rgb(int soc, int dim_shift, uint8_t *r, uint8_t *g, uint8_t *b)
+void soc_to_rgb(int soc, uint8_t *r, uint8_t *g, uint8_t *b)
 {
     int i;
 
@@ -24,7 +24,7 @@ void soc_to_rgb(int soc, int dim_shift, uint8_t *r, uint8_t *g, uint8_t *b)
         }
     }
 
-    *r = levels[i].r >> dim_shift;
-    *g = levels[i].g >> dim_shift;
-    *b = levels[i].b >> dim_shift;
+    *r = levels[i].r;
+    *g = levels[i].g;
+    *b = levels[i].b;
 }

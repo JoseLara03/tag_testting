@@ -19,16 +19,6 @@ static const struct device *strip = DEVICE_DT_GET(DT_ALIAS(led_strip));
 #define BLINK_MS       500U
 #define BATTERY_MS    5000U
 
-/* The strip holds its colour until written again, so the resting display costs
- * nothing between refreshes — this interval only bounds how stale the level
- * can get, and each tick is one I2C read of the PMIC. SoC moves slowly. */
-#define IDLE_REFRESH_MS 10000U
-
-/* How much darker the resting display is than the button-press readout.
- * Raising this quantises the channels until orange and red become the same
- * triplet; tests/tag_ui_color/ fails if that happens. */
-#define IDLE_DIM_SHIFT  1
-
 static void led_set(uint8_t r, uint8_t g, uint8_t b)
 {
     struct led_rgb px = { .r = r, .g = g, .b = b };
@@ -78,26 +68,7 @@ static void led_show_battery(void)
     log_current();
 
     uint8_t r, g, b;
-    soc_to_rgb(soc, 0, &r, &g, &b);
-    led_set(r, g, b);
-}
-
-/* Resting display: the SoC colour, dimmed, shown continuously between
- * gestures. Dark whenever there is no percentage to show — including while
- * charging, where LED0 on the nPM1304 is the indicator and the terminal
- * voltage says nothing about the charge. Silent: the NUS log belongs to the
- * button press, not to a background refresh every few seconds. */
-static void led_show_idle(void)
-{
-    int soc;
-    uint8_t r, g, b;
-
-    if (batt_read_soc(&soc) != 0) {
-        LED_OFF();
-        return;
-    }
-
-    soc_to_rgb(soc, IDLE_DIM_SHIFT, &r, &g, &b);
+    soc_to_rgb(soc, &r, &g, &b);
     led_set(r, g, b);
 }
 
@@ -139,13 +110,9 @@ static void ui_fn(void *p1, void *p2, void *p3)
 
     uint32_t t1, t2;
 
-    led_show_idle();
-
     while (1) {
-        /* Wait for the first press of a gesture. Timing out is the normal
-         * case: it just refreshes the resting display. */
-        if (k_msgq_get(&press_q, &t1, K_MSEC(IDLE_REFRESH_MS)) != 0) {
-            led_show_idle();
+        /* Wait for the first press of a gesture. */
+        if (k_msgq_get(&press_q, &t1, K_FOREVER) != 0) {
             continue;
         }
 
@@ -163,7 +130,7 @@ static void ui_fn(void *p1, void *p2, void *p3)
                     break;   /* press -> stop blinking; consumed (no battery display) */
                 }
             }
-            led_show_idle();
+            LED_OFF();
         } else {
             /* Single press: battery color for 5 s. */
             led_show_battery();
@@ -177,7 +144,7 @@ static void ui_fn(void *p1, void *p2, void *p3)
                 k_msgq_put(&press_q, &t2, K_NO_WAIT);
                 continue;
             }
-            led_show_idle();
+            LED_OFF();
         }
     }
 }
