@@ -192,7 +192,12 @@ static bool do_one_range(int32_t *out_mm)
     tx_poll_msg[ALL_MSG_SN_IDX] = frame_seq_nb;
     dwt_writetxdata(sizeof(tx_poll_msg), tx_poll_msg, 0);
     dwt_writetxfctrl(sizeof(tx_poll_msg) + FCS_LEN, 0, 1);
-    dwt_starttx(DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED);
+    /* The positioning path checks this too. A poll rejected before it reaches
+     * the air must not look like a poll that got no answer. */
+    if (dwt_starttx(DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED) != DWT_SUCCESS) {
+        frame_seq_nb++;
+        return false;
+    }
     frame_seq_nb++;
 
     irq_evt_t evt = wait_event(K_MSEC(20));
@@ -319,7 +324,7 @@ static uint16_t active_total_seed(void)
  * is within CAL_ACCEPT_MM or CAL_MAX_ITERS is exhausted. Stores to NVS on
  * success. Reports progress over BLE.
  */
-static void run_calibration(uint32_t ref_mm)
+static void run_calibration_locked(uint32_t ref_mm)
 {
     static int32_t samples[CAL_MAX_SAMPLES];
 
@@ -363,6 +368,16 @@ static void run_calibration(uint32_t ref_mm)
         apply_total_dly(total, &tx, &rx);
     }
     twr_log("CAL FAIL res\n");
+}
+
+static void run_calibration(uint32_t ref_mm)
+{
+    dwt_forcetrxoff();
+    dwt_setrxaftertxdelay(POLL_TX_TO_RESP_RX_DLY_UUS);
+    dwt_setrxtimeout(RESP_RX_TIMEOUT_UUS);
+    dwt_setpreambledetecttimeout(PRE_TIMEOUT);
+
+    run_calibration_locked(ref_mm);
 }
 
 /* Format a metre value as a signed "x.xx" string (centimetre resolution),
