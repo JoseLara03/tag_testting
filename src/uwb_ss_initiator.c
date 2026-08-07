@@ -383,6 +383,9 @@ static void run_calibration(uint32_t ref_mm)
     }
 
     dwt_forcetrxoff();
+    /* Clear whatever the abort asserted; a stale RX-error bit would otherwise
+     * surface as a spurious EVT_RXERR in the thread taking over the radio. */
+    dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
     dwt_setrxaftertxdelay(POLL_TX_TO_RESP_RX_DLY_UUS);
     dwt_setrxtimeout(RESP_RX_TIMEOUT_UUS);
     dwt_setpreambledetecttimeout(PRE_TIMEOUT);
@@ -390,6 +393,7 @@ static void run_calibration(uint32_t ref_mm)
     run_calibration_locked(ref_mm);
 
     dwt_forcetrxoff();
+    dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
     uwb_radio_release();
 }
 

@@ -455,6 +455,11 @@ static void runner_fn(void *p1, void *p2, void *p3)
         if (uwb_radio_request_pending()) {
             if (radio_asleep) { dw_wake(); radio_asleep = false; }
             dwt_forcetrxoff();
+            /* dwt_forcetrxoff() can leave RX-abort/error bits asserted. Clear
+             * them here or the *other* thread's first wait_event() would see
+             * them via port_CheckEXT_IRQ() -> process_deca_irq() and dispatch a
+             * spurious EVT_RXERR against an exchange it never started. */
+            dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
 
             uwb_radio_yield();   /* blocks until the claimant releases */
 
