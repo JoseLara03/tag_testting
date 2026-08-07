@@ -19,6 +19,7 @@
 #include "cal.h"
 #include "cal_math.h"
 #include "pos_solver.h"
+#include "uwb_radio_owner.h"
 
 #include <zephyr/kernel.h>
 #include <string.h>
@@ -365,14 +366,31 @@ static void run_calibration_locked(uint32_t ref_mm)
     twr_log("CAL FAIL res\n");
 }
 
+/* Calibration owns the radio for its whole run: consistent conditions across
+ * all samples matter more than keeping beacon sync, and this is a bench
+ * operation. The runner reacquires and re-locks afterwards.
+ *
+ * The wrapper exists so that every exit path of run_calibration_locked() --
+ * three of them are early returns -- releases the radio. A missed release
+ * blocks the runner forever. */
+#define CAL_RADIO_WAIT  K_SECONDS(2)
+
 static void run_calibration(uint32_t ref_mm)
 {
+    if (!uwb_radio_request(CAL_RADIO_WAIT)) {
+        twr_log("CAL FAIL busy\n");
+        return;
+    }
+
     dwt_forcetrxoff();
     dwt_setrxaftertxdelay(POLL_TX_TO_RESP_RX_DLY_UUS);
     dwt_setrxtimeout(RESP_RX_TIMEOUT_UUS);
     dwt_setpreambledetecttimeout(PRE_TIMEOUT);
 
     run_calibration_locked(ref_mm);
+
+    dwt_forcetrxoff();
+    uwb_radio_release();
 }
 
 /* Format a metre value as a signed "x.xx" string (centimetre resolution),
