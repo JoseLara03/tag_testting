@@ -14,6 +14,7 @@
 #include "uwb_frame_802_15_4z.h"
 #include "uwb_ss_initiator.h"
 #include "pos_solver.h"
+#include "uwb_radio_owner.h"
 #include "port.h"
 #include "deca_device_api.h"
 #include "phy_config.h"
@@ -448,6 +449,33 @@ static void runner_fn(void *p1, void *p2, void *p3)
     dwt_setpreambledetecttimeout(PRE_TIMEOUT);
 
     while (1) {
+        /* 0. Offer the radio to a waiting claimant. This is the only point in
+         * the superframe with no exchange in flight, and the handover contract
+         * says we leave the radio awake and idle. */
+        if (uwb_radio_request_pending()) {
+            if (radio_asleep) { dw_wake(); radio_asleep = false; }
+            dwt_forcetrxoff();
+
+            uwb_radio_yield();   /* blocks until the claimant releases */
+
+            /* Seconds may have passed and the antenna delays may have changed.
+             * Re-establish everything the claimant could have disturbed. */
+            dwt_setrxaftertxdelay(POLL_TX_TO_RESP_RX_DLY_UUS);
+            dwt_setrxtimeout(RESP_RX_TIMEOUT_UUS);
+            dwt_setpreambledetecttimeout(PRE_TIMEOUT);
+
+            uint16_t rtx, rrx;
+            cal_get_ant_dly(&rtx, &rrx);
+            dwt_settxantennadelay(rtx);
+            dwt_setrxantennadelay(rrx);
+
+            /* The arrival prediction is stale after that long off the air. A
+             * narrow window aimed at a dead instant would miss repeatedly and
+             * trip RESCAN, so go back to ACQUIRING. */
+            beacon_track_reset(&bt, T_SUPERFRAME_MS, BT_GUARD_MS,
+                               BT_WARMUP_N, BT_EMA_SHIFT);
+        }
+
         /* 1. Inject any pending tier change before the beacon window. */
         if (tier_pending) {
             struct uwb_net_event mev = {
@@ -542,6 +570,11 @@ static void runner_fn(void *p1, void *p2, void *p3)
 
         uint32_t act = uwb_net_handle(&ctx, &ev);
 
+        /* Suppress ranging while the antenna delays are uncalibrated. Seat
+         * maintenance survives, so the tag stays on the network and is ready
+         * for a `cal <mm>` command. */
+        act = uwb_net_gate_actions(act, cal_is_valid());
+
         /* 4. Execute actions. */
 
         if (act & UWB_ACT_SEND_JOIN) {
@@ -584,7 +617,7 @@ static void runner_fn(void *p1, void *p2, void *p3)
                 } else {
                     gev.kind = UWB_EV_GRANT_MISS;
                 }
-                act |= uwb_net_handle(&ctx, &gev);
+                act |= uwb_net_gate_actions(uwb_net_handle(&ctx, &gev), cal_is_valid());
             }
         }
 
