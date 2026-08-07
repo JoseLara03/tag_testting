@@ -457,13 +457,11 @@ static void ss_twr_fn(void *p1, void *p2, void *p3)
         uint32_t ref_mm;
         if (cal_take_request(&ref_mm)) {
             run_calibration(ref_mm);
+            /* The antenna delays are applied by the runner's reacquire path,
+             * which is inside the handover. Writing them here would be an
+             * unsynchronized SPI access against a runner that is already back
+             * on the radio. */
             ranging = cal_is_valid();
-            if (ranging) {
-                uint16_t tx, rx;
-                cal_get_ant_dly(&tx, &rx);
-                dwt_settxantennadelay(tx);
-                dwt_setrxantennadelay(rx);
-            }
         } else if (!ranging) {
             cal_wait_request();   /* block until a cal command arrives */
         } else {
