@@ -35,11 +35,6 @@
 #define PRE_TIMEOUT                  128U
 /* RNG_FAST_MS / RNG_SLOW_MS removed — cadence now owned by uwb_net_runner. */
 
-/* Anchors to range each cycle (static; <=4). Positioning needs >=3 of these
- * to respond in a cycle to produce a fix. Edit and rebuild to change the set. */
-static const uint8_t ANCHOR_IDS[] = { 0, 1, 2, 3 };
-#define POS_NUM_ANCHORS  ARRAY_SIZE(ANCHOR_IDS)
-
 /* Settle time between anchors within one cycle (radio turnaround margin). */
 #define INTER_ANCHOR_DELAY_MS  10U
 

@@ -337,7 +337,6 @@ static int anchor_sweep(struct pos_meas *out, size_t max)
     dwt_setrxtimeout(RESP_RX_TIMEOUT_UUS);
     dwt_setpreambledetecttimeout(PRE_TIMEOUT);
 
-    uint32_t t_sweep = k_uptime_get_32();
     size_t n = 0;
 
     for (size_t i = 0; i < n_selected && n < max; i++) {
@@ -345,10 +344,8 @@ static int anchor_sweep(struct pos_meas *out, size_t max)
             k_sleep(K_USEC(INTER_ANCHOR_DELAY_US));
         }
 
-        uint32_t t_twr = k_uptime_get_32();
         float r, ax, ay;
         bool ok = do_one_range_anchor(selected[i], &r, &ax, &ay);
-        uint32_t twr_ms = k_uptime_get_32() - t_twr;
 
         if (ok) {
             out[n].x       = ax;
