@@ -180,6 +180,30 @@ static void test_ranging(void)
     CHECK(cd.state == UWB_ST_DISCOVER);
 }
 
+static void test_gate_actions(void)
+{
+    const uint32_t ranging = UWB_ACT_RUN_DISCOVER | UWB_ACT_RUN_SWEEP;
+    const uint32_t housekeeping = UWB_ACT_SEND_JOIN | UWB_ACT_SEND_KEEPALIVE
+                                | UWB_ACT_SLEEP | UWB_ACT_TO_SCAN;
+
+    /* Calibrated: every action passes through untouched. */
+    CHECK(uwb_net_gate_actions(ranging | housekeeping, true)
+          == (ranging | housekeeping));
+
+    /* Uncalibrated: both ranging actions are cleared. */
+    CHECK((uwb_net_gate_actions(ranging, false) & UWB_ACT_RUN_DISCOVER) == 0);
+    CHECK((uwb_net_gate_actions(ranging, false) & UWB_ACT_RUN_SWEEP) == 0);
+
+    /* Uncalibrated: everything that keeps the seat survives. This is the
+     * property that matters -- a tag that stops ranging must not also stop
+     * renewing its lease, or it silently drops off the network. */
+    CHECK(uwb_net_gate_actions(ranging | housekeeping, false) == housekeeping);
+
+    /* Nothing in, nothing out, either way. */
+    CHECK(uwb_net_gate_actions(UWB_ACT_NONE, true) == UWB_ACT_NONE);
+    CHECK(uwb_net_gate_actions(UWB_ACT_NONE, false) == UWB_ACT_NONE);
+}
+
 int main(void)
 {
     test_init_and_cadence();
@@ -187,6 +211,7 @@ int main(void)
     test_grant_discover();
     test_discover_keeps_lease();
     test_ranging();
+    test_gate_actions();
     printf(g_fail ? "FAILED %d\n" : "OK\n", g_fail);
     return g_fail ? 1 : 0;
 }

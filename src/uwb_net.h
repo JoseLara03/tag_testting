@@ -52,6 +52,15 @@ struct uwb_net_event {
 #define UWB_ACT_SLEEP           (1u << 4)
 #define UWB_ACT_TO_SCAN         (1u << 5)   /* lease lost this superframe */
 
+/* Actions that put the radio on the air for ranging. Cleared when the tag has
+ * no valid antenna calibration -- see uwb_net_gate_actions(). */
+#define UWB_ACT_RANGING_MASK    (UWB_ACT_RUN_DISCOVER | UWB_ACT_RUN_SWEEP)
+
+/* Filter an action word from uwb_net_handle() against calibration validity.
+ * Without a valid record the antenna delays are meaningless, so ranging is
+ * suppressed while everything that holds the tag's seat is left alone. Pure. */
+uint32_t uwb_net_gate_actions(uint32_t act, bool cal_valid);
+
 struct uwb_net_ctx {
     uwb_net_state_t state;
     uint8_t   eui[8];
