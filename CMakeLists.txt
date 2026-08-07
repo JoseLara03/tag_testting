@@ -24,6 +24,7 @@ target_sources(app PRIVATE
     src/uwb_frame_802_15_4z.c
     src/uwb_net.c
     src/uwb_net_runner.c
+    src/uwb_radio_owner.c
     src/tag_cmd.c
     src/rx_stats_core.c
     src/rx_stats.c
