@@ -182,17 +182,25 @@ static void test_ranging(void)
 
 static void test_gate_actions(void)
 {
-    const uint32_t ranging = UWB_ACT_RUN_DISCOVER | UWB_ACT_RUN_SWEEP;
+    /* Only the sweep does TWR, so only the sweep depends on the antenna delay. */
+    const uint32_t ranging = UWB_ACT_RUN_SWEEP;
     const uint32_t housekeeping = UWB_ACT_SEND_JOIN | UWB_ACT_SEND_KEEPALIVE
+                                | UWB_ACT_RUN_DISCOVER
                                 | UWB_ACT_SLEEP | UWB_ACT_TO_SCAN;
 
     /* Calibrated: every action passes through untouched. */
     CHECK(uwb_net_gate_actions(ranging | housekeeping, true)
           == (ranging | housekeeping));
 
-    /* Uncalibrated: both ranging actions are cleared. */
-    CHECK((uwb_net_gate_actions(ranging, false) & UWB_ACT_RUN_DISCOVER) == 0);
+    /* Uncalibrated: the sweep is cleared. */
     CHECK((uwb_net_gate_actions(ranging, false) & UWB_ACT_RUN_SWEEP) == 0);
+
+    /* Uncalibrated: DISCOVER survives. It does no TWR, and gating it would
+     * strand the tag in UWB_ST_DISCOVER — which is also the only way it ever
+     * reaches UWB_ST_RANGING, the sole source of UWB_ACT_SLEEP. Clearing it
+     * would therefore cost the radio's deep sleep as well as the state. */
+    CHECK((uwb_net_gate_actions(UWB_ACT_RUN_DISCOVER, false)
+           & UWB_ACT_RUN_DISCOVER) != 0);
 
     /* Uncalibrated: everything that keeps the seat survives. This is the
      * property that matters -- a tag that stops ranging must not also stop

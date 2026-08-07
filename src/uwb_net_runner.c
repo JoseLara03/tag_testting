@@ -617,6 +617,11 @@ static void runner_fn(void *p1, void *p2, void *p3)
                 } else {
                     gev.kind = UWB_EV_GRANT_MISS;
                 }
+                /* Defensive: this re-OR happens after the first gate, so any
+                 * action it introduces would bypass it. Today a GRANT only
+                 * yields UWB_ACT_RUN_DISCOVER, which the gate deliberately
+                 * lets through — but the gate belongs on every path that can
+                 * add actions, not only on the ones that currently need it. */
                 act |= uwb_net_gate_actions(uwb_net_handle(&ctx, &gev), cal_is_valid());
             }
         }
