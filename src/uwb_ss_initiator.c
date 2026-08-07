@@ -366,15 +366,15 @@ static void run_calibration_locked(uint32_t ref_mm)
     twr_log("CAL FAIL res\n");
 }
 
+#define CAL_RADIO_WAIT  K_SECONDS(2)
+
 /* Calibration owns the radio for its whole run: consistent conditions across
  * all samples matter more than keeping beacon sync, and this is a bench
  * operation. The runner reacquires and re-locks afterwards.
  *
  * The wrapper exists so that every exit path of run_calibration_locked() --
- * three of them are early returns -- releases the radio. A missed release
- * blocks the runner forever. */
-#define CAL_RADIO_WAIT  K_SECONDS(2)
-
+ * two early returns plus the fall-through off the end -- releases the radio.
+ * A missed release blocks the runner forever. */
 static void run_calibration(uint32_t ref_mm)
 {
     if (!uwb_radio_request(CAL_RADIO_WAIT)) {

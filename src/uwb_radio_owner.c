@@ -29,6 +29,13 @@ bool uwb_radio_request(k_timeout_t timeout)
 
     state = OWNER_REQUESTED;
 
+    /* Note: `timeout` is relative and is re-passed unchanged on every
+     * iteration, so a spurious wake would restart the whole budget rather than
+     * consume it. That is unreachable today: while we are OWNER_REQUESTED the
+     * only broadcast that can arrive is uwb_radio_yield()'s, and it moves the
+     * state to OWNER_HANDED, which exits the loop. Add a third state or a
+     * second claimant and this becomes a real bug -- track the deadline with
+     * sys_clock_timeout_end_calc()/k_uptime_get() then. */
     while (state == OWNER_REQUESTED) {
         if (k_condvar_wait(&cv, &lock, timeout) != 0) {
             break;

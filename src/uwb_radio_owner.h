@@ -22,6 +22,14 @@
  * This is not a mutex. The runner sleeps inside its own superframe loop, so a
  * lock held across the loop would starve every other claimant. Instead the
  * runner offers the radio at one safe point per superframe.
+ *
+ * PHY-state contract: on reacquire the runner restores only
+ * dwt_setrxaftertxdelay, dwt_setrxtimeout, dwt_setpreambledetecttimeout,
+ * dwt_settxantennadelay and dwt_setrxantennadelay. Everything else it assumes
+ * unchanged. A claimant that touches anything outside that list -- dwt_configure,
+ * dwt_configuretxrf, dwt_setcallbacks, frame filtering, PAN/short address --
+ * must restore it before uwb_radio_release(), or it silently breaks runner RX
+ * with no error anywhere: the tag simply stops hearing beacons.
  */
 
 /* Claimant: ask for the radio and block until the runner hands it over.
