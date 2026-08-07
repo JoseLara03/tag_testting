@@ -11,6 +11,18 @@
 
 static const struct device *const gpio0 = DEVICE_DT_GET(DT_NODELABEL(gpio0));
 
+/* Every pin driven directly below goes through gpio0, which covers P0.00-P0.31.
+ * The nRF driver does not reject an out-of-range pin, it masks it:
+ * NRF_PIN_PORT_TO_PIN_NUMBER(pin, port) = ((pin) & 0x1F) | ((port) << 5), and
+ * Zephyr's own range check is an __ASSERT that compiles out. So a P1.x value in
+ * this file's flat numbering silently lands on a different P0 pin -- RST was 37
+ * (P1.05 in that scheme) and aliased onto P0.05, the SPI1 MISO line, putting the
+ * nRF's output driver against the DW3000's. Fail the build instead. */
+BUILD_ASSERT(DW3000_RST_Pin < 32, "DW3000_RST_Pin is not on gpio0");
+BUILD_ASSERT(DW3000_IRQ_Pin < 32, "DW3000_IRQ_Pin is not on gpio0");
+BUILD_ASSERT(DW3000_WUP_Pin < 32, "DW3000_WUP_Pin is not on gpio0");
+BUILD_ASSERT(DW3000_CS_Pin  < 32, "DW3000_CS_Pin is not on gpio0");
+
 /* ---- UART (Zephyr printk-backed) ---------------------------------------- */
 
 #define UART_LINE_LEN 64
@@ -60,9 +72,12 @@ void gpio_init(void)
 {
     __ASSERT(device_is_ready(gpio0), "gpio0 device not ready");
 
-    /* RST: driven HIGH → transistor active → DW3000 RST pin floats → chip runs.
-     * Drive LOW to assert reset (transistor pulls DW3000 RST to GND). */
-    gpio_pin_configure(gpio0, DW3000_RST_Pin, GPIO_OUTPUT_ACTIVE);
+    /* RST: no more level-shifting transistor now that DW3000 and nRF share 3.3V.
+     * RSTn is open-drain on the DW3000 side with its own pull-up, so the nRF pin
+     * must idle as a high-impedance input; driving it high would fight the DW3000
+     * if it (or anything else) pulls the line low. reset_DWIC() switches it to an
+     * output only for the duration of the reset pulse. */
+    gpio_pin_configure(gpio0, DW3000_RST_Pin, GPIO_INPUT);
 
     /* WUP: external pull-down holds it low at rest; drive HIGH to wake DW3000. */
     gpio_pin_configure(gpio0, DW3000_WUP_Pin, GPIO_OUTPUT_INACTIVE);
@@ -96,11 +111,15 @@ void dw_irq_init(void)
 
 void reset_DWIC(void)
 {
-    /* LOW → transistor off → DW3000 RST pulled to GND → chip in reset. */
-    gpio_pin_set(gpio0, DW3000_RST_Pin, 0);
+    /* Assert reset. OUTPUT_INACTIVE configures the pin and drives it low in one
+     * step; OUTPUT_ACTIVE would drive it high first, and an open-drain RSTn must
+     * never be driven high. */
+    gpio_pin_configure(gpio0, DW3000_RST_Pin, GPIO_OUTPUT_INACTIVE);
     k_msleep(2);
-    /* HIGH → transistor on → DW3000 RST floats → chip released from reset. */
-    gpio_pin_set(gpio0, DW3000_RST_Pin, 1);
+
+    /* Release: go back to high-impedance input and let the DW3000's own
+     * pull-up bring RSTn high. Do NOT drive the pin high. */
+    gpio_pin_configure(gpio0, DW3000_RST_Pin, GPIO_INPUT);
     k_msleep(2);
 }
 

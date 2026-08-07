@@ -28,7 +28,7 @@ extern "C"
  * SPI1 pins (SCK/MOSI/MISO/CS) are managed by the Zephyr SPI driver.
  */
 #define DW3000_IRQ_Pin   30   /* P0.30 */
-#define DW3000_RST_Pin   37   /* P0.37 */
+#define DW3000_RST_Pin   31   /* P0.31 */
 #define DW3000_WUP_Pin   15   /* P0.15 */
 #define DW3000_CS_Pin    11   /* P0.11 */
 #define DW3000_CLK_Pin    4   /* P0.04 (SPI1 SCK) */
