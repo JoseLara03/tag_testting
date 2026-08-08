@@ -76,6 +76,12 @@ static uint8_t pos_resp_ref[] = { 0x41, 0x88, 0, 0xCA, 0xDE, 'V', 'E', 'W', 'A',
 static uint8_t  frame_seq_nb;
 static uint8_t  rx_buf[RX_BUF_LEN];
 
+/* TEMPORARY (diagnostics for the ~74 m calibration readings). Counts why polls
+ * were discarded, so an iteration's sample count can be accounted for rather
+ * than inferred. Remove once the root cause is found. */
+static uint32_t cal_n_big;    /* frame longer than rx_buf -- stale-buffer path */
+static uint32_t cal_n_hdr;    /* header did not match the expected response   */
+
 /* ---- BLE result message queue ---------------------------------------------- */
 #define TWR_MSG_LEN  20
 
@@ -204,12 +210,22 @@ static bool do_one_range(int32_t *out_mm)
     }
 
     uint16_t flen = dwt_getframelength();
-    if (flen <= RX_BUF_LEN) {
-        dwt_readrxdata(rx_buf, flen, 0);
+    if (flen > RX_BUF_LEN) {
+        /* The frame does not fit, so rx_buf still holds the PREVIOUS exchange.
+         * Falling through would pair stale anchor timestamps with fresh local
+         * ones and yield a plausible-looking but meaningless distance --
+         * silently, because the stale header still passes the memcmp below.
+         * do_one_range_anchor() already rejects oversized frames; this path
+         * did not. */
+        cal_n_big++;   /* TEMPORARY (diagnostics) */
+        dwt_writesysstatuslo(DWT_INT_RXFCG_BIT_MASK);
+        return false;
     }
+    dwt_readrxdata(rx_buf, flen, 0);
     rx_buf[ALL_MSG_SN_IDX] = 0;
 
     if (memcmp(rx_buf, rx_resp_msg, ALL_MSG_COMMON_LEN) != 0) {
+        cal_n_hdr++;   /* TEMPORARY (diagnostics) */
         dwt_writesysstatuslo(DWT_INT_RXFCG_BIT_MASK);
         return false;
     }
@@ -331,6 +347,8 @@ static void run_calibration_locked(uint32_t ref_mm)
 
     for (uint32_t it = 0; it < CAL_MAX_ITERS; it++) {
         size_t got = 0;
+        cal_n_big = 0;   /* TEMPORARY (diagnostics) */
+        cal_n_hdr = 0;   /* TEMPORARY (diagnostics) */
         for (uint32_t i = 0; i < CAL_SAMPLES_PER_ITER; i++) {
             int32_t mm;
             if (do_one_range(&mm)) {
@@ -346,6 +364,22 @@ static void run_calibration_locked(uint32_t ref_mm)
             twr_log("CAL FAIL no-resp\n");
             return;
         }
+
+        /* TEMPORARY (diagnostics). The mean alone cannot distinguish a tight
+         * cluster from a bimodal set: cal_filtered_mean() rejects outliers at
+         * 6*MAD, and when half the samples are far away the MAD is itself huge,
+         * so nothing is rejected and the mean lands between the two groups.
+         * min/max and the far-sample count make that visible. */
+        int32_t smin = samples[0], smax = samples[0];
+        uint32_t n_far = 0;
+        for (size_t k = 0; k < got; k++) {
+            if (samples[k] < smin) { smin = samples[k]; }
+            if (samples[k] > smax) { smax = samples[k]; }
+            if (samples[k] > 10000 || samples[k] < -10000) { n_far++; }
+        }
+        twr_log("CALd g=%u k=%u far=%u min=%d max=%d big=%u hdr=%u\n",
+                (unsigned)got, (unsigned)kept, n_far, smin, smax,
+                cal_n_big, cal_n_hdr);
 
         int32_t err = mean - (int32_t)ref_mm;
         int32_t abserr = (err < 0) ? -err : err;
