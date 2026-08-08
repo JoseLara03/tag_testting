@@ -152,3 +152,11 @@ uint32_t uwb_net_handle(struct uwb_net_ctx *c, const struct uwb_net_event *ev)
         return UWB_ACT_NONE;
     }
 }
+
+uint32_t uwb_net_gate_actions(uint32_t act, bool cal_valid)
+{
+    if (cal_valid) {
+        return act;
+    }
+    return act & ~UWB_ACT_RANGING_MASK;
+}

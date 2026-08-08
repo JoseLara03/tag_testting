@@ -52,6 +52,25 @@ struct uwb_net_event {
 #define UWB_ACT_SLEEP           (1u << 4)
 #define UWB_ACT_TO_SCAN         (1u << 5)   /* lease lost this superframe */
 
+/* Actions whose result depends on the antenna delay. Cleared when the tag has
+ * no valid antenna calibration -- see uwb_net_gate_actions().
+ *
+ * UWB_ACT_RUN_DISCOVER is deliberately NOT in the mask. Discovery does no TWR
+ * at all — it broadcasts E2 and collects E4s — so it never touches the antenna
+ * delay and produces no range to be wrong. Gating it would also pin an
+ * uncalibrated tag in UWB_ST_DISCOVER forever, because the only path to
+ * UWB_ST_RANGING is UWB_EV_DISCOVERED, which the runner only emits inside the
+ * gated DISCOVER block. That in turn makes UWB_ACT_SLEEP unreachable (it is
+ * emitted only from UWB_ST_RANGING), so the radio would never deep-sleep: a
+ * regression from ~56 mA back to ~66 mA for every uncalibrated tag — and a
+ * phy_option change invalidates the record for a whole fleet at once. */
+#define UWB_ACT_RANGING_MASK    (UWB_ACT_RUN_SWEEP)
+
+/* Filter an action word from uwb_net_handle() against calibration validity.
+ * Without a valid record the antenna delays are meaningless, so ranging is
+ * suppressed while everything that holds the tag's seat is left alone. Pure. */
+uint32_t uwb_net_gate_actions(uint32_t act, bool cal_valid);
+
 struct uwb_net_ctx {
     uwb_net_state_t state;
     uint8_t   eui[8];
