@@ -19,7 +19,6 @@
 #include "cal.h"
 #include "cal_math.h"
 #include "pos_solver.h"
-#include "uwb_radio_owner.h"
 
 #include <zephyr/kernel.h>
 #include <string.h>
@@ -35,6 +34,11 @@
 #define RESP_RX_TIMEOUT_UUS         2000U   /* covers full response frame air time */
 #define PRE_TIMEOUT                  128U
 /* RNG_FAST_MS / RNG_SLOW_MS removed — cadence now owned by uwb_net_runner. */
+
+/* Anchors to range each cycle (static; <=4). Positioning needs >=3 of these
+ * to respond in a cycle to produce a fix. Edit and rebuild to change the set. */
+static const uint8_t ANCHOR_IDS[] = { 0, 1, 2, 3 };
+#define POS_NUM_ANCHORS  ARRAY_SIZE(ANCHOR_IDS)
 
 /* Settle time between anchors within one cycle (radio turnaround margin). */
 #define INTER_ANCHOR_DELAY_MS  10U
@@ -188,12 +192,7 @@ static bool do_one_range(int32_t *out_mm)
     tx_poll_msg[ALL_MSG_SN_IDX] = frame_seq_nb;
     dwt_writetxdata(sizeof(tx_poll_msg), tx_poll_msg, 0);
     dwt_writetxfctrl(sizeof(tx_poll_msg) + FCS_LEN, 0, 1);
-    /* The positioning path checks this too. A poll rejected before it reaches
-     * the air must not look like a poll that got no answer. */
-    if (dwt_starttx(DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED) != DWT_SUCCESS) {
-        frame_seq_nb++;
-        return false;
-    }
+    dwt_starttx(DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED);
     frame_seq_nb++;
 
     irq_evt_t evt = wait_event(K_MSEC(20));
@@ -320,7 +319,7 @@ static uint16_t active_total_seed(void)
  * is within CAL_ACCEPT_MM or CAL_MAX_ITERS is exhausted. Stores to NVS on
  * success. Reports progress over BLE.
  */
-static void run_calibration_locked(uint32_t ref_mm)
+static void run_calibration(uint32_t ref_mm)
 {
     static int32_t samples[CAL_MAX_SAMPLES];
 
@@ -364,37 +363,6 @@ static void run_calibration_locked(uint32_t ref_mm)
         apply_total_dly(total, &tx, &rx);
     }
     twr_log("CAL FAIL res\n");
-}
-
-#define CAL_RADIO_WAIT  K_SECONDS(2)
-
-/* Calibration owns the radio for its whole run: consistent conditions across
- * all samples matter more than keeping beacon sync, and this is a bench
- * operation. The runner reacquires and re-locks afterwards.
- *
- * The wrapper exists so that every exit path of run_calibration_locked() --
- * two early returns plus the fall-through off the end -- releases the radio.
- * A missed release blocks the runner forever. */
-static void run_calibration(uint32_t ref_mm)
-{
-    if (!uwb_radio_request(CAL_RADIO_WAIT)) {
-        twr_log("CAL FAIL busy\n");
-        return;
-    }
-
-    dwt_forcetrxoff();
-    /* Clear whatever the abort asserted; a stale RX-error bit would otherwise
-     * surface as a spurious EVT_RXERR in the thread taking over the radio. */
-    dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
-    dwt_setrxaftertxdelay(POLL_TX_TO_RESP_RX_DLY_UUS);
-    dwt_setrxtimeout(RESP_RX_TIMEOUT_UUS);
-    dwt_setpreambledetecttimeout(PRE_TIMEOUT);
-
-    run_calibration_locked(ref_mm);
-
-    dwt_forcetrxoff();
-    dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
-    uwb_radio_release();
 }
 
 /* Format a metre value as a signed "x.xx" string (centimetre resolution),
@@ -461,11 +429,13 @@ static void ss_twr_fn(void *p1, void *p2, void *p3)
         uint32_t ref_mm;
         if (cal_take_request(&ref_mm)) {
             run_calibration(ref_mm);
-            /* The antenna delays are applied by the runner's reacquire path,
-             * which is inside the handover. Writing them here would be an
-             * unsynchronized SPI access against a runner that is already back
-             * on the radio. */
             ranging = cal_is_valid();
+            if (ranging) {
+                uint16_t tx, rx;
+                cal_get_ant_dly(&tx, &rx);
+                dwt_settxantennadelay(tx);
+                dwt_setrxantennadelay(rx);
+            }
         } else if (!ranging) {
             cal_wait_request();   /* block until a cal command arrives */
         } else {

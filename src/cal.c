@@ -86,17 +86,6 @@ bool cal_init(void)
 
 void cal_get_ant_dly(uint16_t *tx, uint16_t *rx)
 {
-    if (!active_valid) {
-        /* No stored record: hand back the factory reference, as
-         * active_total_seed() already does. `active` lives in BSS, so the old
-         * behaviour was to return zero -- an ~8 m bias that looked like a
-         * plausible reading. Callers that must not range uncalibrated are
-         * gated by uwb_net_gate_actions(); this is the backstop for the rest. */
-        *tx = TX_ANT_DLY;
-        *rx = RX_ANT_DLY;
-        return;
-    }
-
     *tx = active.tx_ant_dly;
     *rx = active.rx_ant_dly;
 }

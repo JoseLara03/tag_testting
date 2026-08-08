@@ -14,7 +14,6 @@
 #include "uwb_frame_802_15_4z.h"
 #include "uwb_ss_initiator.h"
 #include "pos_solver.h"
-#include "uwb_radio_owner.h"
 #include "port.h"
 #include "deca_device_api.h"
 #include "phy_config.h"
@@ -338,6 +337,7 @@ static int anchor_sweep(struct pos_meas *out, size_t max)
     dwt_setrxtimeout(RESP_RX_TIMEOUT_UUS);
     dwt_setpreambledetecttimeout(PRE_TIMEOUT);
 
+    uint32_t t_sweep = k_uptime_get_32();
     size_t n = 0;
 
     for (size_t i = 0; i < n_selected && n < max; i++) {
@@ -345,8 +345,10 @@ static int anchor_sweep(struct pos_meas *out, size_t max)
             k_sleep(K_USEC(INTER_ANCHOR_DELAY_US));
         }
 
+        uint32_t t_twr = k_uptime_get_32();
         float r, ax, ay;
         bool ok = do_one_range_anchor(selected[i], &r, &ax, &ay);
+        uint32_t twr_ms = k_uptime_get_32() - t_twr;
 
         if (ok) {
             out[n].x       = ax;
@@ -449,44 +451,6 @@ static void runner_fn(void *p1, void *p2, void *p3)
     dwt_setpreambledetecttimeout(PRE_TIMEOUT);
 
     while (1) {
-        /* 0. Offer the radio to a waiting claimant. This is the only point in
-         * the superframe with no exchange in flight, and the handover contract
-         * says we leave the radio awake and idle. */
-        if (uwb_radio_request_pending()) {
-            if (radio_asleep) { dw_wake(); radio_asleep = false; }
-            dwt_forcetrxoff();
-            /* dwt_forcetrxoff() can leave RX-abort/error bits asserted. Clear
-             * them here or the *other* thread's first wait_event() would see
-             * them via port_CheckEXT_IRQ() -> process_deca_irq() and dispatch a
-             * spurious EVT_RXERR against an exchange it never started. */
-            dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
-
-            /* Blocks until the claimant releases -- unless the claim was
-             * withdrawn in between, in which case it returns false at once and
-             * the radio never left us. */
-            if (uwb_radio_yield()) {
-                /* Seconds may have passed and the antenna delays may have
-                 * changed. Re-establish everything the claimant could have
-                 * disturbed. */
-                dwt_setrxaftertxdelay(POLL_TX_TO_RESP_RX_DLY_UUS);
-                dwt_setrxtimeout(RESP_RX_TIMEOUT_UUS);
-                dwt_setpreambledetecttimeout(PRE_TIMEOUT);
-
-                uint16_t rtx, rrx;
-                cal_get_ant_dly(&rtx, &rrx);
-                dwt_settxantennadelay(rtx);
-                dwt_setrxantennadelay(rrx);
-
-                /* The arrival prediction is stale after that long off the air.
-                 * A narrow window aimed at a dead instant would miss repeatedly
-                 * and trip RESCAN, so go back to ACQUIRING. That costs
-                 * BT_WARMUP_N superframes of full-window RX, which is why it is
-                 * gated on an actual handover. */
-                beacon_track_reset(&bt, T_SUPERFRAME_MS, BT_GUARD_MS,
-                                   BT_WARMUP_N, BT_EMA_SHIFT);
-            }
-        }
-
         /* 1. Inject any pending tier change before the beacon window. */
         if (tier_pending) {
             struct uwb_net_event mev = {
@@ -581,11 +545,6 @@ static void runner_fn(void *p1, void *p2, void *p3)
 
         uint32_t act = uwb_net_handle(&ctx, &ev);
 
-        /* Suppress ranging while the antenna delays are uncalibrated. Seat
-         * maintenance survives, so the tag stays on the network and is ready
-         * for a `cal <mm>` command. */
-        act = uwb_net_gate_actions(act, cal_is_valid());
-
         /* 4. Execute actions. */
 
         if (act & UWB_ACT_SEND_JOIN) {
@@ -628,12 +587,7 @@ static void runner_fn(void *p1, void *p2, void *p3)
                 } else {
                     gev.kind = UWB_EV_GRANT_MISS;
                 }
-                /* Defensive: this re-OR happens after the first gate, so any
-                 * action it introduces would bypass it. Today a GRANT only
-                 * yields UWB_ACT_RUN_DISCOVER, which the gate deliberately
-                 * lets through — but the gate belongs on every path that can
-                 * add actions, not only on the ones that currently need it. */
-                act |= uwb_net_gate_actions(uwb_net_handle(&ctx, &gev), cal_is_valid());
+                act |= uwb_net_handle(&ctx, &gev);
             }
         }
 
@@ -742,5 +696,47 @@ void uwb_net_runner_start(const uint8_t eui[8])
     k_thread_create(&runner_tid, runner_stack,
                     K_THREAD_STACK_SIZEOF(runner_stack),
                     runner_fn, NULL, NULL, NULL,
+                    RUNNER_PRIO, 0, K_NO_WAIT);
+}
+
+/* =========================================================================
+ * B4.2 test helper — broadcasts DISCOVERY (0xE2) every 500 ms so the anchor
+ * discovery-reply path can be verified without a gateway.
+ * Replace uwb_net_runner_start() with uwb_disc_test_start() in main.c,
+ * then revert when done.
+ * ========================================================================= */
+
+K_THREAD_STACK_DEFINE(disc_test_stack, 1024);
+static struct k_thread disc_test_tid;
+
+static void disc_test_fn(void *p1, void *p2, void *p3)
+{
+    ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
+
+    uint8_t seq = 0;
+
+    while (1) {
+        uint8_t buf[UWB_FRAME_LEN_DISC];
+        int n = uwb_frame_discovery_build(buf, sizeof(buf),
+                                          UWB_ADDR_UNASSOC, 0u);
+        if (n > 0) {
+            uwb_frame_set_seq_num(buf, seq++);
+            dwt_writetxdata((uint16_t)n, buf, 0);
+            dwt_writetxfctrl((uint16_t)(n + 2U), 0, 0);   /* +2 FCS */
+            dwt_starttx(DWT_START_TX_IMMEDIATE);
+            /* Wait for TX done (up to 10 ms) then clear status. */
+            irq_evt_t evt = wait_event(K_MSEC(10));
+            (void)evt;
+            dwt_writesysstatuslo(DWT_INT_TXFRS_BIT_MASK);
+        }
+        k_sleep(K_MSEC(500));
+    }
+}
+
+void uwb_disc_test_start(void)
+{
+    k_thread_create(&disc_test_tid, disc_test_stack,
+                    K_THREAD_STACK_SIZEOF(disc_test_stack),
+                    disc_test_fn, NULL, NULL, NULL,
                     RUNNER_PRIO, 0, K_NO_WAIT);
 }
