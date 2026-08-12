@@ -1,6 +1,8 @@
 #ifndef BATT_H_
 #define BATT_H_
 
+#include <stdint.h>
+
 /* Read battery state of charge as a percentage (0-100), estimated from the
  * cell voltage via the LiPo discharge curve in batt_curve.h.
  *

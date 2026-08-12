@@ -46,7 +46,7 @@
 #define T_SLOT_MS          24u   /* sized to the measured worst sweep (22 ms n=4) + guard; no slot overlap */
 #define T_MINISLOT_MS       2u   /* ~1.5 ms, round up */
 #define N_CAP               UWB_FRAME_N_CAP   /* 4 */
-#define N_CFP               UWB_FRAME_N_CFP   /* 12 */
+#define N_CFP               UWB_FRAME_N_CFP   /* 11 */
 
 /* ---- DW3000 RX/TX timing (re-used from initiator) ---- */
 #define POLL_TX_TO_RESP_RX_DLY_UUS   1000U

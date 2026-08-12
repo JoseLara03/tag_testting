@@ -478,6 +478,14 @@ void position_publish(const struct pos_result *pos, uint8_t n_anchors,
     if (len < 0) {
         return;
     }
+
+    /* Force IDLE before this TX: the last anchor exchange of the sweep can
+     * time out at the kernel level with no DW3000 event, leaving the PHY in
+     * an unknown state, and an immediate-TX command is not honoured from
+     * non-IDLE. Nothing has been transmitted or received yet at this point,
+     * so there is no new abort here for dwt_writesysstatuslo() to clear. */
+    dwt_forcetrxoff();
+
     uwb_frame_set_seq_num(buf, frame_seq_nb++);
 
     dwt_writetxdata((uint16_t)len, buf, 0);
@@ -485,6 +493,7 @@ void position_publish(const struct pos_result *pos, uint8_t n_anchors,
 
     if (dwt_starttx(DWT_START_TX_IMMEDIATE) != DWT_SUCCESS) {
         dwt_forcetrxoff();
+        dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
         return;
     }
 
@@ -492,9 +501,10 @@ void position_publish(const struct pos_result *pos, uint8_t n_anchors,
      * k_sem_reset() and closes with a global port_DisableEXT_IRQ(), which is
      * destructive to the runner's own RX arming (see src/uwb_radio_owner.h).
      * Polling the status register touches no shared IRQ state. The frame is
-     * ~1.3 ms of airtime, so 10 ms is generous; the timeout exists so a radio
-     * fault cannot park the runner here. */
-    for (int i = 0; i < 100; i++) {
+     * ~1.3 ms of airtime; 30 iterations at 100 us each is ~3 ms, leaving
+     * headroom against T_SLOT_MS=24 while still catching a stuck radio well
+     * short of the next tag's slot. */
+    for (int i = 0; i < 30; i++) {
         if (dwt_readsysstatuslo() & DWT_INT_TXFRS_BIT_MASK) {
             dwt_writesysstatuslo(DWT_INT_TXFRS_BIT_MASK);
             return;
@@ -502,6 +512,7 @@ void position_publish(const struct pos_result *pos, uint8_t n_anchors,
         k_busy_wait(100);
     }
     dwt_forcetrxoff();
+    dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
 }
 
 static void ss_twr_fn(void *p1, void *p2, void *p3)
