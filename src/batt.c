@@ -98,9 +98,38 @@ int batt_read_current(int *ma)
 static struct batt_window idle_win;
 static volatile bool      batt_connected;
 
+/* Written by batt_work_fn on the system workqueue, read by any thread. A plain
+ * volatile byte is sufficient: single-byte loads and stores are atomic on this
+ * core, there is exactly one writer, and a reader that catches the previous
+ * sample is harmless — the value is a percentage that moves over minutes.
+ *
+ * 0xFF is the "no reading" value. It is written as a literal rather than as
+ * UWB_FRAME_POS_SOC_UNKNOWN on purpose: the battery module must not depend on
+ * the UWB wire format. The two definitions must agree, and the POS frame's
+ * choice of sentinel was made to match this one — if either changes, change
+ * both. */
+static volatile uint8_t batt_soc_cache = 0xFF;
+
+uint8_t batt_soc_cached(void)
+{
+    return batt_soc_cache;
+}
+
 static void batt_work_fn(struct k_work *work)
 {
     ARG_UNUSED(work);
+
+    /* Refresh the SoC cache first, and unconditionally: the current read below
+     * returns early when there is no gauge or no battery, and doing this after
+     * that early return would leave the cache stuck at 0xFF forever. */
+    int soc;
+    if (batt_read_soc(&soc) == 0 && soc >= 0 && soc <= 100) {
+        batt_soc_cache = (uint8_t)soc;
+    } else {
+        /* Includes -EBUSY, which means the charger is connected and terminal
+         * voltage says nothing about charge. Report unknown, never a guess. */
+        batt_soc_cache = 0xFF;
+    }
 
     int ma;
     if (batt_read_current(&ma) != 0) {

@@ -14,6 +14,12 @@
  * profiled from this exact cell. */
 int batt_read_soc(int *soc);
 
+/* Last state of charge sampled by the periodic monitor: 0-100, or 0xFF when no
+ * reading is available (charger connected, or gauge error). Non-blocking — safe
+ * to call from timing-critical paths, unlike batt_read_soc(). Returns 0xFF
+ * until batt_monitor_start() has run at least once. */
+uint8_t batt_soc_cached(void);
+
 /* Read average battery current in milliamps (discharge as a positive
  * magnitude). Returns 0 on success; negative errno on failure. */
 int batt_read_current(int *ma);
