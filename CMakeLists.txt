@@ -17,6 +17,7 @@ target_sources(app PRIVATE
     src/cal.c
     src/storage.c
     src/pos_solver.c
+    src/pos_residual.c
     src/uwb_ss_initiator.c
     src/motion.c
     src/tag_ui.c
