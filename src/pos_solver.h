@@ -18,6 +18,7 @@ struct pos_meas {
 struct pos_result {
     float x;
     float y;
+    float residual_m;  /* RMS range residual, metres; 0.0f when !valid */
     bool  valid;
 };
 

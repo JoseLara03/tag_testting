@@ -1,4 +1,5 @@
 #include "pos_solver.h"
+#include "pos_residual.h"
 #include <arm_math.h>
 
 /* Largest A is (POS_MAX_ANCHORS - 1) x 2. */
@@ -6,7 +7,8 @@
 
 bool pos_solve(const struct pos_meas *m, size_t n, struct pos_result *out)
 {
-    out->valid = false;
+    out->valid      = false;
+    out->residual_m = 0.0f;
     if (n < 3 || n > POS_MAX_ANCHORS) {
         return false;
     }
@@ -60,6 +62,7 @@ bool pos_solve(const struct pos_meas *m, size_t n, struct pos_result *out)
 
     out->x = p_d[0];
     out->y = p_d[1];
+    out->residual_m = pos_residual_rms(m, n, out->x, out->y);
     out->valid = true;
     return true;
 }
