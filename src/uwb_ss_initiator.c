@@ -20,6 +20,8 @@
 #include "cal_math.h"
 #include "pos_solver.h"
 #include "uwb_radio_owner.h"
+#include "uwb_frame_802_15_4z.h"
+#include "batt.h"
 
 #include <zephyr/kernel.h>
 #include <string.h>
@@ -457,13 +459,49 @@ static void fmt_coord(char *buf, size_t len, float v)
  * (<=20 bytes for the NUS limit) and enqueue to the BLE sender. A future
  * UWB-to-master sender replaces only this function body.
  */
-void position_publish(float x, float y)
+void position_publish(const struct pos_result *pos, uint8_t n_anchors,
+                      uint16_t src_addr)
 {
     char xs[16], ys[16];
 
-    fmt_coord(xs, sizeof(xs), x);
-    fmt_coord(ys, sizeof(ys), y);
+    /* The BLE console line stays alongside the UWB frame. It is the only
+     * independent check that the tag solved what the gateway received, and
+     * during bring-up that is worth one twr_log() call. */
+    fmt_coord(xs, sizeof(xs), pos->x);
+    fmt_coord(ys, sizeof(ys), pos->y);
     twr_log("P:%s,%s\n", xs, ys);
+
+    uint8_t buf[UWB_FRAME_LEN_POS];
+    int len = uwb_frame_pos_build(buf, sizeof(buf), src_addr,
+                                  pos->x, pos->y, pos->residual_m,
+                                  n_anchors, batt_soc_cached());
+    if (len < 0) {
+        return;
+    }
+    uwb_frame_set_seq_num(buf, frame_seq_nb++);
+
+    dwt_writetxdata((uint16_t)len, buf, 0);
+    dwt_writetxfctrl((uint16_t)(len + FCS_LEN), 0, 0);
+
+    if (dwt_starttx(DWT_START_TX_IMMEDIATE) != DWT_SUCCESS) {
+        dwt_forcetrxoff();
+        return;
+    }
+
+    /* Bounded poll for TXFRS rather than wait_event(): that helper opens with
+     * k_sem_reset() and closes with a global port_DisableEXT_IRQ(), which is
+     * destructive to the runner's own RX arming (see src/uwb_radio_owner.h).
+     * Polling the status register touches no shared IRQ state. The frame is
+     * ~1.3 ms of airtime, so 10 ms is generous; the timeout exists so a radio
+     * fault cannot park the runner here. */
+    for (int i = 0; i < 100; i++) {
+        if (dwt_readsysstatuslo() & DWT_INT_TXFRS_BIT_MASK) {
+            dwt_writesysstatuslo(DWT_INT_TXFRS_BIT_MASK);
+            return;
+        }
+        k_busy_wait(100);
+    }
+    dwt_forcetrxoff();
 }
 
 static void ss_twr_fn(void *p1, void *p2, void *p3)

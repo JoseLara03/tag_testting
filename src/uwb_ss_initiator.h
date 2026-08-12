@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include <zephyr/kernel.h>
 #include "uwb_net_runner.h"   /* uwb_net_set_tier, uwb_tier_t */
+#include "pos_solver.h"
 
 /* Start the interrupt-driven SS-TWR initiator (spawns ranging + BLE threads).
  * Call after uwb_init() has configured the DW3000 PHY. */
@@ -29,8 +30,12 @@ irq_evt_t wait_event(k_timeout_t timeout);
  * Returns false on timeout, RX error, bad frame, or anchor-id mismatch. */
 bool do_one_range_anchor(uint8_t aid, float *range_m, float *ax, float *ay);
 
-/* Publish a solved position over BLE NUS ("P:x.xx,y.yy\n"). */
-void position_publish(float x, float y);
+/* Report a solved fix: logs the BLE "P:x,y" line and transmits a 0xEA POS frame
+ * to the gateway. Call from the runner thread only, inside its own CFP slot —
+ * it transmits on the DW3000 without taking a uwb_radio_owner claim, because
+ * the runner already owns the radio there. */
+void position_publish(const struct pos_result *pos, uint8_t n_anchors,
+                      uint16_t src_addr);
 
 /* Enqueue a BLE NUS log message (≤19 chars + NUL; drops if queue full). */
 void twr_log(const char *fmt, ...);

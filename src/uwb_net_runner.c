@@ -688,7 +688,7 @@ static void runner_fn(void *p1, void *p2, void *p3)
 
                 struct pos_result pos;
                 if (n >= 3 && pos_solve(meas, (size_t)n, &pos)) {
-                    position_publish(pos.x, pos.y);
+                    position_publish(&pos, (uint8_t)n, ctx.short_addr);
                 }
 
                 struct uwb_net_event sev = {
