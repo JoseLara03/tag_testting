@@ -1,0 +1,19 @@
+{
+	"folders": [
+		{
+			"path": "../../../../../ncs/v3.2.4/nrf/samples/pmic/native/npm13xx_fuel_gauge"
+		},
+		{
+			"name": "npm13xx_ek",
+			"path": "../../../../../ncs/v3.2.4/zephyr/samples/shields/npm13xx_ek"
+		},
+		{
+			"name": "PMIC_config",
+			"path": "../../nRF52/PMIC_config"
+		},
+		{
+			"path": ".."
+		}
+	],
+	"settings": {}
+}

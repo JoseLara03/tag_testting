@@ -5,12 +5,16 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-/* Lifecycle/config constants (contract v1). */
+/* Lifecycle/config constants (contract v2). */
 #define UWB_NET_LEASE_SF        50   /* lease length, superframes */
 #define UWB_NET_MISS_MAX        3    /* M: consecutive beacon misses -> lost */
 #define UWB_NET_JOIN_RETRY_MAX  4    /* N: join attempts -> back to scan */
 #define UWB_NET_MIN_ANCHORS     3    /* need >=3 for a 2D fix */
-#define UWB_NET_PROTO_VER       1
+/* Must equal UWB_PROTO_VER in uwb_frame_802_15_4z.h -- the gateway stamps beacon
+ * byte 10 with that one and the tag drops any beacon that does not match this
+ * one. Bumping only the frame module leaves the tag deaf in SCAN with no
+ * diagnostic. Pinned by tests/uwb_net/test_proto_ver_matches_frame_module. */
+#define UWB_NET_PROTO_VER       2
 
 typedef enum { UWB_TIER_IDLE = 0, UWB_TIER_SLOW = 1, UWB_TIER_FAST = 2 } uwb_tier_t;
 typedef enum { UWB_ST_SCAN = 0, UWB_ST_JOINING, UWB_ST_DISCOVER, UWB_ST_RANGING } uwb_net_state_t;

@@ -1,4 +1,5 @@
 #include "uwb_net.h"
+#include "uwb_frame_802_15_4z.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -212,8 +213,19 @@ static void test_gate_actions(void)
     CHECK(uwb_net_gate_actions(UWB_ACT_NONE, false) == UWB_ACT_NONE);
 }
 
+/* The net layer rejects any beacon whose byte-10 proto_ver != UWB_NET_PROTO_VER,
+ * and the gateway stamps that byte with the frame module's UWB_PROTO_VER. The two
+ * constants live in different headers, so bumping one alone silently strands the
+ * tag in SCAN: it hears every beacon and answers none. That is exactly what
+ * happened when the frame module went to v2 and this header stayed at v1. */
+static void test_proto_ver_matches_frame_module(void)
+{
+    CHECK(UWB_NET_PROTO_VER == UWB_PROTO_VER);
+}
+
 int main(void)
 {
+    test_proto_ver_matches_frame_module();
     test_init_and_cadence();
     test_scan_join();
     test_grant_discover();
