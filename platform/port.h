@@ -35,7 +35,9 @@ extern "C"
 #define DW3000_MOSI_Pin  41   /* P1.09 (SPI1 MOSI) = 32 + 9 */
 #define DW3000_MISO_Pin   5   /* P0.05 (SPI1 MISO) */
 
-/* DW IC IRQ handler type. */
+/* DW IC IRQ handler type. Dispatched from the GPIO ISR by process_deca_irq().
+ * See the comment on deca_irq_handler() in port.c for the known
+ * blocking-SPI-in-ISR issue and why deferring it to a thread was reverted. */
 typedef void (*port_dwic_isr_t)(void);
 
 /* UART console interface (backed by Zephyr printk). */

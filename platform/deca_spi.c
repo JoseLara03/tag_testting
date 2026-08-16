@@ -108,6 +108,16 @@ int readfromspi(uint16_t headerLength, uint8_t *headerBuffer,
                 uint16_t readLength, uint8_t *readBuffer)
 {
     int ret;
+
+    /* rx_dummy is DECA_MAX_SPI_HEADER_LENGTH (3) bytes and is the DMA
+     * destination for the header phase. A longer header would have SPIM's
+     * EasyDMA write past it into whatever BSS follows -- silent corruption of
+     * an unrelated variable, surfacing later as a wild pointer somewhere with
+     * no connection to SPI. Refuse the transfer instead. */
+    if (headerLength > sizeof(rx_dummy)) {
+        return -EINVAL;
+    }
+
     struct spi_buf tx_bufs[] = {
         { .buf = headerBuffer, .len = headerLength },
         { .buf = NULL,         .len = readLength   },

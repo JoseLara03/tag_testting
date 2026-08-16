@@ -412,6 +412,16 @@ static void dw_wake(void)
      * as in the DW3 SDK tx_sleep examples. */
     dwt_restoreconfig();
 
+    /* Re-arm the external LNA. dwt_setlnapamode() configures DW3000 GPIOs as
+     * EXTRXE outputs, and that GPIO mode is not part of what AON restores or
+     * what dwt_restoreconfig() covers -- so without this the front end is live
+     * only until the first dw_enter_sleep(), i.e. dead for the entire session
+     * in the very mode we ship. Cheap to re-apply unconditionally; the
+     * alternative is depending on undocumented behaviour of a precompiled
+     * driver. RX-only front end: no PA on this board. Must mirror the
+     * init-time call in uwb.c exactly. */
+    dwt_setlnapamode(DWT_LNA_ENABLE);
+
     /* Re-apply the runner-owned TWR params + antenna delays. */
     dwt_setrxaftertxdelay(POLL_TX_TO_RESP_RX_DLY_UUS);
     dwt_setrxtimeout(RESP_RX_TIMEOUT_UUS);
@@ -735,6 +745,16 @@ void uwb_net_set_tier(uwb_tier_t t)
     tier_pending = true;
 }
 
+size_t uwb_net_runner_stack_unused(void)
+{
+    size_t unused = 0;
+
+    if (k_thread_stack_space_get(&runner_tid, &unused) != 0) {
+        return 0;   /* CONFIG_INIT_STACKS off, or thread not started */
+    }
+    return unused;
+}
+
 void uwb_net_runner_start(const uint8_t eui[8])
 {
     memcpy(runner_eui, eui, UWB_FRAME_EUI_LEN);
@@ -743,4 +763,6 @@ void uwb_net_runner_start(const uint8_t eui[8])
                     K_THREAD_STACK_SIZEOF(runner_stack),
                     runner_fn, NULL, NULL, NULL,
                     RUNNER_PRIO, 0, K_NO_WAIT);
+    /* Named so a fatal error can say which thread died -- see `fault`. */
+    k_thread_name_set(&runner_tid, "runner");
 }

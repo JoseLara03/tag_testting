@@ -44,4 +44,18 @@ void twr_log(const char *fmt, ...);
  * true  -> UWB_TIER_FAST, false -> UWB_TIER_IDLE. */
 void uwb_set_moving(bool moving);
 
+/* Minimum bytes ever left unused on the SS-TWR/calibration thread stack, as a
+ * high-water mark. The calibration path is the deepest in this firmware
+ * (cal_filtered_mean() alone holds 1 KB of locals in one frame, and picolibc is
+ * built with double printf here, so vsnprintf is expensive too), and an
+ * overflow faults into a silent halt. Requires CONFIG_INIT_STACKS; returns 0
+ * when unavailable. Read over NUS with `stack`. */
+size_t uwb_ss_stack_unused(void);
+
+/* Same, for the BLE sender thread. Only 512 bytes and it calls straight into
+ * the BLE host via bt_nus_send() -> bt_gatt_notify(), so it is a candidate for
+ * an overflow in its own right -- and it is the thread that drains the burst of
+ * diagnostic lines a calibration run produces. */
+size_t uwb_ss_ble_stack_unused(void);
+
 #endif /* UWB_SS_INITIATOR_H_ */

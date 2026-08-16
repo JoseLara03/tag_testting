@@ -45,6 +45,19 @@
 #define CAL_SAMPLES_PER_ITER  100U   /* ranges averaged per iteration */
 #define CAL_MAX_ITERS         4U     /* give up after this many corrections */
 #define CAL_ACCEPT_MM         15     /* residual error considered converged */
+/* Wall-clock ceiling for one sampling iteration. A responding peer costs ~7 ms
+ * per sample (~0.7 s for 100), but every sample that times out costs the full
+ * 20 ms wait_event budget plus the 5 ms settle, so an iteration against a poor
+ * link legitimately approaches 2.5 s. 5 s keeps this a backstop against a
+ * runaway loop rather than something that can truncate a healthy run and make
+ * it look like "no-resp". */
+#define CAL_ITER_BUDGET_MS    5000U
+
+/* samples[] is CAL_MAX_SAMPLES long and one iteration can fill one entry per
+ * pass, so the per-iteration count must never exceed it. Caught at compile
+ * time rather than as a BSS overrun into the next variable. */
+BUILD_ASSERT(CAL_SAMPLES_PER_ITER <= CAL_MAX_SAMPLES,
+             "cal sample budget exceeds the samples[] array");
 
 /* SPEED_OF_LIGHT is a Qorvo shared_defines macro not present in this project's
  * driver headers; define it locally (m/s, as used by the Qorvo examples). */
@@ -77,12 +90,6 @@ static uint8_t pos_resp_ref[] = { 0x41, 0x88, 0, 0xCA, 0xDE, 'V', 'E', 'W', 'A',
 
 static uint8_t  frame_seq_nb;
 static uint8_t  rx_buf[RX_BUF_LEN];
-
-/* TEMPORARY (diagnostics for the ~74 m calibration readings). Counts why polls
- * were discarded, so an iteration's sample count can be accounted for rather
- * than inferred. Remove once the root cause is found. */
-static uint32_t cal_n_big;    /* frame longer than rx_buf -- stale-buffer path */
-static uint32_t cal_n_hdr;    /* header did not match the expected response   */
 
 /* ---- BLE result message queue ---------------------------------------------- */
 #define TWR_MSG_LEN  20
@@ -137,9 +144,28 @@ static void cb_rxto  (const dwt_cb_data_t *d) { ARG_UNUSED(d); last_evt = EVT_RX
 static void cb_rxerr (const dwt_cb_data_t *d) { ARG_UNUSED(d); last_evt = EVT_RXERR; k_sem_give(&irq_sem); }
 
 /*
- * Enable DW3000 IRQ, wait for an event semaphore, then disable IRQ.
+ * Enable DW3000 IRQ, wait for an event, then disable IRQ.
  * Returns EVT_RXTO when the kernel timeout expires (no event received).
  * IRQ is always DISABLED on return so the caller can safely do SPI work.
+ *
+ * dwt_isr() is dispatched from the GPIO ISR (via process_deca_irq), where it
+ * both decodes the event into last_evt and gives irq_sem -- so k_sem_take()
+ * returning means the event is already decoded.
+ *
+ * DO NOT RESTRUCTURE THIS WITHOUT HARDWARE EVIDENCE. Two rewrites were tried
+ * while chasing a calibration crash and both had to be reverted, each dropping
+ * accepted ranges to 1 in 100 (`CALp 100 1`, zero size/header rejects, i.e. 99
+ * pure RX timeouts):
+ *
+ *   1. Deferring dwt_isr() into this thread via an ISR notifier + semaphore.
+ *   2. Draining with the IRQ masked *before* arming it, and returning early
+ *      when that drain produced an event.
+ *
+ * Both look more correct than what is here -- (2) genuinely closes a window
+ * where this thread runs SPI with the interrupt armed -- but the receive path
+ * depends on the order below in ways that are not captured by reading it. The
+ * crash that motivated the rewrites was an array overrun in
+ * run_calibration_locked(), not anything in this function.
  */
 irq_evt_t wait_event(k_timeout_t timeout)
 {
@@ -175,7 +201,15 @@ static uint32_t get_ts_4b(const uint8_t *b)
 
 /* ---- SS-TWR ranging thread ------------------------------------------------- */
 #define SS_TWR_PRIO   2
-#define SS_TWR_STACK  2048
+/* 4096, not 2048: the calibration path is by far the deepest in this firmware.
+ * cal_filtered_mean() alone declares two int32_t[CAL_MAX_SAMPLES] arrays --
+ * 1 KB of locals in a single frame -- on top of run_calibration_locked(),
+ * run_calibration(), the double-precision ToF math, and vsnprintf() in
+ * twr_log(). At 2048 that ran with little margin, and the failure mode is an
+ * MPU fault (CONFIG_HW_STACK_PROTECTION=y) which, with no console, is a silent
+ * reset: exactly "the tag disconnects and never says whether cal worked".
+ * The extra 2 KB is nothing against 128 KB of RAM. */
+#define SS_TWR_STACK  4096
 
 K_THREAD_STACK_DEFINE(ss_twr_stack, SS_TWR_STACK);
 static struct k_thread ss_twr_tid;
@@ -219,7 +253,6 @@ static bool do_one_range(int32_t *out_mm)
          * silently, because the stale header still passes the memcmp below.
          * do_one_range_anchor() already rejects oversized frames; this path
          * did not. */
-        cal_n_big++;   /* TEMPORARY (diagnostics) */
         dwt_writesysstatuslo(DWT_INT_RXFCG_BIT_MASK);
         return false;
     }
@@ -227,7 +260,6 @@ static bool do_one_range(int32_t *out_mm)
     rx_buf[ALL_MSG_SN_IDX] = 0;
 
     if (memcmp(rx_buf, rx_resp_msg, ALL_MSG_COMMON_LEN) != 0) {
-        cal_n_hdr++;   /* TEMPORARY (diagnostics) */
         dwt_writesysstatuslo(DWT_INT_RXFCG_BIT_MASK);
         return false;
     }
@@ -313,6 +345,30 @@ bool do_one_range_anchor(uint8_t aid, float *range_m, float *ax, float *ay)
     return true;
 }
 
+/*
+ * Emit a calibration verdict: enqueue it for BLE *and* latch it for `cal last`.
+ *
+ * A run owns the radio for seconds and ends with an NVS write; the BLE link
+ * frequently does not survive that, and ble_log_send() drops silently with no
+ * connection. Pushing the verdict alone means the operator learns nothing about
+ * the run that just completed. Latching it makes the result retrievable after
+ * reconnecting -- and, because the latch is RAM-only, "CAL none" after a
+ * visible run is positive evidence that the tag reset rather than merely losing
+ * the link.
+ */
+static void cal_verdict(const char *fmt, ...)
+{
+    char line[TWR_MSG_LEN];
+    va_list ap;
+
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+
+    cal_set_last_result(line);
+    twr_log("%s", line);
+}
+
 /* Apply a combined antenna delay to the DW3000 (split equally TX/RX). */
 static void apply_total_dly(uint16_t total, uint16_t *tx, uint16_t *rx)
 {
@@ -349,11 +405,39 @@ static void run_calibration_locked(uint32_t ref_mm)
 
     for (uint32_t it = 0; it < CAL_MAX_ITERS; it++) {
         size_t got = 0;
-        cal_n_big = 0;   /* TEMPORARY (diagnostics) */
-        cal_n_hdr = 0;   /* TEMPORARY (diagnostics) */
+
+        /* Wall-clock backstop for the sampling loop. The `i < N` bound alone was
+         * observed not to hold on hardware while the array overrun (below) was
+         * live: the loop-counter register held 0xff7e0000 instead of 0..100 and
+         * the run spun forever. A deadline cannot be defeated by a bad counter
+         * register, so this turns any recurrence into a reported failure rather
+         * than a hang. */
+        uint32_t t_end = k_uptime_get_32() + CAL_ITER_BUDGET_MS;
+
         for (uint32_t i = 0; i < CAL_SAMPLES_PER_ITER; i++) {
+            if ((int32_t)(t_end - k_uptime_get_32()) <= 0) {
+                break;
+            }
             int32_t mm;
-            if (do_one_range(&mm)) {
+            /* The `got < CAL_MAX_SAMPLES` guard is not redundant with the loop
+             * bound, and removing it re-opens a confirmed memory-corruption
+             * bug. `got` cannot exceed CAL_SAMPLES_PER_ITER *if the loop runs
+             * the number of times it says it does* -- but this was caught on
+             * hardware writing samples[130] into a 128-element array, with the
+             * loop counter register holding 0xff7e0000 instead of 0..100.
+             *
+             * What it overwrote was not spare memory: samples[] is followed in
+             * BSS by int_cb -- the LIS2HH12 gpio_callback. The overrun landed
+             * exactly on int_cb.node.next, so a stray range measurement became
+             * the "next" pointer of a live entry in gpio0's callback list, and
+             * every DW3000 interrupt after that
+             * walked that list and dereferenced a range in millimetres as an
+             * address, taking a precise BusFault inside the GPIO ISR, halting
+             * the system, and letting the watchdog reset the tag ~120 ms later.
+             * From the outside: "cal disconnects and never reports a result".
+             *
+             * Bound the write at the write. */
+            if (do_one_range(&mm) && got < CAL_MAX_SAMPLES) {
                 samples[got++] = mm;
             }
             k_sleep(K_MSEC(5));
@@ -361,37 +445,25 @@ static void run_calibration_locked(uint32_t ref_mm)
 
         int32_t mean;
         size_t kept;
+
         if (got < CAL_SAMPLES_PER_ITER / 4 ||
             !cal_filtered_mean(samples, got, &mean, &kept)) {
-            twr_log("CAL FAIL no-resp\n");
+            cal_verdict("CAL FAIL no-resp\n");
             return;
         }
-
-        /* TEMPORARY (diagnostics). The mean alone cannot distinguish a tight
-         * cluster from a bimodal set: cal_filtered_mean() rejects outliers at
-         * 6*MAD, and when half the samples are far away the MAD is itself huge,
-         * so nothing is rejected and the mean lands between the two groups.
-         * min/max and the far-sample count make that visible. */
-        int32_t smin = samples[0], smax = samples[0];
-        uint32_t n_far = 0;
-        for (size_t k = 0; k < got; k++) {
-            if (samples[k] < smin) { smin = samples[k]; }
-            if (samples[k] > smax) { smax = samples[k]; }
-            if (samples[k] > 10000 || samples[k] < -10000) { n_far++; }
-        }
-        twr_log("CALd g=%u k=%u far=%u min=%d max=%d big=%u hdr=%u\n",
-                (unsigned)got, (unsigned)kept, n_far, smin, smax,
-                cal_n_big, cal_n_hdr);
 
         int32_t err = mean - (int32_t)ref_mm;
         int32_t abserr = (err < 0) ? -err : err;
         twr_log("CAL it%u e=%dmm\n", it + 1, err);
 
         if (abserr <= CAL_ACCEPT_MM) {
-            if (cal_store(tx, rx, ref_mm, (uint16_t)abserr) == 0) {
-                twr_log("CAL OK %u/%u\n", tx, rx);
-            } else {
-                twr_log("CAL FAIL nvs\n");
+            /* Latch the solved values BEFORE the NVS write. The write is the
+             * single most likely point for the BLE link to drop (flash
+             * operations contend with the radio), and losing the link must not
+             * also lose the answer. */
+            cal_verdict("CAL OK %u/%u\n", tx, rx);
+            if (cal_store(tx, rx, ref_mm, (uint16_t)abserr) != 0) {
+                cal_verdict("CAL FAIL nvs\n");
             }
             return;
         }
@@ -399,7 +471,7 @@ static void run_calibration_locked(uint32_t ref_mm)
         total = cal_solve_step(mean, (int32_t)ref_mm, total);
         apply_total_dly(total, &tx, &rx);
     }
-    twr_log("CAL FAIL res\n");
+    cal_verdict("CAL FAIL res\n");
 }
 
 #define CAL_RADIO_WAIT  K_SECONDS(2)
@@ -414,7 +486,7 @@ static void run_calibration_locked(uint32_t ref_mm)
 static void run_calibration(uint32_t ref_mm)
 {
     if (!uwb_radio_request(CAL_RADIO_WAIT)) {
-        twr_log("CAL FAIL busy\n");
+        cal_verdict("CAL FAIL busy\n");
         return;
     }
 
@@ -564,15 +636,38 @@ void uwb_set_moving(bool moving)
     uwb_net_set_tier(moving ? UWB_TIER_FAST : UWB_TIER_SLOW);
 }
 
+size_t uwb_ss_stack_unused(void)
+{
+    size_t unused = 0;
+
+    if (k_thread_stack_space_get(&ss_twr_tid, &unused) != 0) {
+        return 0;   /* CONFIG_INIT_STACKS off, or thread not started */
+    }
+    return unused;
+}
+
+size_t uwb_ss_ble_stack_unused(void)
+{
+    size_t unused = 0;
+
+    if (k_thread_stack_space_get(&ss_ble_tx_tid, &unused) != 0) {
+        return 0;
+    }
+    return unused;
+}
+
 void uwb_ss_initiator_start(void)
 {
     k_thread_create(&ss_ble_tx_tid, ss_ble_tx_stack,
                     K_THREAD_STACK_SIZEOF(ss_ble_tx_stack),
                     ble_tx_fn,  NULL, NULL, NULL,
                     BLE_TX_PRIO, 0, K_NO_WAIT);
+    /* Named so a fatal error can say which thread died -- see `fault`. */
+    k_thread_name_set(&ss_ble_tx_tid, "bletx");
 
     k_thread_create(&ss_twr_tid, ss_twr_stack,
                     K_THREAD_STACK_SIZEOF(ss_twr_stack),
                     ss_twr_fn, NULL, NULL, NULL,
                     SS_TWR_PRIO, 0, K_NO_WAIT);
+    k_thread_name_set(&ss_twr_tid, "sstwr");
 }

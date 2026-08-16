@@ -21,6 +21,24 @@ static K_SEM_DEFINE(cal_req_sem, 0, 1);
 static volatile uint32_t cal_req_ref_mm;
 static volatile bool     cal_req_pending;
 
+/* Last-run verdict. Written by the ranging thread, read by the BT RX thread.
+ * Both are short strings written once per run and read on command, so the worst
+ * a race can produce is a torn line in a diagnostic -- not worth a lock on the
+ * ranging thread's path. */
+#define CAL_LAST_LEN 20
+static char cal_last[CAL_LAST_LEN] = "CAL none\n";
+
+void cal_set_last_result(const char *s)
+{
+    strncpy(cal_last, s, sizeof(cal_last) - 1);
+    cal_last[sizeof(cal_last) - 1] = '\0';
+}
+
+const char *cal_get_last_result(void)
+{
+    return cal_last;
+}
+
 /* ---- command parser (runs in BT RX thread) -------------------------------- */
 void cal_on_rx(const uint8_t *data, uint16_t len)
 {
@@ -49,6 +67,13 @@ void cal_on_rx(const uint8_t *data, uint16_t len)
         }
         return;
     }
+    if (strcmp(buf, "cal last") == 0) {
+        /* Verdict of the most recent run. "CAL none" means no run has finished
+         * since boot -- so if a run visibly happened and this still says none,
+         * the tag reset during it. */
+        ble_log_send(cal_get_last_result());
+        return;
+    }
     if (strcmp(buf, "cal selftest") == 0) {
         char msg[20];
         (void)snprintf(msg, sizeof(msg), "SELFTEST %d\n", cal_math_selftest());
@@ -62,11 +87,17 @@ void cal_on_rx(const uint8_t *data, uint16_t len)
             cal_req_ref_mm = (uint32_t)mm;
             cal_req_pending = true;
             k_sem_give(&cal_req_sem);
+            /* Clear the previous verdict: from here until the run ends, the
+             * absence of a result is itself the state we want reported. */
+            cal_set_last_result("CAL running\n");
             ble_log_send("CAL start\n");
             return;
         }
     }
-    ble_log_send("CAL ERR usage: cal <mm>\n");
+    /* 19 bytes. The previous string was 23 and exceeded the 20-byte NUS
+     * payload limit, so bt_nus_send() returned -EMSGSIZE and a mistyped
+     * command was answered with silence. */
+    ble_log_send("CAL ERR cal <mm>\n");
 }
 
 /* ---- public API ------------------------------------------------------------ */

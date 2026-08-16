@@ -67,9 +67,18 @@ int uwb_init(int max_retries)
 
         dwt_configuretxrf(&txconfig_options);
 
-        dwt_setlnapamode(DWT_LNA_ENABLE | DWT_PA_ENABLE);
-        // dwt_setlnapamode(DWT_LNA_PA_DISABLE);
-        
+        /* LNA only. This board fits an external receive amplifier and no PA,
+         * so DWT_PA_ENABLE would configure a DW3000 GPIO to drive a part that
+         * is not on the PCB -- a hardware fact, confirmed by the maintainer,
+         * not an optimisation.
+         *
+         * The mode lives in GPIO configuration, which is NOT among the
+         * registers restored from AON after SLEEP, so dw_wake() in
+         * uwb_net_runner.c re-applies it -- otherwise the front end goes dead
+         * on the first deep-sleep cycle and stays dead for the session. The two
+         * call sites must always match. */
+        dwt_setlnapamode(DWT_LNA_ENABLE);
+
         return 0;
     }
 

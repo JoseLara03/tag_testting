@@ -4,3 +4,4 @@ docs/
 .vscode/
 *.exe
 /tmp/
+debug/

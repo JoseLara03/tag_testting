@@ -4,8 +4,10 @@
 #include "ble_log.h"
 #include "cal.h"
 #include "uwb_net_runner.h"
+#include "uwb_ss_initiator.h"
 #include "batt.h"
 #include "rx_stats.h"
+#include "wdt.h"
 
 static void tag_cmd_on_rx(const uint8_t *data, uint16_t len)
 {
@@ -16,6 +18,86 @@ static void tag_cmd_on_rx(const uint8_t *data, uint16_t len)
 	buf[n] = '\0';
 	while (n > 0 && (buf[n - 1] == '\r' || buf[n - 1] == '\n')) {
 		buf[--n] = '\0';
+	}
+
+	if (strcmp(buf, "rst") == 0) {
+		/* Why the last boot happened.
+		 *
+		 * CONFIG_RESET_ON_FATAL_ERROR is NOT set in this build, so a
+		 * fatal error does not reboot: arch_system_halt() kills
+		 * interrupts and spins, BLE dies at once, the wdt feeder stops,
+		 * and the hardware watchdog resets ~10 s later. So on this
+		 * firmware a crash reports "dog", not "sreq" -- and a crash is
+		 * visible externally as a disconnect followed by the tag
+		 * re-advertising about ten seconds afterwards.
+		 *
+		 * "pwr" means the SoC never reset at all, so a BLE drop was the
+		 * link alone. "sreq" would mean a deliberate reboot; nothing in
+		 * this firmware calls sys_reboot(). */
+		uint32_t r = tag_reset_reason();
+		const char *why = (r & (1u << 1)) ? "dog"
+				: (r & (1u << 2)) ? "sreq"
+				: (r & (1u << 3)) ? "lock"
+				: (r & (1u << 0)) ? "pin"
+						  : "pwr";
+		char msg[20];
+
+		snprintf(msg, sizeof(msg), "RST %s %08x\n", why, (unsigned)r);
+		ble_log_send(msg);
+		return;
+	}
+
+	if (strcmp(buf, "fault") == 0 || strcmp(buf, "fault clear") == 0) {
+		/* What killed the previous boot. Survives the watchdog reset in
+		 * __noinit RAM. reason: 0 CPU_EXCEPTION, 1 SPURIOUS_IRQ,
+		 * 2 STACK_CHK_FAIL, 3 KERNEL_OOPS, 4 KERNEL_PANIC.
+		 * Look the pc up in build/tag_testting/zephyr/zephyr.elf with
+		 * arm-zephyr-eabi-addr2line to get the exact line. */
+		uint32_t    reason = 0, pc = 0, lr = 0, bfar = 0;
+		const char *thread = "";
+		char        msg[20];
+
+		if (strcmp(buf, "fault clear") == 0) {
+			tag_fault_clear();
+			ble_log_send("FLT cleared\n");
+			return;
+		}
+		if (!tag_fault_get(&reason, &pc, &lr, &bfar, &thread)) {
+			ble_log_send("FLT none\n");
+			return;
+		}
+		snprintf(msg, sizeof(msg), "FLT r%u %s\n",
+			 (unsigned)reason, thread);
+		ble_log_send(msg);
+		snprintf(msg, sizeof(msg), "FLT pc %08x\n", (unsigned)pc);
+		ble_log_send(msg);
+		/* On an assert panic the pc is assert_post_action(); lr names the
+		 * actual assert site. */
+		snprintf(msg, sizeof(msg), "FLT lr %08x\n", (unsigned)lr);
+		ble_log_send(msg);
+		/* The address the bad access targeted -- see tag_fault_get(). */
+		snprintf(msg, sizeof(msg), "FLT bf %08x\n", (unsigned)bfar);
+		ble_log_send(msg);
+		return;
+	}
+
+	if (strcmp(buf, "stack") == 0) {
+		/* Free-bytes high-water mark for the two deep threads. Run this
+		 * right after a `cal` run: if the SS-TWR figure is near zero,
+		 * the calibration path is overflowing and the "disconnect at
+		 * the end of cal" is a stack fault, not a BLE problem. */
+		char msg[20];
+
+		snprintf(msg, sizeof(msg), "STK ss %u\n",
+			 (unsigned)uwb_ss_stack_unused());
+		ble_log_send(msg);
+		snprintf(msg, sizeof(msg), "STK run %u\n",
+			 (unsigned)uwb_net_runner_stack_unused());
+		ble_log_send(msg);
+		snprintf(msg, sizeof(msg), "STK ble %u\n",
+			 (unsigned)uwb_ss_ble_stack_unused());
+		ble_log_send(msg);
+		return;
 	}
 
 	if (strncmp(buf, "pwr", 3) == 0) {

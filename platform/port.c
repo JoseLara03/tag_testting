@@ -88,6 +88,28 @@ void gpio_init(void)
 static struct gpio_callback dw3000_irq_cb;
 static port_dwic_isr_t      port_dwic_isr = NULL;
 
+/*
+ * Dispatch the DW IC handler directly from the GPIO ISR.
+ *
+ * KNOWN ISSUE, deliberately retained: dwt_isr() reaches the DW3000 over SPI,
+ * and readfromspi()/writetospi() in deca_spi.c take a k_mutex and then block in
+ * spi_transceive(). Blocking in an ISR is illegal in Zephyr -- an uncontended
+ * k_mutex_lock() takes a fast path and works, but a contended one would call
+ * z_pend_curr() and suspend whatever thread was interrupted.
+ *
+ * This was reworked to defer dwt_isr() to thread context, and that rework had
+ * to be reverted: it cut the accepted-range count from 100 to 1 per
+ * calibration iteration (CALp 100 1, with zero size/header rejects -- 99 pure
+ * RX timeouts). Ranging depends on this handler running promptly and draining
+ * the device in one go; a semaphore hand-off to a thread does not preserve
+ * that. The deferral was originally made to fix a crash it turned out not to
+ * cause (that was an array overrun in run_calibration_locked), so the correct
+ * move was to give the working behaviour back.
+ *
+ * Fixing the blocking-SPI-in-ISR problem properly means making the SPI path
+ * ISR-safe -- a polled/no-wait transfer for the ISR case -- not moving
+ * dwt_isr(). Do not re-attempt the deferral without solving that first.
+ */
 static void deca_irq_handler(const struct device *dev,
                               struct gpio_callback *cb,
                               uint32_t pins)
@@ -95,6 +117,7 @@ static void deca_irq_handler(const struct device *dev,
     ARG_UNUSED(dev);
     ARG_UNUSED(cb);
     ARG_UNUSED(pins);
+
     process_deca_irq();
 }
 
@@ -145,6 +168,22 @@ void make_very_short_wakeup_io(void)
 
 /* ---- IRQ routing --------------------------------------------------------- */
 
+/*
+ * Drain the DW3000 until it drops its IRQ line. Called from deca_irq_handler
+ * (GPIO ISR context) and from wait_event() in thread context.
+ *
+ * KNOWN HAZARD, left as-is deliberately: this loop's condition is "the DW3000
+ * still asserts IRQ". Any status bit that is interrupt-enabled but never
+ * cleared by dwt_isr() makes it spin forever -- and from the ISR path that
+ * means spinning inside an interrupt, with the kernel timer starved and the
+ * ~120 ms hardware watchdog as the only way out.
+ *
+ * An iteration cap was added during the calibration investigation and then
+ * removed again: with calibration still failing, carrying an unverified change
+ * on the receive path was worth less than a known-good baseline. Re-add it
+ * (16 passes is ample) once calibration is healthy and the change can actually
+ * be regression-tested.
+ */
 void process_deca_irq(void)
 {
     while (port_CheckEXT_IRQ() != 0) {
