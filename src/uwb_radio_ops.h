@@ -14,8 +14,12 @@ int  uwb_radio_tx_cap(const uint8_t *buf, size_t len, uint8_t minislot);
 int  uwb_radio_discover(struct pos_meas *out, size_t max);
 /* Range the previously discovered anchors; fill ranges; return count. */
 int  uwb_radio_sweep(struct pos_meas *out, size_t max);
-/* Sleep the DW3000 until `wake_ms` (monotonic). */
-void uwb_radio_sleep_until(uint32_t wake_ms);
+/* Sleep until `wake_ms` (monotonic), interruptibly: returns true if the sleep
+ * was cut short by uwb_net_runner_wake() (motion edge or HELP press). */
+bool uwb_radio_sleep_until(uint32_t wake_ms);
+/* Same, but NOT interruptible. Only for the CFP slot wait: that is a TDMA
+ * deadline, and waking early would transmit outside the tag's own slot. */
+void uwb_radio_sleep_until_strict(uint32_t wake_ms);
 uint32_t uwb_radio_now_ms(void);
 
 #endif /* UWB_RADIO_OPS_H */

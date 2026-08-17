@@ -6,6 +6,7 @@
 #include <nfc/ndef/record.h>
 #include "storage.h"
 #include "nfc_tag.h"
+#include "ble_log.h"
 
 #define NDEF_BUF_SIZE   256
 #define NFC_NAME_NVS_ID 2
@@ -123,7 +124,18 @@ static void nfc_callback(void *context, nfc_t4t_event_t event,
     ARG_UNUSED(context);
     ARG_UNUSED(flags);
 
+    /* A phone in the field is a person interacting with the tag, which is the
+     * other half of the event-driven advertising policy (the button being the
+     * first): open the 60 s window so NUS is reachable straight after a tap.
+     * This callback runs in the nrfxlib NFC thread, not an ISR, and
+     * ble_log_adv_window() only submits work, so it is safe here. */
+    if (event == NFC_T4T_EVENT_FIELD_ON) {
+        ble_log_adv_window();
+        return;
+    }
+
     if (event == NFC_T4T_EVENT_NDEF_UPDATED && data_length > 0) {
+        ble_log_adv_window();
         on_nfc_write(data, (uint32_t)data_length);
     }
 }

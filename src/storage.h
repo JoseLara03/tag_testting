@@ -4,6 +4,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* NVS ids in use (one nvs_fs instance for the whole app -- do not open a
+ * second one): 1 = cal record (src/cal.c), 2 = NFC name (src/nfc_tag.c),
+ * 3 = alert epoch/active (src/tag_alert.c). */
+
 int storage_init(void);
 int storage_read(uint16_t id, void *buf, size_t len);
 int storage_write(uint16_t id, const void *buf, size_t len);

@@ -8,23 +8,107 @@ static int g_fail = 0;
 
 static const uint8_t EUI[8] = {0xDE,0xAD,0xBE,0xEF,0,0,0,1};
 
-static void test_init_and_cadence(void)
+static void test_init(void)
 {
     struct uwb_net_ctx c;
     uwb_net_init(&c, EUI);
     CHECK(c.state == UWB_ST_SCAN);
     CHECK(c.req_tier == UWB_TIER_FAST);
+    CHECK(c.filt_tier == UWB_TIER_FAST);
+    CHECK(c.part_count == 0);
     CHECK(memcmp(c.eui, EUI, 8) == 0);
+}
 
-    /* FAST: every superframe. */
-    CHECK(uwb_tier_due(UWB_TIER_FAST, 0));
-    CHECK(uwb_tier_due(UWB_TIER_FAST, 7));
-    /* SLOW: every 5. */
-    CHECK(uwb_tier_due(UWB_TIER_SLOW, 10));
-    CHECK(!uwb_tier_due(UWB_TIER_SLOW, 11));
-    /* IDLE: every 25. */
-    CHECK(uwb_tier_due(UWB_TIER_IDLE, 50));
-    CHECK(!uwb_tier_due(UWB_TIER_IDLE, 51));
+/* listen_skip is clamped on *read* so that lifting UWB_LISTEN_SKIP_CAP when the
+ * gateway lease contract lands does not require rewriting any stored value. */
+static void test_tier_params(void)
+{
+    struct uwb_tier_params p;
+
+    uwb_net_reset_tier_params();
+
+    /* Design §6.1 defaults, seen through the cap. */
+    uwb_net_get_tier_params(UWB_TIER_FAST, &p);
+    CHECK(p.listen_skip == 25u && p.range_every == 1u);
+    uwb_net_get_tier_params(UWB_TIER_SLOW, &p);
+    CHECK(p.listen_skip == UWB_LISTEN_SKIP_CAP);   /* stored 75, capped to 25 */
+    CHECK(p.range_every == 1u);
+    uwb_net_get_tier_params(UWB_TIER_IDLE, &p);
+    CHECK(p.listen_skip == UWB_LISTEN_SKIP_CAP);   /* stored 300, capped to 25 */
+
+    /* The write is not clamped -- the stored value survives the cap. */
+    struct uwb_tier_params set = { 300u, 4u };
+    uwb_net_set_tier_params(UWB_TIER_IDLE, &set);
+    uwb_net_get_tier_params(UWB_TIER_IDLE, &p);
+    CHECK(p.listen_skip == UWB_LISTEN_SKIP_CAP);
+    CHECK(p.range_every == 4u);
+
+    /* Zeros are never handed out: they would mean "never wake" / "never range". */
+    struct uwb_tier_params zero = { 0u, 0u };
+    uwb_net_set_tier_params(UWB_TIER_SLOW, &zero);
+    uwb_net_get_tier_params(UWB_TIER_SLOW, &p);
+    CHECK(p.listen_skip == 1u && p.range_every == 1u);
+
+    /* An out-of-range tier reads back FAST rather than indexing off the end. */
+    uwb_net_get_tier_params((uwb_tier_t)99, &p);
+    struct uwb_tier_params f;
+    uwb_net_get_tier_params(UWB_TIER_FAST, &f);
+    CHECK(p.listen_skip == f.listen_skip && p.range_every == f.range_every);
+
+    uwb_net_reset_tier_params();
+    uwb_net_get_tier_params(UWB_TIER_IDLE, &p);
+    CHECK(p.range_every == 1u);
+}
+
+/* Design §6.2: promotion is immediate, both demotions are held. */
+static void test_tier_filter(void)
+{
+    struct uwb_net_ctx c;
+    uwb_net_init(&c, EUI);
+
+    /* Activity edge -> FAST at once. */
+    CHECK(uwb_net_tier_filter(&c, true, 1000u) == UWB_TIER_FAST);
+
+    /* Still, but inside the FAST hold: stays FAST right up to the boundary. */
+    CHECK(uwb_net_tier_filter(&c, false, 1000u + UWB_TIER_HOLD_FAST_MS - 1u)
+          == UWB_TIER_FAST);
+    /* Exactly at the boundary the demotion fires. */
+    CHECK(uwb_net_tier_filter(&c, false, 1000u + UWB_TIER_HOLD_FAST_MS)
+          == UWB_TIER_SLOW);
+
+    uint32_t t_slow = 1000u + UWB_TIER_HOLD_FAST_MS;
+
+    /* SLOW -> IDLE only after a further hold of continued stillness. */
+    CHECK(uwb_net_tier_filter(&c, false, t_slow + UWB_TIER_HOLD_SLOW_MS - 1u)
+          == UWB_TIER_SLOW);
+    CHECK(uwb_net_tier_filter(&c, false, t_slow + UWB_TIER_HOLD_SLOW_MS)
+          == UWB_TIER_IDLE);
+
+    /* Any activity edge, from any rung, goes straight back to FAST. */
+    CHECK(uwb_net_tier_filter(&c, true, t_slow + 1000000u) == UWB_TIER_FAST);
+
+    /* Flapping: a person shifting in a chair must not bounce the tier. Each
+     * activity edge re-arms the FAST hold, so a still sample between two
+     * edges never demotes. */
+    struct uwb_net_ctx cf;
+    uwb_net_init(&cf, EUI);
+    uint32_t t = 500u;
+    for (int i = 0; i < 20; i++) {
+        CHECK(uwb_net_tier_filter(&cf, true, t) == UWB_TIER_FAST);
+        t += UWB_TIER_HOLD_FAST_MS - 1u;
+        CHECK(uwb_net_tier_filter(&cf, false, t) == UWB_TIER_FAST);
+        t += 1u;
+    }
+
+    /* Wrap-safe: the same sequence across the uint32 ms wrap. */
+    struct uwb_net_ctx cw;
+    uwb_net_init(&cw, EUI);
+    uint32_t base = 0xFFFFFF00u;
+    CHECK(uwb_net_tier_filter(&cw, true, base) == UWB_TIER_FAST);
+    CHECK(uwb_net_tier_filter(&cw, false, base + UWB_TIER_HOLD_FAST_MS - 1u)
+          == UWB_TIER_FAST);
+    CHECK(uwb_net_tier_filter(&cw, false, base + UWB_TIER_HOLD_FAST_MS)
+          == UWB_TIER_SLOW);
 }
 
 static struct uwb_net_event ev_beacon(uint32_t fc, bool in_map, uint8_t slot)
@@ -47,9 +131,10 @@ static void test_scan_join(void)
 {
     struct uwb_net_ctx c; uwb_net_init(&c, EUI);
 
-    /* Wrong proto version: ignored, stays SCAN. */
+    /* Wrong proto version: ignored, stays SCAN -- and sleeps rather than
+     * holding the receiver open for the whole superframe. */
     struct uwb_net_event bad = ev_beacon(1, false, 0); bad.proto_ver = 99;
-    CHECK(uwb_net_handle(&c, &bad) == UWB_ACT_NONE);
+    CHECK(uwb_net_handle(&c, &bad) == UWB_ACT_SLEEP);
     CHECK(c.state == UWB_ST_SCAN);
 
     /* Valid beacon: -> JOINING, emit join. */
@@ -146,12 +231,33 @@ static void test_ranging(void)
     CHECK(!(a & UWB_ACT_SEND_KEEPALIVE));
     CHECK(c.slot_index == 3);
 
-    /* SLOW tier, frame_counter not a multiple of 5 -> sleep, no sweep. */
+    /* range_every counts *participations*, not frame counters: once whole
+     * superframes are skipped the frame counter advances while the tag is
+     * asleep, so a modulo test would fire on whichever superframe the tag
+     * happened to wake in. Drive SLOW with range_every = 3 and a frame counter
+     * that jumps arbitrarily -- the sweep must land on every third
+     * participation regardless. */
+    uwb_net_reset_tier_params();
+    struct uwb_tier_params every3 = { 75u, 3u };
+    uwb_net_set_tier_params(UWB_TIER_SLOW, &every3);
+
     struct uwb_net_ctx cs; to_ranging(&cs, UWB_TIER_SLOW);
+    static const uint32_t fcs[] = { 7, 400, 401, 9000, 9025, 9050, 12345 };
+    for (unsigned i = 0; i < sizeof(fcs) / sizeof(fcs[0]); i++) {
+        struct uwb_net_event bi = ev_beacon(fcs[i], true, 3);
+        uint32_t ai = uwb_net_handle(&cs, &bi);
+        bool want_sweep = ((i + 1) % 3u) == 0u;
+        CHECK(((ai & UWB_ACT_RUN_SWEEP) != 0) == want_sweep);
+        CHECK(((ai & UWB_ACT_SLEEP) != 0) == !want_sweep);
+    }
+    uwb_net_reset_tier_params();
+
+    /* Default range_every = 1: every participation sweeps, in every tier. */
+    struct uwb_net_ctx cs1; to_ranging(&cs1, UWB_TIER_SLOW);
     struct uwb_net_event b1 = ev_beacon(1, true, 3);
-    CHECK(uwb_net_handle(&cs, &b1) == UWB_ACT_SLEEP);
+    CHECK(uwb_net_handle(&cs1, &b1) & UWB_ACT_RUN_SWEEP);
     struct uwb_net_event b5 = ev_beacon(5, true, 3);
-    CHECK(uwb_net_handle(&cs, &b5) & UWB_ACT_RUN_SWEEP);
+    CHECK(uwb_net_handle(&cs1, &b5) & UWB_ACT_RUN_SWEEP);
 
     /* Lease decays to half -> keepalive flag set, lease renewed. */
     struct uwb_net_ctx ck; to_ranging(&ck, UWB_TIER_FAST);
@@ -179,6 +285,89 @@ static void test_ranging(void)
     struct uwb_net_event sw; memset(&sw, 0, sizeof(sw)); sw.kind = UWB_EV_SWEPT; sw.n_anchors = 2;
     CHECK(uwb_net_handle(&cd, &sw) == UWB_ACT_RUN_DISCOVER);
     CHECK(cd.state == UWB_ST_DISCOVER);
+}
+
+/* Open Work item 3: UWB_ST_SCAN must emit UWB_ACT_SLEEP. An unjoined tag used
+ * to hold RX open across ~100% of every superframe -- the tag's worst power
+ * state, and the one every failed `cal` run leaves it in. */
+static void test_scan_sleeps(void)
+{
+    struct uwb_net_ctx c; uwb_net_init(&c, EUI);
+
+    struct uwb_net_event miss; memset(&miss, 0, sizeof(miss));
+    miss.kind = UWB_EV_BEACON_MISS;
+    CHECK(uwb_net_handle(&c, &miss) == UWB_ACT_SLEEP);
+    CHECK(c.state == UWB_ST_SCAN);
+
+    /* Repeatedly, and without ever accumulating toward a state change. */
+    for (int i = 0; i < 10; i++) {
+        CHECK(uwb_net_handle(&c, &miss) == UWB_ACT_SLEEP);
+    }
+    CHECK(c.state == UWB_ST_SCAN);
+
+    /* A usable beacon still joins instead of sleeping. */
+    struct uwb_net_event b = ev_beacon(5, false, 0);
+    CHECK(uwb_net_handle(&c, &b) == UWB_ACT_SEND_JOIN);
+
+    /* And the sleep must not have cost the SCAN alert rule: a HELP raised out
+     * of coverage still goes out blind on both BEACON and BEACON_MISS. */
+    struct uwb_net_ctx ca; uwb_net_init(&ca, EUI);
+    struct uwb_net_event ma = miss; ma.alert_pending = true;
+    CHECK(uwb_net_handle(&ca, &ma) == (UWB_ACT_SLEEP | UWB_ACT_SEND_ALERT));
+}
+
+/* Regression, introduced by superframe skipping: the gateway ages every lease
+ * once per superframe whether or not the tag listened. A tag that re-syncs
+ * every 25 superframes must renew on every re-sync -- decrementing the local
+ * lease by one per *received* beacon would renew 25x too late and the seat
+ * would be reclaimed on the first skip (RESCAN seat, and a full JOIN + GRANT +
+ * re-discovery to get it back, which costs more than the skip saves). */
+static void test_lease_ages_by_elapsed(void)
+{
+    struct uwb_net_ctx c; to_ranging(&c, UWB_TIER_FAST);
+
+    /* A single beacon 25 superframes later must age the lease by 25, which is
+     * exactly the renewal threshold. */
+    uint32_t fc = c.frame_counter + 25u;
+    struct uwb_net_event b = ev_beacon(fc, true, 3);
+    uint32_t a = uwb_net_handle(&c, &b);
+    CHECK(a & UWB_ACT_SEND_KEEPALIVE);
+    CHECK(c.lease_remaining == UWB_NET_LEASE_SF);   /* renewed */
+
+    /* Sustained: 200 re-syncs at skip 25 and the local lease must never run
+     * out between renewals. */
+    for (int i = 0; i < 200; i++) {
+        fc += 25u;
+        struct uwb_net_event bi = ev_beacon(fc, true, 3);
+        uwb_net_handle(&c, &bi);
+        CHECK(c.state == UWB_ST_RANGING);
+        CHECK(c.lease_remaining > 0);
+    }
+
+    /* Every superframe: still exactly one decrement per beacon, so nothing
+     * about the un-skipped case changed. */
+    struct uwb_net_ctx c1; to_ranging(&c1, UWB_TIER_FAST);
+    uint16_t before = c1.lease_remaining;
+    struct uwb_net_event b1 = ev_beacon(c1.frame_counter + 1u, true, 3);
+    uwb_net_handle(&c1, &b1);
+    CHECK(c1.lease_remaining == before - 1u);
+
+    /* Wrap-safe across the gateway's uint32 frame counter. */
+    struct uwb_net_ctx cw; to_ranging(&cw, UWB_TIER_FAST);
+    cw.frame_counter = 0xFFFFFFF0u;
+    cw.lease_remaining = UWB_NET_LEASE_SF;
+    struct uwb_net_event bw = ev_beacon(0x00000004u, true, 3);   /* +20 */
+    uwb_net_handle(&cw, &bw);
+    CHECK(cw.lease_remaining == UWB_NET_LEASE_SF - 20u);
+
+    /* A gateway restart (counter jumps backwards) zeroes the lease, which
+     * forces a keepalive -- the right answer for a gateway that just rebooted. */
+    struct uwb_net_ctx cr; to_ranging(&cr, UWB_TIER_FAST);
+    cr.frame_counter = 900000u;
+    cr.lease_remaining = UWB_NET_LEASE_SF;
+    struct uwb_net_event br = ev_beacon(3u, true, 3);
+    CHECK(uwb_net_handle(&cr, &br) & UWB_ACT_SEND_KEEPALIVE);
+    CHECK(cr.lease_remaining == UWB_NET_LEASE_SF);   /* renewed after zeroing */
 }
 
 static void test_gate_actions(void)
@@ -223,15 +412,123 @@ static void test_proto_ver_matches_frame_module(void)
     CHECK(UWB_NET_PROTO_VER == UWB_PROTO_VER);
 }
 
+/* UWB_ACT_SEND_ALERT: JOINING / DISCOVER / RANGING fire only on an actual
+ * beacon; SCAN fires on both BEACON and BEACON_MISS. In every case the rest
+ * of the action word / state transition must be identical to the same event
+ * with alert_pending == false -- an alert must never suppress or alter
+ * anything else. */
+static void test_send_alert(void)
+{
+    /* -- SCAN -- */
+    {
+        struct uwb_net_ctx c0; uwb_net_init(&c0, EUI);
+        struct uwb_net_ctx c1; uwb_net_init(&c1, EUI);
+        struct uwb_net_event b0 = ev_beacon(5, false, 0);
+        struct uwb_net_event b1 = b0; b1.alert_pending = true;
+
+        uint32_t a0 = uwb_net_handle(&c0, &b0);
+        uint32_t a1 = uwb_net_handle(&c1, &b1);
+        CHECK(a1 == (a0 | UWB_ACT_SEND_ALERT));
+        CHECK(c0.state == c1.state);
+
+        struct uwb_net_ctx c2; uwb_net_init(&c2, EUI);
+        struct uwb_net_ctx c3; uwb_net_init(&c3, EUI);
+        struct uwb_net_event m0; memset(&m0, 0, sizeof(m0)); m0.kind = UWB_EV_BEACON_MISS;
+        struct uwb_net_event m1 = m0; m1.alert_pending = true;
+
+        uint32_t am0 = uwb_net_handle(&c2, &m0);
+        uint32_t am1 = uwb_net_handle(&c3, &m1);
+        CHECK(am1 == (am0 | UWB_ACT_SEND_ALERT));
+        CHECK(c2.state == c3.state);
+    }
+
+    /* -- JOINING -- */
+    {
+        struct uwb_net_ctx c0; uwb_net_init(&c0, EUI);
+        struct uwb_net_ctx c1; uwb_net_init(&c1, EUI);
+        struct uwb_net_event b = ev_beacon(0, false, 0);
+        uwb_net_handle(&c0, &b); uwb_net_handle(&c1, &b);   /* both -> JOINING */
+        CHECK(c0.state == UWB_ST_JOINING && c1.state == UWB_ST_JOINING);
+
+        struct uwb_net_event j0 = ev_beacon(1, false, 0);   /* retry-join beacon */
+        struct uwb_net_event j1 = j0; j1.alert_pending = true;
+        uint32_t a0 = uwb_net_handle(&c0, &j0);
+        uint32_t a1 = uwb_net_handle(&c1, &j1);
+        CHECK(a1 == (a0 | UWB_ACT_SEND_ALERT));
+        CHECK(c0.state == c1.state);
+
+        /* BEACON_MISS is not a JOINING event kind in this FSM's contract via
+         * beacons only, so drive GRANT_MISS instead to confirm alert_pending
+         * has no effect on a non-BEACON event in a synced state. */
+        struct uwb_net_event gm; memset(&gm, 0, sizeof(gm)); gm.kind = UWB_EV_GRANT_MISS;
+        struct uwb_net_event gm1 = gm; gm1.alert_pending = true;
+        uint32_t g0 = uwb_net_handle(&c0, &gm);
+        uint32_t g1 = uwb_net_handle(&c1, &gm1);
+        CHECK(g0 == g1);   /* no alert bit: not a BEACON event */
+    }
+
+    /* -- DISCOVER -- */
+    {
+        struct uwb_net_ctx c0; uwb_net_init(&c0, EUI);
+        struct uwb_net_ctx c1; uwb_net_init(&c1, EUI);
+        struct uwb_net_event b = ev_beacon(0, false, 0);
+        struct uwb_net_event g = ev_grant(0x0007, 3, UWB_TIER_FAST, 50);
+        uwb_net_handle(&c0, &b); uwb_net_handle(&c0, &g);
+        uwb_net_handle(&c1, &b); uwb_net_handle(&c1, &g);
+        CHECK(c0.state == UWB_ST_DISCOVER && c1.state == UWB_ST_DISCOVER);
+
+        struct uwb_net_event db0 = ev_beacon(1, true, 3);
+        struct uwb_net_event db1 = db0; db1.alert_pending = true;
+        uint32_t a0 = uwb_net_handle(&c0, &db0);
+        uint32_t a1 = uwb_net_handle(&c1, &db1);
+        CHECK(a1 == (a0 | UWB_ACT_SEND_ALERT));
+        CHECK(c0.state == c1.state);
+
+        struct uwb_net_event dm; memset(&dm, 0, sizeof(dm)); dm.kind = UWB_EV_BEACON_MISS;
+        struct uwb_net_event dm1 = dm; dm1.alert_pending = true;
+        uint32_t m0 = uwb_net_handle(&c0, &dm);
+        uint32_t m1 = uwb_net_handle(&c1, &dm1);
+        CHECK(m0 == m1);   /* miss never fires the alert outside SCAN */
+    }
+
+    /* -- RANGING -- */
+    {
+        struct uwb_net_ctx c0; to_ranging(&c0, UWB_TIER_FAST);
+        struct uwb_net_ctx c1; to_ranging(&c1, UWB_TIER_FAST);
+
+        struct uwb_net_event rb0 = ev_beacon(2, true, 3);
+        struct uwb_net_event rb1 = rb0; rb1.alert_pending = true;
+        uint32_t a0 = uwb_net_handle(&c0, &rb0);
+        uint32_t a1 = uwb_net_handle(&c1, &rb1);
+        CHECK(a1 == (a0 | UWB_ACT_SEND_ALERT));
+        CHECK(a0 & UWB_ACT_RUN_SWEEP);   /* sanity: a real action was in play */
+        CHECK(c0.state == c1.state);
+
+        struct uwb_net_event rm; memset(&rm, 0, sizeof(rm)); rm.kind = UWB_EV_BEACON_MISS;
+        struct uwb_net_event rm1 = rm; rm1.alert_pending = true;
+        uint32_t m0 = uwb_net_handle(&c0, &rm);
+        uint32_t m1 = uwb_net_handle(&c1, &rm1);
+        CHECK(m0 == m1);   /* "never TX on a missed beacon" rule stands */
+    }
+
+    /* Gate: UWB_ACT_SEND_ALERT survives uwb_net_gate_actions() uncalibrated. */
+    CHECK((uwb_net_gate_actions(UWB_ACT_SEND_ALERT, false) & UWB_ACT_SEND_ALERT) != 0);
+}
+
 int main(void)
 {
     test_proto_ver_matches_frame_module();
-    test_init_and_cadence();
+    test_init();
+    test_tier_params();
+    test_tier_filter();
+    test_scan_sleeps();
     test_scan_join();
     test_grant_discover();
     test_discover_keeps_lease();
     test_ranging();
+    test_lease_ages_by_elapsed();
     test_gate_actions();
+    test_send_alert();
     printf(g_fail ? "FAILED %d\n" : "OK\n", g_fail);
     return g_fail ? 1 : 0;
 }

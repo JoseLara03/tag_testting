@@ -93,7 +93,13 @@ int batt_read_current(int *ma)
     return 0;
 }
 
-#define BATT_SAMPLE_MS 5000
+/* One sample per minute. The quantity moves over hours, so 5 s was buying no
+ * resolution and cost twelve MCU wakes and twelve I2C transactions a minute --
+ * the second-highest periodic wake in the system once the runner starts
+ * skipping superframes. The idle-current window accumulates per *sample*
+ * (batt_window.c), not per second, so its min/mean/max stay valid; only the
+ * `n` reported by `pwr idle` gets smaller for the same wall-clock period. */
+#define BATT_SAMPLE_MS 60000
 
 static struct batt_window idle_win;
 static volatile bool      batt_connected;

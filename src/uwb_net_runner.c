@@ -21,6 +21,9 @@
 #include "cal.h"
 #include "rx_stats.h"
 #include "beacon_track_core.h"
+#include "beacon_sched_core.h"
+#include "scan_backoff_core.h"
+#include "tag_alert.h"
 #include <zephyr/kernel.h>
 #include <zephyr/random/random.h>
 #include <string.h>
@@ -58,7 +61,16 @@
 
 #define DISCOVERY_WINDOW_MS      15U   /* total RX collection window; covers anchor_id=3 (12.5 ms slot) */
 #define DISCOVERY_RX_SLOT_MS      3U   /* per-attempt uwb_radio_rx_beacon timeout */
-#define REDISCOVER_INTERVAL_SF   10U   /* superframes between periodic re-discovery */
+/* Periodic re-discovery, in wall-clock time rather than participations. It was
+ * 10 superframes, which is 2 s at the old every-superframe cadence but becomes
+ * ~10 minutes once the IDLE tier participates once a minute -- the anchor pool
+ * would go stale exactly where the tag moves least often but matters most. */
+#define REDISCOVER_INTERVAL_MS 60000U
+
+/* Rung of the coverage ladder at and above which discovery is suppressed
+ * entirely (design §5.3): run_discovery() broadcasts and then holds a 15 ms
+ * window open for anchors that are, by definition, not there. */
+#define SCAN_QUIET_RUNG           2U
 
 /* ---- Anchor-pool / CIR selection ---- */
 #define ANCHOR_POOL_MAX           6
@@ -78,7 +90,8 @@ typedef struct {
 static anchor_entry_t anchor_pool[ANCHOR_POOL_MAX];
 static uint8_t        selected[ANCHOR_SELECT_MAX];
 static uint8_t        n_selected;
-static uint8_t        sf_since_discover = REDISCOVER_INTERVAL_SF; /* force on first boot */
+static uint32_t       last_discover_ms;
+static bool           ever_discovered;   /* force the first round regardless of clock */
 static uint8_t        last_sweep_n      = 0;
 
 /* ---- Runner thread parameters ---- */
@@ -92,6 +105,20 @@ static struct k_thread runner_tid;
 static volatile uwb_tier_t  pending_tier;
 static volatile bool        tier_pending;
 
+/* Raw motion state from the LIS2HH12 INT1 handler. Kept raw rather than
+ * pre-mapped to a tier because uwb_net_tier_filter() owns the hysteresis, and
+ * it needs the edge, not the conclusion. */
+static volatile bool        motion_moving;
+static volatile bool        motion_edge;
+
+/* Beacon scheduler + coverage ladder. File-static rather than locals in
+ * runner_fn so the `pwr sched` / `pwr scan` diagnostics can read them. Written
+ * only by the runner thread and read from the BT RX thread; every field read
+ * out is a single aligned 32-bit or 8-bit word and the values are advisory, so
+ * no lock is taken. */
+static struct beacon_sched  sched;
+static struct scan_backoff  backoff;
+
 /* ---- EUI stored at start ---- */
 static uint8_t runner_eui[UWB_FRAME_EUI_LEN];
 
@@ -100,6 +127,22 @@ static volatile bool dw_sleep_enabled = true;
 
 void uwb_radio_set_sleep_enabled(bool en) { dw_sleep_enabled = en; }
 bool uwb_radio_sleep_enabled(void)        { return dw_sleep_enabled; }
+
+/* ---- Interruptible sleep / wake signal (design §4.5) ---- */
+static K_SEM_DEFINE(runner_wake, 0, 1);
+static volatile bool force_full_window;
+
+void uwb_net_runner_wake(void)
+{
+    /* Two parts, and both are needed. The semaphore shortens a sleep that is
+     * in progress right now; the sticky flag carries the request across a give
+     * that landed while an exchange was in flight (where there was no sleep to
+     * shorten and the drain at the top of the loop discards the give). Without
+     * the flag, a HELP raised mid-sweep would still wait a whole skip for its
+     * beacon. */
+    force_full_window = true;
+    k_sem_give(&runner_wake);
+}
 
 
 /* ---- DW3000 ISR callbacks (mirror the initiator's; same irq_sem/last_evt) ----
@@ -194,7 +237,21 @@ uint32_t uwb_radio_now_ms(void)
     return k_uptime_get_32();
 }
 
-void uwb_radio_sleep_until(uint32_t wake_ms)
+bool uwb_radio_sleep_until(uint32_t wake_ms)
+{
+    int32_t rem = (int32_t)(wake_ms - k_uptime_get_32());
+
+    if (rem <= 0) {
+        return false;
+    }
+    /* Wait on the wake signal rather than k_sleep(): once the runner skips
+     * whole superframes, a plain sleep would make a motion edge or a HELP
+     * press wait out the entire skip -- up to 60 s at the IDLE tier. For an
+     * emergency button that is a defect, not a latency figure (design §4.5). */
+    return k_sem_take(&runner_wake, K_MSEC(rem)) == 0;
+}
+
+void uwb_radio_sleep_until_strict(uint32_t wake_ms)
 {
     int32_t rem = (int32_t)(wake_ms - k_uptime_get_32());
 
@@ -446,8 +503,16 @@ static void runner_fn(void *p1, void *p2, void *p3)
 
     uwb_net_init(&ctx, runner_eui);
 
+    /* beacon_track and beacon_sched are complementary, not alternatives:
+     * beacon_track runs the ACQUIRING->TRACKING acquisition FSM and gets the
+     * tag locked on a full-window listen; beacon_sched then keeps it locked
+     * across skips of tens of superframes using a long-baseline period
+     * estimate. Merging them would put an acquisition FSM and an extrapolator
+     * with completely different failure modes behind one set of state. */
     struct beacon_track bt;
     beacon_track_reset(&bt, T_SUPERFRAME_MS, BT_GUARD_MS, BT_WARMUP_N, BT_EMA_SHIFT);
+    beacon_sched_reset(&sched, T_SUPERFRAME_MS);
+    scan_backoff_reset(&backoff);
     bool radio_asleep = false;   /* tracks whether the DW3000 is in deep sleep */
 
     /* DW3000 callbacks and timing — must be set before the loop.
@@ -459,6 +524,13 @@ static void runner_fn(void *p1, void *p2, void *p3)
     dwt_setpreambledetecttimeout(PRE_TIMEOUT);
 
     while (1) {
+        /* Drain any wake given while the previous superframe's exchange was in
+         * flight. It could not shorten anything then, and left pending it
+         * would abort an unrelated skip an iteration or two later. The intent
+         * is not lost: force_full_window is sticky and tier_pending latches
+         * the motion edge separately. */
+        k_sem_reset(&runner_wake);
+
         /* 0. Offer the radio to a waiting claimant. This is the only point in
          * the superframe with no exchange in flight, and the handover contract
          * says we leave the radio awake and idle. */
@@ -494,10 +566,17 @@ static void runner_fn(void *p1, void *p2, void *p3)
                  * gated on an actual handover. */
                 beacon_track_reset(&bt, T_SUPERFRAME_MS, BT_GUARD_MS,
                                    BT_WARMUP_N, BT_EMA_SHIFT);
+                /* Same argument, only stronger for the long-baseline
+                 * estimate: its phase reference is seconds old and its
+                 * baseline now spans a gap in which the tag heard nothing. */
+                beacon_sched_reset(&sched, T_SUPERFRAME_MS);
             }
         }
 
-        /* 1. Inject any pending tier change before the beacon window. */
+        /* 1. Tier. An explicit uwb_net_set_tier() still overrides directly;
+         * motion goes through the §6.2 hysteresis filter, which must be
+         * evaluated every superframe and not only on an edge -- the
+         * SLOW -> IDLE demotion is a timeout, not an edge. */
         if (tier_pending) {
             struct uwb_net_event mev = {
                 .kind     = UWB_EV_MOTION,
@@ -505,6 +584,36 @@ static void runner_fn(void *p1, void *p2, void *p3)
             };
             uwb_net_handle(&ctx, &mev);
             tier_pending = false;
+        }
+
+        if (motion_edge) {
+            motion_edge = false;
+            if (motion_moving) {
+                /* A tag leaving or entering a building is always in motion, so
+                 * an activity edge is a far better predictor of a coverage
+                 * change than elapsed time is (design §5.2). */
+                scan_backoff_motion(&backoff);
+            }
+        }
+
+        {
+            uwb_tier_t want = uwb_net_tier_filter(&ctx, motion_moving,
+                                                  uwb_radio_now_ms());
+            if (want != ctx.tier) {
+                struct uwb_net_event tev = {
+                    .kind     = UWB_EV_MOTION,
+                    .req_tier = (uint8_t)want,
+                };
+                uwb_net_handle(&ctx, &tev);
+                /* beacon_sched is deliberately NOT reset here, in either
+                 * direction. Its period estimate and phase reference are
+                 * properties of the gateway's clock, not of our tier, and a
+                 * longer skip is exactly when the long baseline is worth most
+                 * -- throwing it away would force the widest window at the
+                 * moment the narrowest is needed. A short baseline already
+                 * widens its own window, so growing the skip is safe with
+                 * whatever estimate exists. */
+            }
         }
 
         /* 2. Listen for THE beacon, discarding cross-traffic.  In TRACKING the
@@ -518,21 +627,70 @@ static void runner_fn(void *p1, void *p2, void *p3)
 
         bool     bt_narrow;
         uint32_t bt_arm_ms, bt_window_ms;
+        uint32_t eff_skip = 1u;      /* superframes this window skips over */
         beacon_track_plan(&bt, &bt_narrow, &bt_arm_ms, &bt_window_ms);
 
-        uint32_t bcn_deadline;
-        if (bt_narrow) {
-            /* Sleep (radio stays in deep sleep) until just before the predicted
-             * beacon, leaving DW_WAKE_GUARD_MS for the wake to settle. */
-            if ((int32_t)(bt_arm_ms - DW_WAKE_GUARD_MS - uwb_radio_now_ms()) > 0) {
-                uwb_radio_sleep_until(bt_arm_ms - DW_WAKE_GUARD_MS);
-            }
-            if (radio_asleep) { dw_wake(); radio_asleep = false; }
-            bcn_deadline = bt_arm_ms + bt_window_ms;
-        } else {
-            if (radio_asleep) { dw_wake(); radio_asleep = false; }
-            bcn_deadline = uwb_radio_now_ms() + T_SUPERFRAME_MS + T_BEACON_MS;
+        bool scanning = (ctx.state == UWB_ST_SCAN);
+
+        struct uwb_tier_params tp;
+        uwb_net_get_tier_params(ctx.tier, &tp);
+
+        if (scanning) {
+            /* Out of coverage there is no prediction to aim at: the probe is
+             * always a full superframe and the ladder owns how often it runs. */
+            bt_narrow = false;
+        } else if (bt_narrow && beacon_sched_have_ref(&sched)) {
+            /* Locked. Hand the prediction to the long-baseline scheduler,
+             * which may skip whole superframes; beacon_track's single-
+             * superframe plan is only used until that reference exists. */
+            beacon_sched_plan(&sched, tp.listen_skip,
+                              &bt_arm_ms, &bt_window_ms, &eff_skip);
         }
+
+        /* A wake request (motion edge or HELP press) buys one full-window
+         * listen: the prediction it interrupted is no longer the one we want
+         * to aim at, and a wasted full-window re-sync is the correct price for
+         * an emergency press. */
+        if (force_full_window) {
+            force_full_window = false;
+            bt_narrow = false;
+            eff_skip  = 1u;
+        }
+
+        if (scanning) {
+            /* Sleep out the ladder's probe interval with the radio still in
+             * deep sleep -- but only if it actually is asleep, so the first
+             * probe after boot (and every probe in bench mode, where
+             * dw_sleep_enabled is false and the radio never sleeps) happens
+             * immediately instead of 10 s late. A wake signal here cuts the
+             * wait short, which is exactly what a motion edge or a HELP press
+             * should do out of coverage. */
+            uint32_t probe_ms = (dw_sleep_enabled && radio_asleep)
+                              ? scan_backoff_next_ms(&backoff) : 0u;
+
+            if (probe_ms > DW_WAKE_GUARD_MS) {
+                (void)uwb_radio_sleep_until(uwb_radio_now_ms()
+                                            + probe_ms - DW_WAKE_GUARD_MS);
+            }
+        } else if (bt_narrow) {
+            /* Sleep (radio stays in deep sleep) until just before the predicted
+             * beacon, leaving DW_WAKE_GUARD_MS for the wake to settle. A wake
+             * signal here abandons the narrow window: the instant we were
+             * aiming at is no longer the one we are waiting for. */
+            if ((int32_t)(bt_arm_ms - DW_WAKE_GUARD_MS - uwb_radio_now_ms()) > 0) {
+                if (uwb_radio_sleep_until(bt_arm_ms - DW_WAKE_GUARD_MS)) {
+                    force_full_window = false;
+                    bt_narrow = false;
+                    eff_skip  = 1u;
+                }
+            }
+        }
+
+        if (radio_asleep) { dw_wake(); radio_asleep = false; }
+
+        uint32_t bcn_deadline = bt_narrow
+            ? (bt_arm_ms + bt_window_ms)
+            : (uwb_radio_now_ms() + T_SUPERFRAME_MS + T_BEACON_MS);
 
         uint32_t bcn_rx_ms = 0;
 
@@ -577,16 +735,54 @@ static void runner_fn(void *p1, void *p2, void *p3)
                 ev.in_map        = (slot_idx >= 0);
                 ev.map_slot      = (slot_idx >= 0) ? (uint8_t)slot_idx : 0;
                 rx_stats_beacon();
-                beacon_track_beacon(&bt, bcn_rx_ms);
+                /* The gateway's frame counter is what makes a long skip
+                 * self-correcting: it tells the tag exactly how many
+                 * superframes actually elapsed, so the period estimate is
+                 * validated against ground truth at every wake rather than
+                 * left to drift. */
+                beacon_sched_observe(&sched, bcn_rx_ms, frame_ctr);
+                if (eff_skip <= 1u) {
+                    beacon_track_beacon(&bt, bcn_rx_ms);
+                }
+                /* Across a skip the gap to the previous arrival is K x P, and
+                 * beacon_track's EMA assumes *consecutive* superframes -- one
+                 * skipped window would push its period estimate to thousands
+                 * of milliseconds. It is not used for prediction here
+                 * (beacon_sched owns that once it has a reference); its only
+                 * remaining job is the ACQUIRING->TRACKING lock, which this
+                 * beacon has already satisfied. So leave it untouched rather
+                 * than poison it. A miss clears both, and the re-lock then
+                 * happens at skip 1 where the EMA is valid again. */
             } else {
                 ev.kind = UWB_EV_BEACON_MISS;
                 rx_stats_miss();
                 beacon_track_miss(&bt);
+                beacon_sched_miss(&sched);
             }
         } else {
             ev.kind = UWB_EV_BEACON_MISS;
             rx_stats_miss();
             beacon_track_miss(&bt);
+            beacon_sched_miss(&sched);
+        }
+
+        /* The alert is orthogonal to beacon sync: fill it in on every event,
+         * BEACON or BEACON_MISS alike, before handing the event to the FSM.
+         * uwb_net_handle()'s emission rule decides whether this superframe's
+         * state actually earns UWB_ACT_SEND_ALERT. */
+        ev.alert_pending = tag_alert_active();
+
+        /* Coverage ladder. The alert pin goes on first so the failure below is
+         * a no-op while a HELP stands -- an emergency is exactly when the tag
+         * should be trying hardest to find a network. A beacon in *any* state
+         * means we are in coverage, so the reset is not conditioned on SCAN;
+         * only the climb is, since a miss inside RANGING is already handled by
+         * UWB_NET_MISS_MAX. */
+        scan_backoff_alert(&backoff, ev.alert_pending);
+        if (ev.kind == UWB_EV_BEACON) {
+            scan_backoff_reset(&backoff);
+        } else if (scanning) {
+            scan_backoff_fail(&backoff);
         }
 
         uint32_t act = uwb_net_handle(&ctx, &ev);
@@ -659,9 +855,45 @@ static void runner_fn(void *p1, void *p2, void *p3)
             }
         }
 
+        /* Placed after JOIN/KEEPALIVE and before RUN_DISCOVER/RUN_SWEEP: the
+         * action word is a bitmask evaluated top to bottom in one pass, so
+         * position in this function *is* the priority. This keeps a pending
+         * alert from ever delaying the sweep's slot-start deadline (and vice
+         * versa), and ensures it runs before UWB_ACT_SLEEP -- an alert that
+         * loses the race to sleep would wait a whole superframe to go out.
+         * No uwb_radio_owner claim and no new wait_event() caller: the runner
+         * already owns the radio here, exactly like position_publish(). */
+        if (act & UWB_ACT_SEND_ALERT) {
+            struct uwb_alert a;
+            uint32_t now = uwb_radio_now_ms();
+
+            if (tag_alert_frame_due(&a, ctx.short_addr, now)) {
+                uint8_t abuf[UWB_FRAME_LEN_ALERT];
+                int alen = uwb_frame_alert_build(abuf, sizeof(abuf), ctx.short_addr, &a);
+
+                if (alen > 0) {
+                    uint8_t mslot = (uint8_t)(sys_rand32_get() % N_CAP);
+                    uwb_radio_tx_cap(abuf, (size_t)alen, mslot);
+                    tag_alert_sent(now);
+                }
+            }
+        }
+
+        /* Discovery is suppressed while the coverage ladder has climbed:
+         * run_discovery() broadcasts and then holds a 15 ms window open for
+         * anchors that, at rung >= 2, have been absent for two minutes
+         * (design §5.3). Belt and braces in practice -- UWB_ACT_RUN_DISCOVER
+         * is only emitted from DISCOVER/RANGING, and any beacon resets the
+         * ladder -- but the suppression is cheap and the alternative is a
+         * broadcast into an empty room. */
+        if (scan_backoff_rung(&backoff) >= SCAN_QUIET_RUNG) {
+            act &= ~UWB_ACT_RUN_DISCOVER;
+        }
+
         if (act & UWB_ACT_RUN_DISCOVER) {
             int n = run_discovery(ctx.short_addr);
-            sf_since_discover = 0;
+            last_discover_ms = uwb_radio_now_ms();
+            ever_discovered  = true;
             last_sweep_n = (uint8_t)(n > 0 ? n : 0);   /* prime so next sweep isn't rediscover_due */
             struct uwb_net_event dev = {
                 .kind      = UWB_EV_DISCOVERED,
@@ -671,7 +903,11 @@ static void runner_fn(void *p1, void *p2, void *p3)
         }
 
         if (act & UWB_ACT_RUN_SWEEP) {
-            bool rediscover_due = (sf_since_discover >= REDISCOVER_INTERVAL_SF)
+            /* Wall-clock, not participations: at the IDLE tier a
+             * participation-counted interval of 10 would be ~10 minutes. */
+            bool rediscover_due = !ever_discovered
+                               || ((int32_t)(uwb_radio_now_ms() - last_discover_ms)
+                                   >= (int32_t)REDISCOVER_INTERVAL_MS)
                                || (last_sweep_n < ANCHOR_SELECT_MIN);
 
             if (rediscover_due) {
@@ -681,7 +917,8 @@ static void runner_fn(void *p1, void *p2, void *p3)
                  * after this round, the next sweep returns n_anchors < 3 which
                  * sends UWB_EV_SWEPT → FSM falls back to UWB_ST_DISCOVER naturally. */
                 run_discovery(ctx.short_addr);
-                sf_since_discover = 0;
+                last_discover_ms = uwb_radio_now_ms();
+                ever_discovered  = true;
             } else {
                 /* Sleep until our CFP slot start. */
                 uint32_t slot_start = t0_ms
@@ -689,12 +926,15 @@ static void runner_fn(void *p1, void *p2, void *p3)
                     + (uint32_t)N_CAP * T_MINISLOT_MS + T_GUARD_MS
                     + (uint32_t)ctx.slot_index * (T_SLOT_MS + T_GUARD_MS);
 
-                uwb_radio_sleep_until(slot_start);
+                /* Strict: this is the tag's TDMA slot boundary. Returning
+                 * early would put the poll outside the slot and straight into
+                 * a neighbour's -- the inter-tag collision T_SLOT_MS exists to
+                 * prevent. A motion edge or a HELP press waits the few ms. */
+                uwb_radio_sleep_until_strict(slot_start);
 
                 struct pos_meas meas[POS_MAX_ANCHORS];
                 int n = uwb_radio_sweep(meas, POS_MAX_ANCHORS);
                 last_sweep_n = (uint8_t)n;
-                sf_since_discover++;
 
                 struct pos_result pos;
                 if (n >= 3 && pos_solve(meas, (size_t)n, &pos)) {
@@ -718,7 +958,7 @@ static void runner_fn(void *p1, void *p2, void *p3)
                 dw_enter_sleep();
                 radio_asleep = true;
             } else {
-                uwb_radio_sleep_until(t0_ms + T_SUPERFRAME_MS);
+                (void)uwb_radio_sleep_until(t0_ms + T_SUPERFRAME_MS);
             }
         }
 
@@ -743,6 +983,46 @@ void uwb_net_set_tier(uwb_tier_t t)
 {
     pending_tier = t;
     tier_pending = true;
+}
+
+void uwb_net_set_moving(bool moving)
+{
+    motion_moving = moving;
+    motion_edge   = true;
+}
+
+bool uwb_net_runner_sched_get(uint32_t *period_q16, uint32_t *window_ms,
+                              uint32_t *eff_skip, uint32_t *misses,
+                              uint32_t *ok_count, uint32_t *miss_count)
+{
+    struct uwb_tier_params tp;
+    uint32_t win = 0, eff = 0;
+
+    /* The tier here is the parameter set the runner would use next; reading
+     * ctx.tier would need the runner's stack frame, so report the FAST row --
+     * the diagnostics that matter (period, misses, counters) are tier-free and
+     * the window/skip pair is read back per tier with `pwr tier`. */
+    uwb_net_get_tier_params(UWB_TIER_FAST, &tp);
+    beacon_sched_plan(&sched, tp.listen_skip, NULL, &win, &eff);
+
+    if (period_q16) { *period_q16 = beacon_sched_period_q16(&sched); }
+    if (window_ms)  { *window_ms  = win; }
+    if (eff_skip)   { *eff_skip   = eff; }
+    if (misses)     { *misses     = sched.misses; }
+    if (ok_count)   { *ok_count   = sched.ok_count; }
+    if (miss_count) { *miss_count = sched.miss_count; }
+    return sched.ok_count != 0u || sched.miss_count != 0u;
+}
+
+void uwb_net_runner_sched_reset_stats(void)
+{
+    beacon_sched_stats_reset(&sched);
+}
+
+void uwb_net_runner_scan_get(uint8_t *rung, uint32_t *next_ms)
+{
+    if (rung)    { *rung    = scan_backoff_rung(&backoff); }
+    if (next_ms) { *next_ms = scan_backoff_next_ms(&backoff); }
 }
 
 size_t uwb_net_runner_stack_unused(void)

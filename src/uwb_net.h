@@ -17,6 +17,59 @@
 #define UWB_NET_PROTO_VER       2
 
 typedef enum { UWB_TIER_IDLE = 0, UWB_TIER_SLOW = 1, UWB_TIER_FAST = 2 } uwb_tier_t;
+#define UWB_TIER_COUNT  3
+
+/* Per-tier duty cycle (design §6.1). These are two *different* cadences that
+ * used to be one number, and conflating them is why the tier setting saved so
+ * little: tier_cadence() gated UWB_ACT_RUN_SWEEP only, so the dominant costs --
+ * the beacon RX and the DW3000 wake, paid on every superframe regardless of
+ * tier -- were invisible to it.
+ *
+ *   listen_skip  superframes slept between beacon re-syncs. This is where the
+ *                power is.
+ *   range_every  participations between position fixes. This is where the
+ *                position update rate is.
+ *
+ * range_every defaults to 1 in every tier: with listen_skip doing the work
+ * there is no longer a reason to wake, re-sync and then not range -- the
+ * re-sync is the expensive part and the sweep is already paid for once you are
+ * awake. It stays for the case where the fix rate must be decoupled from the
+ * seat-maintenance rate. */
+struct uwb_tier_params {
+    uint16_t listen_skip;
+    uint16_t range_every;
+};
+
+/* Hard cap applied to listen_skip on read, until the gateway implements the
+ * lease contract in design §7.
+ *
+ * UWB_NET_LEASE_SF is 50 superframes (10 s) and is renewed at half that, so a
+ * tag that sleeps for more than 25 superframes cannot renew its lease: it
+ * loses its seat on every skip and pays a full JOIN + GRANT + re-discovery
+ * cycle each time, which costs more than the skip saves. Until the gateway
+ * sizes the lease from a declared skip factor, FAST (25) works against today's
+ * gateway and SLOW/IDLE do not.
+ *
+ * Clamped on read, not on write, so lifting this cap is a one-line edit that
+ * does not require rewriting any stored value. */
+#define UWB_LISTEN_SKIP_CAP  25u
+
+/* Set/get a tier's parameters. The getter always applies UWB_LISTEN_SKIP_CAP
+ * and never returns a range_every of 0. An out-of-range tier reads back the
+ * FAST defaults rather than indexing off the end. Pure; not thread-safe --
+ * the table is written from the command handler and read from the runner, and
+ * both are aligned 16-bit fields. */
+void uwb_net_set_tier_params(uwb_tier_t t, const struct uwb_tier_params *p);
+void uwb_net_get_tier_params(uwb_tier_t t, struct uwb_tier_params *out);
+
+/* Restore the compiled-in defaults (`pwr tier def`). */
+void uwb_net_reset_tier_params(void);
+
+/* Tier hysteresis (design §6.2). The LIS2HH12's own ACT_DUR gives a ~5 s
+ * inactivity window, but the *activity* edge is immediate, so without this a
+ * person shifting in a chair flaps the tag into FAST and back. */
+#define UWB_TIER_HOLD_FAST_MS  30000u
+#define UWB_TIER_HOLD_SLOW_MS  60000u
 typedef enum { UWB_ST_SCAN = 0, UWB_ST_JOINING, UWB_ST_DISCOVER, UWB_ST_RANGING } uwb_net_state_t;
 
 typedef enum {
@@ -45,6 +98,10 @@ struct uwb_net_event {
     uint8_t  n_anchors;
     /* MOTION */
     uint8_t  req_tier;
+    /* Set by the caller every superframe from tag_alert_active()-equivalent
+     * state: true whenever the tag has a HELP/CANCEL frame it wants sent.
+     * See UWB_ACT_SEND_ALERT's emission rule below. */
+    bool     alert_pending;
 };
 
 /* Action bit-flags returned by uwb_net_handle (a superframe may need >1). */
@@ -55,6 +112,14 @@ struct uwb_net_event {
 #define UWB_ACT_RUN_SWEEP       (1u << 3)
 #define UWB_ACT_SLEEP           (1u << 4)
 #define UWB_ACT_TO_SCAN         (1u << 5)   /* lease lost this superframe */
+/* Emitted per the design's alert emission rule (spec/2026-08-16-uwb-help-alert-
+ * design.md §5): on UWB_EV_BEACON in JOINING/DISCOVER/RANGING (synced TX
+ * window only -- never on a missed beacon there, since the tag would not
+ * know where the CAP is); on BOTH UWB_EV_BEACON and UWB_EV_BEACON_MISS in
+ * SCAN, where the tag has no sync to protect and no seat to lose. Deliberately
+ * outside UWB_ACT_RANGING_MASK -- an uncalibrated tag must still call for
+ * help. */
+#define UWB_ACT_SEND_ALERT      (1u << 6)
 
 /* Actions whose result depends on the antenna delay. Cleared when the tag has
  * no valid antenna calibration -- see uwb_net_gate_actions().
@@ -85,12 +150,31 @@ struct uwb_net_ctx {
     uint16_t  lease_remaining;  /* superframes until expiry */
     uint8_t   miss_count;       /* consecutive beacon misses */
     uint8_t   join_retries;
-    uint32_t  frame_counter;    /* last beacon's counter (cadence ref) */
+    uint32_t  frame_counter;    /* last beacon's counter (last beacon seen) */
     uint8_t   n_anchors;        /* selected anchors after discovery */
+    /* Participations since the last sweep. Counted, not derived from
+     * frame_counter % cadence: once whole superframes are skipped the frame
+     * counter is no longer a usable cadence reference -- it advances while the
+     * tag is asleep, so a modulo test would fire on whichever superframe the
+     * tag happened to wake in, or never. */
+    uint16_t  part_count;
+    /* uwb_net_tier_filter() state. Separate from `tier`, which is the tier the
+     * gateway granted / the FSM is running; the filter's output is fed back in
+     * as UWB_EV_MOTION by the caller. */
+    uwb_tier_t filt_tier;
+    uint32_t  last_active_ms;   /* last activity edge */
+    uint32_t  tier_since_ms;    /* when filt_tier was entered */
 };
 
 void     uwb_net_init(struct uwb_net_ctx *c, const uint8_t eui[8]);
-bool     uwb_tier_due(uwb_tier_t tier, uint32_t frame_counter);
 uint32_t uwb_net_handle(struct uwb_net_ctx *c, const struct uwb_net_event *ev);
+
+/* Motion state -> the tier the runner should actually use. Call once per
+ * superframe with the raw INT1-derived motion state and a monotonic ms clock;
+ * `moving` true is an activity edge and always returns FAST immediately. The
+ * demotions are held: FAST -> SLOW only once UWB_TIER_HOLD_FAST_MS has passed
+ * since the last activity edge, and SLOW -> IDLE only after a further
+ * UWB_TIER_HOLD_SLOW_MS of continued stillness. Wrap-safe in now_ms. */
+uwb_tier_t uwb_net_tier_filter(struct uwb_net_ctx *c, bool moving, uint32_t now_ms);
 
 #endif /* UWB_NET_H */

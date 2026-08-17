@@ -12,6 +12,7 @@
 #include "motion.h"
 #include "tag_ui.h"
 #include "cal.h"
+#include "tag_alert.h"
 #include "tag_cmd.h"
 #include "rx_stats.h"
 #include "wdt.h"
@@ -58,6 +59,7 @@ int main(void)
         }
         tag_cmd_init();
         rx_stats_reset();
+        tag_alert_init();
         uwb_ss_initiator_start();
         uwb_net_runner_start(eui);
         if (motion_init() != 0) {

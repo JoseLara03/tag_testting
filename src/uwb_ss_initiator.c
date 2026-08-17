@@ -531,10 +531,27 @@ static void fmt_coord(char *buf, size_t len, float v)
  * (<=20 bytes for the NUS limit) and enqueue to the BLE sender. A future
  * UWB-to-master sender replaces only this function body.
  */
+static float    last_pos_x, last_pos_y;
+static volatile bool last_pos_valid;
+
+bool pos_last_get(float *x, float *y)
+{
+    if (!last_pos_valid) {
+        return false;
+    }
+    *x = last_pos_x;
+    *y = last_pos_y;
+    return true;
+}
+
 void position_publish(const struct pos_result *pos, uint8_t n_anchors,
                       uint16_t src_addr)
 {
     char xs[16], ys[16];
+
+    last_pos_x     = pos->x;
+    last_pos_y     = pos->y;
+    last_pos_valid = true;
 
     /* The BLE console line stays alongside the UWB frame. It is the only
      * independent check that the tag solved what the gateway received, and
@@ -629,11 +646,20 @@ static void ss_twr_fn(void *p1, void *p2, void *p3)
     }
 }
 
-/* Compatibility shim: motion.c calls this; route to the runner's tier API.
- * Static -> SLOW (1 s cadence); moving -> FAST (200 ms cadence). */
+/* Compatibility shim: motion.c calls this; route to the runner's motion API,
+ * which applies the tier hysteresis and the coverage-ladder reset. */
 void uwb_set_moving(bool moving)
 {
-    uwb_net_set_tier(moving ? UWB_TIER_FAST : UWB_TIER_SLOW);
+    /* Raw state, not a tier: uwb_net_tier_filter() in the runner owns the
+     * hysteresis now (design §6.2), and it needs the edge rather than a
+     * conclusion already drawn from it. */
+    uwb_net_set_moving(moving);
+    /* The tier is only read at the top of the runner's loop, and the loop can
+     * be parked in a multi-second skip. Wake it so the new cadence starts now
+     * rather than at the end of the skip -- the tag would otherwise be well
+     * into motion before it began ranging at the moving rate. Called from the
+     * accelerometer's GPIO ISR; uwb_net_runner_wake() is ISR-safe. */
+    uwb_net_runner_wake();
 }
 
 size_t uwb_ss_stack_unused(void)

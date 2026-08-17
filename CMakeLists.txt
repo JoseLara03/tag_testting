@@ -19,10 +19,13 @@ target_sources(app PRIVATE
     src/pos_solver.c
     src/pos_residual.c
     src/uwb_ss_initiator.c
+    src/tag_alert.c
     src/motion.c
     src/tag_ui.c
     src/tag_ui_color.c
     src/uwb_frame_802_15_4z.c
+    src/alert_relay.c
+    src/tag_alert_core.c
     src/uwb_net.c
     src/uwb_net_runner.c
     src/uwb_radio_owner.c
@@ -30,6 +33,8 @@ target_sources(app PRIVATE
     src/rx_stats_core.c
     src/rx_stats.c
     src/beacon_track_core.c
+    src/beacon_sched_core.c
+    src/scan_backoff_core.c
     src/wdt.c
     drivers/lis2hh12-pid/lis2hh12_reg.c
     platform/port.c

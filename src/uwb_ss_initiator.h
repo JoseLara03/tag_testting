@@ -37,11 +37,16 @@ bool do_one_range_anchor(uint8_t aid, float *range_m, float *ax, float *ay);
 void position_publish(const struct pos_result *pos, uint8_t n_anchors,
                       uint16_t src_addr);
 
+/* Last position cached by position_publish(), for the alert frame's last_x/
+ * last_y. Returns false (leaving the pointed-to x and y untouched) when there
+ * has never been a fix -- the caller sends NaN in that case. */
+bool pos_last_get(float *x, float *y);
+
 /* Enqueue a BLE NUS log message (≤19 chars + NUL; drops if queue full). */
 void twr_log(const char *fmt, ...);
 
-/* Compatibility shim: called by motion.c; forwards to uwb_net_set_tier.
- * true  -> UWB_TIER_FAST, false -> UWB_TIER_IDLE. */
+/* Compatibility shim: called by motion.c; forwards the raw motion state to
+ * uwb_net_set_moving() and wakes the runner out of any skip. */
 void uwb_set_moving(bool moving);
 
 /* Minimum bytes ever left unused on the SS-TWR/calibration thread stack, as a

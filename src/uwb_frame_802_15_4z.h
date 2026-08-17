@@ -17,6 +17,7 @@
 #define UWB_FRAME_TYPE_KEEPALIVE 0xE8
 #define UWB_FRAME_TYPE_RELEASE   0xE9
 #define UWB_FRAME_TYPE_POS       0xEA
+#define UWB_FRAME_TYPE_ALERT     0xEB
 
 #define UWB_ADDR_GATEWAY  0x0000u
 #define UWB_ADDR_UNASSOC  0xFFFEu   /* tag src before it is granted a short addr */
@@ -49,6 +50,29 @@
  * real 0 % reading. */
 #define UWB_FRAME_POS_SOC_UNKNOWN 0xFFu
 #define UWB_FRAME_LEN_POS        24
+
+/* ---- ALERT (0xEB): HELP/CANCEL, tag/anchor -> gateway --------------------
+ * See spec/2026-08-16-uwb-help-alert-design.md §2/§3 for the field
+ * semantics (epoch/repeat_seq/ttl/sender_hop ordering and the reserved
+ * `state` bits). UWB_FRAME_LEN_ALERT (34) <= UWB_FRAME_MAX_LEN (37). */
+#define UWB_ALERT_STATE_CANCEL 0x00u
+#define UWB_ALERT_STATE_HELP   0x01u
+#define UWB_ALERT_STATE_RESERVED_MASK 0xFEu   /* bits1-7, must be 0 */
+#define UWB_ALERT_HOP_UNKNOWN  0xFFu
+#define UWB_ALERT_TTL_INIT     6
+#define UWB_FRAME_LEN_ALERT    34
+
+struct uwb_alert {
+    uint8_t  state;        /* bit0 HELP/CANCEL; bits1-7 reserved, must be 0 */
+    uint8_t  epoch;
+    uint8_t  repeat_seq;
+    uint8_t  sender_hop;
+    uint8_t  ttl;
+    uint8_t  orig_eui[8];
+    uint16_t orig_addr;
+    uint8_t  batt_soc;
+    float    last_x, last_y;   /* NaN when the tag has no fix */
+};
 
 struct uwb_anchor_slot {
     uint16_t addr;      /* anchor short address */
@@ -114,6 +138,12 @@ bool uwb_frame_is_pos(const uint8_t *buf, size_t len);
 int  uwb_frame_parse_pos(const uint8_t *buf, size_t len, uint16_t *src_addr,
                          float *x, float *y, float *residual_m,
                          uint8_t *n_anchors, uint8_t *batt_soc);
+
+/* ---- ALERT (0xEB) builder / parser / validator ---- */
+int  uwb_frame_alert_build(uint8_t *buf, size_t buf_len, uint16_t src_addr,
+                           const struct uwb_alert *a);
+bool uwb_frame_is_alert(const uint8_t *buf, size_t len);
+int  uwb_frame_parse_alert(const uint8_t *buf, size_t len, struct uwb_alert *a);
 
 /* ---- Validators ---- */
 bool uwb_frame_is_valid(const uint8_t *buf, size_t len);
