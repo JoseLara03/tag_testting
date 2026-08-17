@@ -171,7 +171,18 @@ void batt_on_ble_state(ble_state_t state)
     if (state == BLE_STATE_CONNECTED) {
         batt_connected = true;   /* stop accumulating; window holds the just-
                                   * finished disconnected period for `pwr idle` */
-    } else {
+    } else if (batt_connected) {
+        /* Only on the CONNECTED -> disconnected edge. Resetting on *every*
+         * non-CONNECTED callback was harmless while the tag advertised from
+         * boot (ADVERTISING fired once and never again), but advertising is
+         * now opened by the button press -- and that press is necessarily the
+         * step before every `pwr idle` read. Resetting here wiped the window
+         * being asked for, so `pwr idle` always answered `none`. The tag now
+         * accumulates from boot until the first connection.
+         *
+         * Cost: the 60 s advertising window is disconnected-but-advertising
+         * and its ~20 uA is folded into the "idle" figure. Below the gauge's
+         * resolution, and far better than reporting nothing. */
         batt_connected = false;
         batt_window_reset(&idle_win);   /* start a fresh disconnected window */
     }
