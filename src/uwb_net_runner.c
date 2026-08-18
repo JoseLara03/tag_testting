@@ -366,15 +366,18 @@ static int run_discovery(uint16_t src_addr)
      * boundary -- so its response was the one structurally at risk of being
      * clipped by that gap, every single discovery round. Arming for the
      * full remaining time each iteration means the receiver only goes
-     * through a re-arm after it has actually consumed a real frame, so no
+     * through a re-arm after it has actually consumed a frame, so no
      * anchor's fixed response delay can alias against a polling boundary. */
     {
         uint32_t t_end = k_uptime_get_32() + DISCOVERY_WINDOW_MS;
         uint8_t  resp_buf[UWB_FRAME_LEN_RESP];
 
-        while ((int32_t)(t_end - k_uptime_get_32()) > 0) {
-            uint32_t rem = (uint32_t)(t_end - k_uptime_get_32());
-            int rlen = uwb_radio_rx_beacon(resp_buf, sizeof(resp_buf), rem);
+        for (;;) {
+            int32_t rem = (int32_t)(t_end - k_uptime_get_32());
+            if (rem <= 0) {
+                break;
+            }
+            int rlen = uwb_radio_rx_beacon(resp_buf, sizeof(resp_buf), (uint32_t)rem);
             if (rlen > 0 && uwb_frame_is_response(resp_buf, (size_t)rlen)) {
                 uint16_t src  = 0;
                 int32_t  cir_p = 0;
