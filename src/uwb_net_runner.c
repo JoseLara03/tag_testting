@@ -60,7 +60,6 @@
 #define INTER_ANCHOR_DELAY_US        10U
 
 #define DISCOVERY_WINDOW_MS      15U   /* total RX collection window; covers anchor_id=3 (12.5 ms slot) */
-#define DISCOVERY_RX_SLOT_MS      3U   /* per-attempt uwb_radio_rx_beacon timeout */
 /* Periodic re-discovery, in wall-clock time rather than participations. It was
  * 10 superframes, which is 2 s at the old every-superframe cadence but becomes
  * ~10 minutes once the IDLE tier participates once a minute -- the anchor pool
@@ -353,16 +352,28 @@ static int run_discovery(uint16_t src_addr)
 
     /* Collect DISCOVERY_RESPONSE frames within DISCOVERY_WINDOW_MS.
      * uwb_radio_rx_beacon() disables HW timeouts (setrxtimeout(0)) — correct
-     * for this open-ended collection window; anchor_sweep() restores them. */
+     * for this open-ended collection window; anchor_sweep() restores them.
+     *
+     * Each call is armed for the FULL remaining time, not a fixed slice --
+     * mirrors the beacon RX loop a few hundred lines below, which re-arms
+     * only after actually consuming a frame. Slicing into fixed-size chunks
+     * (the previous DISCOVERY_RX_SLOT_MS=3 ms design) re-arms the DW3000
+     * receiver on a fixed timer regardless of whether a frame arrived, and
+     * each re-arm (dwt_setrxtimeout/setpreambledetecttimeout/setinterrupt/
+     * rxenable, several SPI writes) leaves a brief gap where the receiver is
+     * not listening. Anchor id 2 (short address 0x0003) replies at exactly
+     * DISC_BASE_UUS + 2*DISC_SLOT_UUS = 9.0 ms -- precisely on a 3 ms slice
+     * boundary -- so its response was the one structurally at risk of being
+     * clipped by that gap, every single discovery round. Arming for the
+     * full remaining time each iteration means the receiver only goes
+     * through a re-arm after it has actually consumed a real frame, so no
+     * anchor's fixed response delay can alias against a polling boundary. */
     {
         uint32_t t_end = k_uptime_get_32() + DISCOVERY_WINDOW_MS;
         uint8_t  resp_buf[UWB_FRAME_LEN_RESP];
 
         while ((int32_t)(t_end - k_uptime_get_32()) > 0) {
             uint32_t rem = (uint32_t)(t_end - k_uptime_get_32());
-            if (rem > DISCOVERY_RX_SLOT_MS) {
-                rem = DISCOVERY_RX_SLOT_MS;
-            }
             int rlen = uwb_radio_rx_beacon(resp_buf, sizeof(resp_buf), rem);
             if (rlen > 0 && uwb_frame_is_response(resp_buf, (size_t)rlen)) {
                 uint16_t src  = 0;
