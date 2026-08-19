@@ -1,0 +1,16 @@
+menu "Tag firmware"
+
+config TAG_CAL_MODE
+	bool "Antenna-delay calibration firmware"
+	help
+	  Build the calibration image instead of the production tag.
+
+	  main() does not start the MAC runner, so nothing opens the receiver
+	  and nothing deep-sleeps the DW3000: the image is idle until a `cal`
+	  command arrives over NUS. Adds `cal listen` and `cal probe`.
+
+	  Never ship this. It holds no network seat and reports no position.
+
+endmenu
+
+source "Kconfig.zephyr"
