@@ -15,7 +15,6 @@
 #include "uwb_ss_initiator.h"   /* twr_log() */
 #include "cal.h"                /* cal_is_valid(), cal_get_ant_dly() */
 #include "phy_config.h"         /* TX_ANT_DLY / RX_ANT_DLY fallback */
-#include "port.h"
 #include "deca_device_api.h"
 
 #include <zephyr/kernel.h>
@@ -112,7 +111,7 @@ static uint32_t wait_any_sysstatus_lo(uint32_t mask, uint32_t timeout_ms)
 static void do_listen(uint32_t ms)
 {
     if (!claim_radio()) {
-        twr_log("F none\n");
+        twr_log("F busy\n");
         return;
     }
 
@@ -151,7 +150,7 @@ static void do_probe(uint32_t wire_id)
     uint8_t buf[RX_BUF_LEN];
 
     if (!claim_radio()) {
-        twr_log("F none\n");
+        twr_log("F busy\n");
         return;
     }
 
@@ -168,12 +167,13 @@ static void do_probe(uint32_t wire_id)
         dwt_writetxfctrl(sizeof(poll) + FCS_LEN, 0, 1);
     }
 
+    dwt_setrxaftertxdelay(0);
     dwt_setrxtimeout(0);
     dwt_setpreambledetecttimeout(0);
 
     if (dwt_starttx(DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED) != DWT_SUCCESS) {
         release_radio();
-        twr_log("F none\n");
+        twr_log("F txfail\n");
         return;
     }
 
@@ -181,18 +181,30 @@ static void do_probe(uint32_t wire_id)
         DWT_INT_RXFCG_BIT_MASK | SYS_STATUS_ALL_RX_ERR,
         CAL_DIAG_PROBE_TIMEOUT_MS);
 
-    if (!(got & DWT_INT_RXFCG_BIT_MASK)) {
+    if (got == 0) {
         release_radio();
         twr_log("F none\n");
+        return;
+    }
+    if (!(got & DWT_INT_RXFCG_BIT_MASK)) {
+        release_radio();
+        twr_log("F err\n");
         return;
     }
     dwt_writesysstatuslo(DWT_INT_RXFCG_BIT_MASK);
 
     uint16_t flen = dwt_getframelength();
 
-    if (flen <= FCS_LEN || flen > RX_BUF_LEN) {
+    if (flen < ALL_MSG_COMMON_LEN + FCS_LEN) {
         release_radio();
-        twr_log("F none\n");
+        twr_log("F err\n");
+        return;
+    }
+    if (flen > RX_BUF_LEN) {
+        uint16_t plen = (uint16_t)(flen - FCS_LEN);
+
+        release_radio();
+        twr_log("F big %u\n", plen);
         return;
     }
     dwt_readrxdata(buf, flen, 0);
@@ -270,7 +282,9 @@ void cal_diag_on_rx(const uint8_t *data, uint16_t len)
         }
         req.kind = CAL_DIAG_LISTEN;
         req.arg  = ms;
-        (void)k_msgq_put(&cal_diag_q, &req, K_NO_WAIT);
+        if (k_msgq_put(&cal_diag_q, &req, K_NO_WAIT) != 0) {
+            twr_log("F busy\n");
+        }
         return;
     }
 
@@ -290,7 +304,9 @@ void cal_diag_on_rx(const uint8_t *data, uint16_t len)
         }
         req.kind = CAL_DIAG_PROBE;
         req.arg  = id;
-        (void)k_msgq_put(&cal_diag_q, &req, K_NO_WAIT);
+        if (k_msgq_put(&cal_diag_q, &req, K_NO_WAIT) != 0) {
+            twr_log("F busy\n");
+        }
         return;
     }
 }
