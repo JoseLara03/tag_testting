@@ -251,6 +251,87 @@ static void test_timeout_vs_yield_race(void)
 }
 
 /* =======================================================================
+ * (d) unmanaged mode: request() grants immediately with no runner present
+ * ======================================================================= */
+
+static void test_unmanaged_request_grants_immediately(void)
+{
+    uint64_t t0 = now_us();
+    bool ok = uwb_radio_request(K_SECONDS(5));
+    uint64_t elapsed_us = now_us() - t0;
+
+    CHECK(ok);
+    /* No yield ever happens in unmanaged mode; a real wait would burn most of
+     * the 5 s budget. 50 ms is generous for "instant" on a host machine. */
+    CHECK(elapsed_us < 50000u);
+    CHECK(uwb_radio_request_pending() == false);
+
+    uwb_radio_release();
+}
+
+/* =======================================================================
+ * (e) unmanaged mode: a second concurrent claim still fails
+ * ======================================================================= */
+
+static volatile int e_second_result;   /* -1 = not finished, 0 = false, 1 = true */
+
+static void *e_second_claimant(void *arg)
+{
+    (void)arg;
+    bool ok = uwb_radio_request(K_MSEC(200));
+    e_second_result = ok ? 1 : 0;
+    return NULL;
+}
+
+static void test_unmanaged_second_claim_fails(void)
+{
+    e_second_result = -1;
+
+    bool first_ok = uwb_radio_request(K_SECONDS(5));
+    CHECK(first_ok);
+
+    pthread_t th;
+    pthread_create(&th, NULL, e_second_claimant, NULL);
+    pthread_join(th, NULL);
+
+    CHECK(e_second_result == 0);   /* the contract holds: second claim fails */
+
+    uwb_radio_release();
+}
+
+/* =======================================================================
+ * (f) unmanaged mode: release() returns to idle so a later claim succeeds
+ * ======================================================================= */
+
+static void test_unmanaged_release_then_reclaim(void)
+{
+    CHECK(uwb_radio_request(K_SECONDS(5)));
+    uwb_radio_release();
+    CHECK(!uwb_radio_request_pending());
+
+    CHECK(uwb_radio_request(K_SECONDS(5)));
+    uwb_radio_release();
+}
+
+/* =======================================================================
+ * (g) unmanaged mode: yield() returns false and does not park
+ * ======================================================================= */
+
+static void test_unmanaged_yield_does_not_park(void)
+{
+    uint64_t t0 = now_us();
+    bool handed = uwb_radio_yield();
+    uint64_t elapsed_us = now_us() - t0;
+
+    CHECK(!handed);
+    /* Must return immediately: state is IDLE or HANDED here, never
+     * REQUESTED, so yield()'s "state != OWNER_REQUESTED" guard returns at
+     * once. A regression that fell into the K_FOREVER wait would hang the
+     * watchdog thread instead of failing this check quickly. */
+    CHECK(elapsed_us < 50000u);
+}
+
+/* =======================================================================
  * Watchdog
  *
  * The characteristic failure of this module is not a wrong answer, it is a
@@ -281,6 +362,13 @@ int main(void)
     test_request_blocks_until_yield();
     test_stray_release_is_inert();
     test_timeout_vs_yield_race();
+
+    uwb_radio_owner_set_unmanaged();
+
+    test_unmanaged_request_grants_immediately();
+    test_unmanaged_second_claim_fails();
+    test_unmanaged_release_then_reclaim();
+    test_unmanaged_yield_does_not_park();
 
     printf("uwb_radio_owner: %d failure(s)\n", fails);
     return fails == 0 ? 0 : 1;

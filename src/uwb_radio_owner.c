@@ -14,6 +14,12 @@ enum owner_state { OWNER_IDLE, OWNER_REQUESTED, OWNER_HANDED };
 static K_MUTEX_DEFINE(lock);
 static K_CONDVAR_DEFINE(cv);
 static enum owner_state state = OWNER_IDLE;
+static bool unmanaged;
+
+void uwb_radio_owner_set_unmanaged(void)
+{
+    unmanaged = true;
+}
 
 bool uwb_radio_request(k_timeout_t timeout)
 {
@@ -25,6 +31,15 @@ bool uwb_radio_request(k_timeout_t timeout)
          * the claim rather than corrupt the one in progress. */
         k_mutex_unlock(&lock);
         return false;
+    }
+
+    if (unmanaged) {
+        /* No runner will ever reach uwb_radio_yield() to grant this claim,
+         * so grant it immediately. The single-claimant contract above still
+         * applies -- a second concurrent claim still fails. */
+        state = OWNER_HANDED;
+        k_mutex_unlock(&lock);
+        return true;
     }
 
     state = OWNER_REQUESTED;

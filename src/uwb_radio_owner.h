@@ -60,4 +60,10 @@ bool uwb_radio_request_pending(void);
  * disturbed costs real airtime. */
 bool uwb_radio_yield(void);
 
+/* Declare that no MAC runner will ever offer the radio: this image has no
+ * runner thread, so a claim can be granted immediately instead of waiting for
+ * a yield that will never come. Call once from bring-up, before any claimant
+ * thread starts. */
+void uwb_radio_owner_set_unmanaged(void);
+
 #endif /* UWB_RADIO_OWNER_H_ */
