@@ -3,6 +3,9 @@
 #include "ble_log.h"
 #include "phy_config.h"   /* CONFIG_OPTION */
 #include "storage.h"
+#ifdef CONFIG_TAG_CAL_MODE
+#include "cal_led.h"
+#endif
 
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
@@ -32,6 +35,9 @@ void cal_set_last_result(const char *s)
 {
     strncpy(cal_last, s, sizeof(cal_last) - 1);
     cal_last[sizeof(cal_last) - 1] = '\0';
+#ifdef CONFIG_TAG_CAL_MODE
+    cal_led_on_result(cal_last);
+#endif
 }
 
 const char *cal_get_last_result(void)
