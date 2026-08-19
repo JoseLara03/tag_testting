@@ -18,6 +18,11 @@
 #include "wdt.h"
 #include "storage.h"
 #include "nfc_tag.h"
+#ifdef CONFIG_TAG_CAL_MODE
+#include "uwb_radio_owner.h"
+#include "cal_diag.h"
+#include "cal_led.h"
+#endif
 
 static const struct device *strip = DEVICE_DT_GET(DT_ALIAS(led_strip));
 
@@ -45,28 +50,41 @@ int main(void)
     if (uwb_init(3) == 0) {
         ble_log_send("Config OK\n");
 
+#ifndef CONFIG_TAG_CAL_MODE
         uint8_t eui[8];
         sys_put_le32(NRF_FICR->DEVICEID[0], &eui[0]);
         sys_put_le32(NRF_FICR->DEVICEID[1], &eui[4]);
+#endif
 
         if (cal_init()) {
             ble_log_send("CAL loaded\n");
         } else {
             ble_log_send("CAL REQUIRED\n");
         }
+#ifndef CONFIG_TAG_CAL_MODE
         if (nfc_tag_init() != 0) {
             ble_log_send("NFC fail\n");
         }
+#endif
         tag_cmd_init();
         rx_stats_reset();
+#ifdef CONFIG_TAG_CAL_MODE
+        uwb_radio_owner_set_unmanaged();
+#else
         tag_alert_init();
+#endif
         uwb_ss_initiator_start();
+#ifdef CONFIG_TAG_CAL_MODE
+        cal_diag_start();
+        cal_led_init(strip);
+#else
         uwb_net_runner_start(eui);
         if (motion_init() != 0) {
             ble_log_send("motion init fail\n");
         }
         tag_ui_init();
         batt_monitor_start();
+#endif
         tag_wdt_run_feeder();
     } else {
         /* Red: fatal DW3000 init failure — the only signal with no BLE. */
