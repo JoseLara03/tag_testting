@@ -4,16 +4,26 @@
 /* Design §6.1 defaults. Runtime-settable so the constants can be tuned on
  * hardware (against a measured LFCLK tolerance, see design §4.3) rather than
  * by reflashing. Indexed by uwb_tier_t: IDLE = 0, SLOW = 1, FAST = 2. */
+/* FAST is 1, not the design's 25. Measured on the bench: at a listen_skip of
+ * 25 the tag spends its participations on seat maintenance and emits nothing
+ * else -- keepalives on the air and no position fixes. UWB_NET_LEASE_SF is 50
+ * superframes renewed at half that, i.e. exactly 25, so a skip of 25 puts every
+ * renewal precisely on its own deadline: any jitter or single missed re-sync
+ * costs the seat, and the next participations go to JOIN/GRANT/keepalive rather
+ * than to ranging. FAST is the moving-and-active tier, where the fix rate is
+ * the whole point and the power saving is not; it re-syncs every superframe.
+ * SLOW and IDLE keep the design's values -- they are where the power is, and
+ * they are already clamped to UWB_LISTEN_SKIP_CAP on read. */
 static const struct uwb_tier_params tier_defaults[UWB_TIER_COUNT] = {
-    { 300u, 1u },   /* IDLE: 60 s re-sync */
-    {  75u, 1u },   /* SLOW: 15 s */
-    {  25u, 1u },   /* FAST:  5 s */
+    { 300u, 1u },   /* IDLE: capped to 25 -> 5 s re-sync */
+    {  75u, 1u },   /* SLOW: capped to 25 -> 5 s */
+    {   1u, 1u },   /* FAST: every superframe */
 };
 
 static struct uwb_tier_params tier_params[UWB_TIER_COUNT] = {
     { 300u, 1u },
     {  75u, 1u },
-    {  25u, 1u },
+    {   1u, 1u },
 };
 
 void uwb_net_reset_tier_params(void)
@@ -48,6 +58,51 @@ void uwb_net_get_tier_params(uwb_tier_t t, struct uwb_tier_params *out)
     if (out->range_every == 0u) {
         out->range_every = 1u;
     }
+}
+
+/* ---- sweep gate (see uwb_net.h) ---- */
+
+void uwb_sweep_gate_init(struct uwb_sweep_gate *g)
+{
+    if (g == NULL) {
+        return;
+    }
+    g->last_discover_ms = 0u;
+    g->last_sweep_n     = 0u;
+    g->ever_discovered  = false;
+}
+
+bool uwb_sweep_gate_rediscover_due(const struct uwb_sweep_gate *g,
+                                   uint32_t now_ms)
+{
+    if (g == NULL) {
+        return true;
+    }
+    /* Signed difference so the ms clock may wrap freely. */
+    return !g->ever_discovered
+           || ((int32_t)(now_ms - g->last_discover_ms)
+               >= (int32_t)UWB_NET_REDISCOVER_INTERVAL_MS)
+           || (g->last_sweep_n < UWB_NET_MIN_ANCHORS);
+}
+
+void uwb_sweep_gate_discovered(struct uwb_sweep_gate *g, uint32_t now_ms,
+                               uint8_t n_found)
+{
+    if (g == NULL) {
+        return;
+    }
+    g->last_discover_ms = now_ms;
+    g->ever_discovered  = true;
+    /* THE FIX. Without this the gate latches: see struct uwb_sweep_gate. */
+    g->last_sweep_n     = n_found;
+}
+
+void uwb_sweep_gate_swept(struct uwb_sweep_gate *g, uint8_t n_ranged)
+{
+    if (g == NULL) {
+        return;
+    }
+    g->last_sweep_n = n_ranged;
 }
 
 uwb_tier_t uwb_net_tier_filter(struct uwb_net_ctx *c, bool moving, uint32_t now_ms)

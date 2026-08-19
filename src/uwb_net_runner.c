@@ -60,11 +60,6 @@
 #define INTER_ANCHOR_DELAY_US        10U
 
 #define DISCOVERY_WINDOW_MS      15U   /* total RX collection window; covers anchor_id=3 (12.5 ms slot) */
-/* Periodic re-discovery, in wall-clock time rather than participations. It was
- * 10 superframes, which is 2 s at the old every-superframe cadence but becomes
- * ~10 minutes once the IDLE tier participates once a minute -- the anchor pool
- * would go stale exactly where the tag moves least often but matters most. */
-#define REDISCOVER_INTERVAL_MS 60000U
 
 /* Rung of the coverage ladder at and above which discovery is suppressed
  * entirely (design §5.3): run_discovery() broadcasts and then holds a 15 ms
@@ -74,7 +69,10 @@
 /* ---- Anchor-pool / CIR selection ---- */
 #define ANCHOR_POOL_MAX           6
 #define ANCHOR_SELECT_MAX         4
-#define ANCHOR_SELECT_MIN         3
+/* The minimum that makes a round "enough" is UWB_NET_MIN_ANCHORS (uwb_net.h),
+ * the same symbol the FSM compares n_anchors against. A private copy here is
+ * what let this file's sweep gate and the FSM disagree about whether the tag
+ * was making progress. */
 #define EMA_ALPHA              0.3f
 #define EMA_DECAY              0.5f
 #define CIR_QUALITY_WEIGHT     1.0f
@@ -89,9 +87,11 @@ typedef struct {
 static anchor_entry_t anchor_pool[ANCHOR_POOL_MAX];
 static uint8_t        selected[ANCHOR_SELECT_MAX];
 static uint8_t        n_selected;
-static uint32_t       last_discover_ms;
-static bool           ever_discovered;   /* force the first round regardless of clock */
-static uint8_t        last_sweep_n      = 0;
+/* Discover-vs-sweep decision and its state. Pure and host-tested in
+ * uwb_net.c/tests/uwb_net -- it used to be three file-scope variables and an
+ * inline condition here, and in that shape it latched the tag out of ranging
+ * for good after a single short sweep. See struct uwb_sweep_gate. */
+static struct uwb_sweep_gate sweep_gate;
 
 /* ---- Runner thread parameters ---- */
 #define RUNNER_PRIO    2
@@ -527,6 +527,7 @@ static void runner_fn(void *p1, void *p2, void *p3)
     beacon_track_reset(&bt, T_SUPERFRAME_MS, BT_GUARD_MS, BT_WARMUP_N, BT_EMA_SHIFT);
     beacon_sched_reset(&sched, T_SUPERFRAME_MS);
     scan_backoff_reset(&backoff);
+    uwb_sweep_gate_init(&sweep_gate);
     bool radio_asleep = false;   /* tracks whether the DW3000 is in deep sleep */
 
     /* DW3000 callbacks and timing — must be set before the loop.
@@ -906,9 +907,10 @@ static void runner_fn(void *p1, void *p2, void *p3)
 
         if (act & UWB_ACT_RUN_DISCOVER) {
             int n = run_discovery(ctx.short_addr);
-            last_discover_ms = uwb_radio_now_ms();
-            ever_discovered  = true;
-            last_sweep_n = (uint8_t)(n > 0 ? n : 0);   /* prime so next sweep isn't rediscover_due */
+
+            uwb_sweep_gate_discovered(&sweep_gate, uwb_radio_now_ms(),
+                                      (uint8_t)(n > 0 ? n : 0));
+
             struct uwb_net_event dev = {
                 .kind      = UWB_EV_DISCOVERED,
                 .n_anchors = (uint8_t)(n > 0 ? n : 0),
@@ -917,22 +919,24 @@ static void runner_fn(void *p1, void *p2, void *p3)
         }
 
         if (act & UWB_ACT_RUN_SWEEP) {
-            /* Wall-clock, not participations: at the IDLE tier a
-             * participation-counted interval of 10 would be ~10 minutes. */
-            bool rediscover_due = !ever_discovered
-                               || ((int32_t)(uwb_radio_now_ms() - last_discover_ms)
-                                   >= (int32_t)REDISCOVER_INTERVAL_MS)
-                               || (last_sweep_n < ANCHOR_SELECT_MIN);
-
-            if (rediscover_due) {
+            if (uwb_sweep_gate_rediscover_due(&sweep_gate, uwb_radio_now_ms())) {
                 /* Re-discovery replaces the sweep this cycle; no position fix.
                  * Do NOT send UWB_EV_DISCOVERED to the FSM — that event is only
-                 * valid in UWB_ST_DISCOVER state.  If selected[] is still < MIN
-                 * after this round, the next sweep returns n_anchors < 3 which
-                 * sends UWB_EV_SWEPT → FSM falls back to UWB_ST_DISCOVER naturally. */
-                run_discovery(ctx.short_addr);
-                last_discover_ms = uwb_radio_now_ms();
-                ever_discovered  = true;
+                 * valid in UWB_ST_DISCOVER state.
+                 *
+                 * Recording the round through the gate is load-bearing, not
+                 * bookkeeping. This branch used to update the timestamp only,
+                 * leaving the sweep count it is itself gated on untouched, so
+                 * once that count went short it stayed short: re-discovery every
+                 * superframe forever, no sweep, hence no UWB_EV_SWEPT, hence no
+                 * fall back to UWB_ST_DISCOVER, hence no way to refresh the
+                 * count. An earlier version of this comment claimed recovery
+                 * came through "the next sweep" returning n_anchors < 3 -- there
+                 * was no next sweep; this branch had already taken its place. */
+                int n = run_discovery(ctx.short_addr);
+
+                uwb_sweep_gate_discovered(&sweep_gate, uwb_radio_now_ms(),
+                                          (uint8_t)(n > 0 ? n : 0));
             } else {
                 /* Sleep until our CFP slot start. */
                 uint32_t slot_start = t0_ms
@@ -948,7 +952,8 @@ static void runner_fn(void *p1, void *p2, void *p3)
 
                 struct pos_meas meas[POS_MAX_ANCHORS];
                 int n = uwb_radio_sweep(meas, POS_MAX_ANCHORS);
-                last_sweep_n = (uint8_t)n;
+
+                uwb_sweep_gate_swept(&sweep_gate, (uint8_t)(n > 0 ? n : 0));
 
                 struct pos_result pos;
                 if (n >= 3 && pos_solve(meas, (size_t)n, &pos)) {

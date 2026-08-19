@@ -47,12 +47,59 @@ struct uwb_tier_params {
  * tag that sleeps for more than 25 superframes cannot renew its lease: it
  * loses its seat on every skip and pays a full JOIN + GRANT + re-discovery
  * cycle each time, which costs more than the skip saves. Until the gateway
- * sizes the lease from a declared skip factor, FAST (25) works against today's
- * gateway and SLOW/IDLE do not.
+ * sizes the lease from a declared skip factor, no tier's design value works
+ * against today's gateway: a skip of exactly 25 lands every renewal on its own
+ * deadline, and on the bench a tag at "pwr tier f 25 1" emitted keepalives and
+ * no position fixes at all. That is why the FAST default is 1 rather than the
+ * design's 25 -- see tier_defaults in uwb_net.c.
  *
  * Clamped on read, not on write, so lifting this cap is a one-line edit that
  * does not require rewriting any stored value. */
 #define UWB_LISTEN_SKIP_CAP  25u
+
+/* Wall-clock interval between forced re-discovery rounds, milliseconds. Was
+ * counted in participations, which becomes ~10 minutes once the IDLE tier
+ * participates once a minute -- the anchor pool would go stale exactly where
+ * the tag moves least and matters most. */
+#define UWB_NET_REDISCOVER_INTERVAL_MS  60000u
+
+/* Whether a participation must re-run discovery instead of sweeping, plus the
+ * state that decision reads.
+ *
+ * Pure and here rather than inline in uwb_net_runner.c because inline it
+ * LATCHED. The rediscover branch ran discovery but never refreshed the
+ * sweep count it was itself gated on, so one sweep that came back short --
+ * every anchor power-cycled, say -- left the tag re-discovering every
+ * superframe forever: no sweep, therefore no UWB_EV_SWEPT, therefore the FSM
+ * never fell back to UWB_ST_DISCOVER, therefore the only other writer of the
+ * count was unreachable. UWB_ST_RANGING became terminal and only a tag reboot
+ * cleared it. The runner's own comment described a recovery through
+ * UWB_EV_SWEPT that its control flow made impossible.
+ *
+ * The threshold is UWB_NET_MIN_ANCHORS, deliberately the same symbol the FSM
+ * compares n_anchors against: a private copy of "3" here is what let the gate
+ * and the FSM disagree about whether the tag was making progress. */
+struct uwb_sweep_gate {
+    uint32_t last_discover_ms;
+    uint8_t  last_sweep_n;
+    bool     ever_discovered;
+};
+
+/* Fresh state: the first participation always discovers. */
+void uwb_sweep_gate_init(struct uwb_sweep_gate *g);
+
+/* True if this participation should discover rather than sweep. Pure read. */
+bool uwb_sweep_gate_rediscover_due(const struct uwb_sweep_gate *g,
+                                   uint32_t now_ms);
+
+/* Record a discovery round that found n_found anchors. Refreshing the count
+ * here is what keeps the gate from latching: a round that finds enough anchors
+ * must let the very next participation sweep again. */
+void uwb_sweep_gate_discovered(struct uwb_sweep_gate *g, uint32_t now_ms,
+                               uint8_t n_found);
+
+/* Record a completed sweep that ranged n_ranged anchors. */
+void uwb_sweep_gate_swept(struct uwb_sweep_gate *g, uint8_t n_ranged);
 
 /* Set/get a tier's parameters. The getter always applies UWB_LISTEN_SKIP_CAP
  * and never returns a range_every of 0. An out-of-range tier reads back the

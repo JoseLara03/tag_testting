@@ -27,9 +27,10 @@ static void test_tier_params(void)
 
     uwb_net_reset_tier_params();
 
-    /* Design §6.1 defaults, seen through the cap. */
+    /* Defaults, seen through the cap. FAST is 1, deliberately not the design's
+     * 25: at 25 the tag only maintained its seat and never ranged. */
     uwb_net_get_tier_params(UWB_TIER_FAST, &p);
-    CHECK(p.listen_skip == 25u && p.range_every == 1u);
+    CHECK(p.listen_skip == 1u && p.range_every == 1u);
     uwb_net_get_tier_params(UWB_TIER_SLOW, &p);
     CHECK(p.listen_skip == UWB_LISTEN_SKIP_CAP);   /* stored 75, capped to 25 */
     CHECK(p.range_every == 1u);
@@ -515,6 +516,67 @@ static void test_send_alert(void)
     CHECK((uwb_net_gate_actions(UWB_ACT_SEND_ALERT, false) & UWB_ACT_SEND_ALERT) != 0);
 }
 
+/* The regression the sweep gate exists for.
+ *
+ * One sweep that comes back short must not latch the tag into re-discovering
+ * forever. The failure this reproduces was observed on hardware: after the
+ * anchors were power-cycled, three anchors answered every DISCOVERY with
+ * verdict "sent" and the tag still never emitted a single WAVE poll again
+ * until it was itself rebooted. */
+static void test_sweep_gate_recovers_after_short_sweep(void)
+{
+    struct uwb_sweep_gate g;
+    uint32_t now = 1000u;
+
+    uwb_sweep_gate_init(&g);
+
+    /* Nothing discovered yet: the first participation must discover. */
+    CHECK(uwb_sweep_gate_rediscover_due(&g, now));
+
+    /* Discovery finds enough anchors, so the next participation sweeps. */
+    uwb_sweep_gate_discovered(&g, now, UWB_NET_MIN_ANCHORS);
+    CHECK(!uwb_sweep_gate_rediscover_due(&g, now));
+
+    /* The anchors are power-cycled and the sweep ranges nobody. */
+    uwb_sweep_gate_swept(&g, 0u);
+    CHECK(uwb_sweep_gate_rediscover_due(&g, now));
+
+    /* The anchors are back and discovery sees all of them again. The very next
+     * participation must sweep. This is the assertion the latch failed: the
+     * rediscover branch refreshed neither the count it was gated on nor any
+     * path back to it. */
+    now += 200u;
+    uwb_sweep_gate_discovered(&g, now, UWB_NET_MIN_ANCHORS);
+    CHECK(!uwb_sweep_gate_rediscover_due(&g, now));
+
+    /* ...and a round that still finds too few must keep re-discovering, so the
+     * fix is not simply "always sweep after a discovery". */
+    uwb_sweep_gate_swept(&g, 0u);
+    now += 200u;
+    uwb_sweep_gate_discovered(&g, now, UWB_NET_MIN_ANCHORS - 1u);
+    CHECK(uwb_sweep_gate_rediscover_due(&g, now));
+}
+
+/* The periodic refresh, and that its arithmetic survives the ms-clock wrap. */
+static void test_sweep_gate_interval(void)
+{
+    struct uwb_sweep_gate g;
+
+    uwb_sweep_gate_init(&g);
+    uwb_sweep_gate_discovered(&g, 0u, UWB_NET_MIN_ANCHORS);
+    uwb_sweep_gate_swept(&g, UWB_NET_MIN_ANCHORS);
+    CHECK(!uwb_sweep_gate_rediscover_due(&g, UWB_NET_REDISCOVER_INTERVAL_MS - 1u));
+    CHECK(uwb_sweep_gate_rediscover_due(&g, UWB_NET_REDISCOVER_INTERVAL_MS));
+
+    /* Signed difference: 0xFFFFFF00 + 512 wraps to 0x100. */
+    uwb_sweep_gate_init(&g);
+    uwb_sweep_gate_discovered(&g, 0xFFFFFF00u, UWB_NET_MIN_ANCHORS);
+    uwb_sweep_gate_swept(&g, UWB_NET_MIN_ANCHORS);
+    CHECK(!uwb_sweep_gate_rediscover_due(&g, 0x00000100u));
+    CHECK(uwb_sweep_gate_rediscover_due(&g,
+              0x00000100u + UWB_NET_REDISCOVER_INTERVAL_MS));
+}
+
 int main(void)
 {
     test_proto_ver_matches_frame_module();
@@ -529,6 +591,8 @@ int main(void)
     test_lease_ages_by_elapsed();
     test_gate_actions();
     test_send_alert();
+    test_sweep_gate_recovers_after_short_sweep();
+    test_sweep_gate_interval();
     printf(g_fail ? "FAILED %d\n" : "OK\n", g_fail);
     return g_fail ? 1 : 0;
 }
