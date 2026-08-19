@@ -38,6 +38,17 @@ int main(void)
         return 0;
     }
 
+#ifdef CONFIG_TAG_CAL_MODE
+    /* The cal image starts neither tag_ui_init() (button) nor nfc_tag_init()
+     * (NFC), which are the production image's only two ways to open the 60 s
+     * advertising window -- and the `pwr adv on` NUS command that would also
+     * force it is itself unreachable without an existing connection. With no
+     * trigger at all, ble_log_init()'s "no advertising at boot" default would
+     * leave this image permanently invisible. Force continuous advertising
+     * for the whole bench session instead. */
+    ble_log_adv_force(true);
+#endif
+
     ble_log_set_state_cb(batt_on_ble_state);
     if (storage_init() != 0) {
         ble_log_send("STOR fail\n");

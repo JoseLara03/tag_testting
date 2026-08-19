@@ -230,8 +230,11 @@ What changes vs. production, all behind `#ifdef CONFIG_TAG_CAL_MODE` in `main.c`
 | `tag_ui_init()` | yes | **no** — replaced by `cal_led_init(strip)` |
 | `uwb_radio_owner_set_unmanaged()` | no | **yes**, called before `uwb_ss_initiator_start()` |
 | `cal_diag_start()` | no | **yes** |
+| `ble_log_adv_force(true)` | no | **yes**, called right after `ble_log_init()` |
 
 `tag_wdt_start_boot_guard()`/`tag_wdt_run_feeder()` need no `main.c` guard at all: `wdt.c` already compiles the boot-guard watchdog out under `CONFIG_TASK_WDT=n`, which `cal.conf` sets, so both calls are inert automatically — the same mechanism `debug.conf` already relies on.
+
+**The cal image must force continuous BLE advertising — it has no other way to become visible.** `ble_log_init()` deliberately starts no advertising at boot; the production image's only triggers for the 60 s `ble_log_adv_window()` are a button press (`tag_ui_init()`) and an NFC field (`nfc_tag_init()`), and both are excluded from the cal image. `pwr adv on` doesn't help either — it only arrives over an existing NUS connection. Without `ble_log_adv_force(true)`, the cal image builds and flashes cleanly but never appears in a BLE scan, with no error anywhere to point at.
 
 **Radio ownership without a runner:** `run_calibration()` (`uwb_ss_initiator.c`) opens with `uwb_radio_request(CAL_RADIO_WAIT)`, and the grant normally comes from the runner reaching `uwb_radio_yield()` once per superframe. With no runner thread, that yield would never come. `uwb_radio_owner_set_unmanaged()` (`src/uwb_radio_owner.{c,h}`) makes `uwb_radio_request()` grant immediately from `OWNER_IDLE` when unmanaged, instead of waiting on a yield that will never arrive — the single-claimant contract (a second concurrent claim still fails) is unaffected, and `uwb_radio_yield()` correctly never parks because the state is never `OWNER_REQUESTED` in this mode. Host-tested in `tests/uwb_radio_owner/` (4 unmanaged-mode cases, on top of the 3 pre-existing managed-mode races).
 
