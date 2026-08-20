@@ -53,6 +53,12 @@
  * runaway loop rather than something that can truncate a healthy run and make
  * it look like "no-resp". */
 #define CAL_ITER_BUDGET_MS    5000U
+/* TEMPORARY, for the rate-dependence experiment below: at the widened
+ * inter-sample gap, one iteration now legitimately takes up to ~100*310ms =
+ * 31s, which the normal 5s budget would truncate to ~16 samples (a false
+ * "no-resp" fail, not a real one). Remove alongside the gap widening once the
+ * experiment concludes either way. */
+#define CAL_ITER_BUDGET_MS_TEST  40000U
 
 /* samples[] is CAL_MAX_SAMPLES long and one iteration can fill one entry per
  * pass, so the per-iteration count must never exceed it. Caught at compile
@@ -392,7 +398,17 @@ static void run_calibration_locked(uint32_t ref_mm)
 
     uint16_t tx, rx;
     /* Seed from the active value if valid, else the factory reference. */
+    /* TEMPORARY diagnostic: `cal status` reporting "CAL REQUIRED" right
+     * before this run means cal_is_valid() was false at that instant, and
+     * active_total_seed()'s fallback (TX_ANT_DLY+RX_ANT_DLY=32742) cannot
+     * evaluate to 0 -- so if `v` prints 0 and `t` still prints 0 here, the
+     * bug is upstream of this function entirely (stale binary, or something
+     * clobbering the factory constants); if `v` prints 1, cal_is_valid()
+     * flipped back to true between the status check and this run. Remove
+     * once resolved. */
+    bool cal_valid_at_seed = cal_is_valid();
     uint16_t total = active_total_seed();
+    twr_log("SEED v=%u t=%u\n", (unsigned)cal_valid_at_seed, total);
     apply_total_dly(total, &tx, &rx);
 
     for (uint32_t it = 0; it < CAL_MAX_ITERS; it++) {
@@ -404,7 +420,7 @@ static void run_calibration_locked(uint32_t ref_mm)
          * the run spun forever. A deadline cannot be defeated by a bad counter
          * register, so this turns any recurrence into a reported failure rather
          * than a hang. */
-        uint32_t t_end = k_uptime_get_32() + CAL_ITER_BUDGET_MS;
+        uint32_t t_end = k_uptime_get_32() + CAL_ITER_BUDGET_MS_TEST;
 
         for (uint32_t i = 0; i < CAL_SAMPLES_PER_ITER; i++) {
             if ((int32_t)(t_end - k_uptime_get_32()) <= 0) {
@@ -432,7 +448,22 @@ static void run_calibration_locked(uint32_t ref_mm)
             if (do_one_range(&mm) && got < CAL_MAX_SAMPLES) {
                 samples[got++] = mm;
             }
-            k_sleep(K_MSEC(5));
+            /* TEMPORARY rate-dependence experiment: production ranging
+             * (do_one_range_anchor via uwb_net_runner) shares this exact
+             * wait_event()/dwt_isr() path and does not corrupt anything, but
+             * it exchanges once every few hundred ms to seconds -- nothing
+             * like calibration's ~100 back-to-back exchanges a few ms apart.
+             * Widening the gap to roughly production's spacing tests whether
+             * the corruption is rate-dependent (a settling window between
+             * exchanges that calibration's tight loop never gives the
+             * previous IRQ/SPI cycle) rather than a straightforward logic
+             * bug in code both paths share equally. Every 10 samples is
+             * cheap to print at this rate. Remove once the experiment
+             * concludes either way. */
+            if (it == 0 && (i % 10) == 0) {
+                twr_log("T1.%u=%u\n", i, total);
+            }
+            k_sleep(K_MSEC(300));
         }
 
         int32_t mean;
@@ -446,6 +477,14 @@ static void run_calibration_locked(uint32_t ref_mm)
 
         int32_t err = mean - (int32_t)ref_mm;
         int32_t abserr = (err < 0) ? -err : err;
+        /* TEMPORARY diagnostic for the odd/even alternating-error bug under
+         * investigation: D is the total antenna delay actually applied while
+         * THIS iteration's 100 samples were collected (not the correction
+         * about to be computed from them), K is how many of those samples
+         * survived cal_filtered_mean()'s outlier rejection. Remove once the
+         * bug is understood, per CLAUDE.md's convention for this class of
+         * probe (Open Work item 1). */
+        twr_log("IT%u D=%u K=%u\n", it + 1, total, (unsigned)kept);
         twr_log("CAL it%u e=%dmm\n", it + 1, err);
 
         if (abserr <= CAL_ACCEPT_MM) {
