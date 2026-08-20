@@ -14,6 +14,7 @@
 #include "uwb_radio_owner.h"
 #include "uwb_ss_initiator.h"   /* twr_log() */
 #include "cal.h"                /* cal_is_valid(), cal_get_ant_dly() */
+#include "cal_math.h"           /* cal_split_dly() -- TEMPORARY probe-delay-override diagnostic */
 #include "phy_config.h"         /* TX_ANT_DLY / RX_ANT_DLY fallback */
 #include "deca_device_api.h"
 
@@ -166,13 +167,34 @@ static void do_listen(uint32_t ms)
     twr_log("LSN n=%u e=%u\n", n, errors);
 }
 
-static void do_probe(uint32_t wire_id)
+/* TEMPORARY diagnostic: `cal probe <n>` for n in 5..65000 overrides the
+ * antenna delay for this ONE probe (still unaddressed -- wire_id stays 0),
+ * applied via a completely fresh claim_radio(), the same clean-start path
+ * that has given consistent, correct results every time so far. n in 1..4
+ * keeps its existing meaning (addressed probe to that anchor id). Point:
+ * isolate whether a freshly re-claimed radio at cal <mm>'s post-correction
+ * delay (e.g. 31692) behaves differently than cal_run.c's mid-session
+ * re-application (already tried, no change) -- i.e. is "more reset" the
+ * fix, or is antenna-delay-mid-session simply not the mechanism at all.
+ * Remove once answered either way. */
+static void do_probe(uint32_t param)
 {
     uint8_t buf[RX_BUF_LEN];
+    bool override_delay = (param > 4);
+    uint32_t wire_id = override_delay ? 0 : param;
 
     if (!claim_radio()) {
         twr_log("F busy\n");
         return;
+    }
+
+    if (override_delay) {
+        uint16_t tx, rx;
+
+        dwt_forcetrxoff();
+        cal_split_dly((uint16_t)param, &tx, &rx);
+        dwt_settxantennadelay(tx);
+        dwt_setrxantennadelay(rx);
     }
 
     if (wire_id == 0) {
@@ -352,7 +374,10 @@ void cal_diag_on_rx(const uint8_t *data, uint16_t len)
         uint32_t id = 0;
 
         if (*arg != '\0') {
-            if (!parse_u32(arg, &id) || id < 1 || id > 4) {
+            /* 1..4 is an anchor id (existing meaning). >4, up to
+             * CAL_MAX_TOTAL_DLY, is a TEMPORARY antenna-delay override for
+             * a fresh-claim unaddressed probe -- see do_probe(). */
+            if (!parse_u32(arg, &id) || id < 1 || id > CAL_MAX_TOTAL_DLY) {
                 twr_log("CAL ERR probe id\n");
                 return;
             }
