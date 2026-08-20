@@ -51,10 +51,14 @@ void uwb_set_moving(bool moving);
 
 /* Minimum bytes ever left unused on the SS-TWR thread stack, as a high-water
  * mark. Calibration no longer runs on this thread (see
- * src/cal_run.c and docs/superpowers/specs/2026-08-20-cal-image-rewrite-design.md);
- * this now covers only production ranging setup and do_one_range_anchor()'s
- * call chain. Requires CONFIG_INIT_STACKS; returns 0 when unavailable. Read
- * over NUS with `stack`. */
+ * src/cal_run.c and docs/superpowers/specs/2026-08-20-cal-image-rewrite-design.md).
+ * After that rewrite, ss_twr_fn() does one-time DW3000 setup and then blocks
+ * forever on k_sleep(K_FOREVER) -- it never calls do_one_range_anchor() itself.
+ * So this high-water mark covers only that one-time setup path, on a thread
+ * that then sleeps forever; it does NOT cover do_one_range_anchor()'s call
+ * chain, which runs on the runner thread in src/uwb_net_runner.c instead.
+ * That thread currently has no equivalent `stack`-style diagnostic. Requires
+ * CONFIG_INIT_STACKS; returns 0 when unavailable. Read over NUS with `stack`. */
 size_t uwb_ss_stack_unused(void);
 
 /* Same, for the BLE sender thread. Only 512 bytes and it calls straight into

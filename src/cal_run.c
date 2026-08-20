@@ -19,6 +19,11 @@
 #include <stdio.h>
 #include <stdarg.h>
 
+/* Written by the "calrun" thread (cal_run_verdict()/cal_set_last_result())
+ * as it produces verdicts, read by the BT RX thread (cal_get_last_result(),
+ * from cal_run_on_rx() servicing `cal last`). No lock: the worst a race can
+ * produce is a torn diagnostic line, which is not worth a lock for a
+ * human-read status string. */
 #define CAL_LAST_LEN 20
 static char cal_last[CAL_LAST_LEN] = "CAL none\n";
 
@@ -134,14 +139,19 @@ static bool cal_range_poll(int32_t *out_mm)
     }
 
     uint32_t got = cal_run_wait_any_sysstatus_lo(
-        DWT_INT_RXFCG_BIT_MASK | SYS_STATUS_ALL_RX_ERR, CAL_RANGE_POLL_TIMEOUT_MS);
+        DWT_INT_RXFCG_BIT_MASK | SYS_STATUS_ALL_RX_ERR | SYS_STATUS_ALL_RX_TO,
+        CAL_RANGE_POLL_TIMEOUT_MS);
 
     if (got == 0) {
-        return false;   /* timeout */
+        return false;   /* software timeout -- no hardware status bit latched */
     }
     if (!(got & DWT_INT_RXFCG_BIT_MASK)) {
-        dwt_writesysstatuslo(SYS_STATUS_ALL_RX_ERR);
-        return false;   /* RX error */
+        /* RX error or the hardware RX timeout armed by cal_run_claim_radio()
+         * (dwt_setrxtimeout()/dwt_setpreambledetecttimeout()) -- either can
+         * latch a status bit, so clear both rather than assuming which one
+         * fired. */
+        dwt_writesysstatuslo(SYS_STATUS_ALL_RX_ERR | SYS_STATUS_ALL_RX_TO);
+        return false;   /* RX error or RX timeout */
     }
     dwt_writesysstatuslo(DWT_INT_RXFCG_BIT_MASK);
 
@@ -211,8 +221,8 @@ static bool cal_run_claim_radio(void)
     return true;
 }
 
-/* Restores the antenna delay per the uwb_radio_owner.h handover contract
- * before releasing, mirroring cal_diag.c's release_radio(). */
+/* Restores all five PHY-state items per the uwb_radio_owner.h handover
+ * contract before releasing, mirroring cal_diag.c's release_radio(). */
 static void cal_run_release_radio(void)
 {
     uint16_t tx, rx;
@@ -220,6 +230,9 @@ static void cal_run_release_radio(void)
     dwt_forcetrxoff();
     dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
 
+    dwt_setrxaftertxdelay(POLL_TX_TO_RESP_RX_DLY_UUS);
+    dwt_setrxtimeout(RESP_RX_TIMEOUT_UUS);
+    dwt_setpreambledetecttimeout(PRE_TIMEOUT);
     if (cal_is_valid()) {
         cal_get_ant_dly(&tx, &rx);
     } else {
@@ -308,6 +321,11 @@ static void cal_run_execute(uint32_t ref_mm)
         enum cal_run_verdict v = cal_run_iteration_result(
             samples, got, CAL_SAMPLES_PER_ITER, (int32_t)ref_mm, total,
             &err, &kept, &new_total);
+        /* kept is captured by the shared decision function but not
+         * currently logged -- the per-iteration IT%u D=... K=... line that
+         * used to consume it was deliberately removed as a debugging-only
+         * diagnostic earlier in this rewrite. */
+        (void)kept;
 
         if (v == CAL_RUN_NO_RESP) {
             cal_run_verdict("CAL FAIL no-resp\n");
@@ -331,6 +349,13 @@ static void cal_run_execute(uint32_t ref_mm)
     }
     cal_run_verdict("CAL FAIL res\n");
 }
+
+/* Set before cal_run_run() starts work and cleared when it returns. cal_run_q
+ * has depth 1 and the thread dequeues almost instantly, so a second `cal
+ * <mm>` arriving while a run is in progress usually finds an empty queue --
+ * this flag is what actually rejects it, checked in cal_run_on_rx() before
+ * enqueueing. */
+static volatile bool cal_run_busy;
 
 static void cal_run_run(uint32_t ref_mm)
 {
@@ -368,7 +393,9 @@ static void cal_run_fn(void *p1, void *p2, void *p3)
 
     while (1) {
         k_msgq_get(&cal_run_q, &req, K_FOREVER);
+        cal_run_busy = true;
         cal_run_run(req.ref_mm);
+        cal_run_busy = false;
     }
 }
 
@@ -421,6 +448,10 @@ void cal_run_on_rx(const uint8_t *data, uint16_t len)
         if (cal_run_parse_u32(buf + 4, &mm) && mm > 0) {
             struct cal_run_req req = { .ref_mm = mm };
 
+            if (cal_run_busy) {
+                ble_log_send("CAL FAIL busy\n");
+                return;
+            }
             if (k_msgq_put(&cal_run_q, &req, K_NO_WAIT) == 0) {
                 cal_set_last_result("CAL running\n");
                 ble_log_send("CAL start\n");

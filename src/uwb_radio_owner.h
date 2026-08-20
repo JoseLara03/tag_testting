@@ -7,11 +7,22 @@
 /*
  * Explicit handover of the DW3000 between the MAC runner and a claimant.
  *
- * The runner and the calibration thread share one interrupt line and one event
- * semaphore through wait_event(), which is destructive under concurrency: it
- * opens with k_sem_reset() and closes with a global port_DisableEXT_IRQ(). That
- * code is correct as long as exactly one thread drives the radio at a time,
- * which this module guarantees for callers that follow the contract below.
+ * This module exists to enforce the single-claimant PHY-state handover
+ * contract below: dwt_setrxaftertxdelay/dwt_setrxtimeout/
+ * dwt_setpreambledetecttimeout/dwt_settxantennadelay/dwt_setrxantennadelay
+ * are shared, mutable DW3000 state, and two threads driving them
+ * concurrently would corrupt each other's ranging. This module guarantees
+ * exactly one thread drives the radio at a time for callers that follow the
+ * contract below.
+ *
+ * Historically this also protected wait_event()'s shared interrupt line and
+ * event semaphore (opened with k_sem_reset(), closed with a global
+ * port_DisableEXT_IRQ()) between the runner and the calibration thread. The
+ * calibration engine (src/cal_run.c) no longer calls wait_event() at all --
+ * it polls SYS_STATUS_LO directly and never enables the DW3000 IRQ. That
+ * sharing now applies only between the runner and do_one_range_anchor()
+ * (production ranging), not calibration -- but the PHY-state handover
+ * contract above is still the real reason this module is needed.
  *
  * Single-claimant contract: at most one claimant thread may hold an
  * outstanding uwb_radio_request() at a time. A second, concurrent

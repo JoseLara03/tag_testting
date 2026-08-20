@@ -67,5 +67,42 @@ int cal_run_math_selftest(void)
         }
     }
 
+    /* Boundary: abserr == CAL_ACCEPT_MM must still be CAL_RUN_CONVERGED. */
+    int32_t at_bound[10];
+    for (int i = 0; i < 10; i++) {
+        at_bound[i] = 2000 + CAL_ACCEPT_MM;
+    }
+    if (cal_run_iteration_result(at_bound, 10, 10, 2000, 32742, &err, &kept, &new_total)
+        != CAL_RUN_CONVERGED) {
+        fails++;
+    }
+
+    /* Boundary: abserr == CAL_ACCEPT_MM + 1 must be CAL_RUN_CONTINUE. */
+    int32_t past_bound[10];
+    for (int i = 0; i < 10; i++) {
+        past_bound[i] = 2000 + CAL_ACCEPT_MM + 1;
+    }
+    if (cal_run_iteration_result(past_bound, 10, 10, 2000, 32742, &err, &kept, &new_total)
+        != CAL_RUN_CONTINUE) {
+        fails++;
+    }
+
+    /* Boundary: got == samples_per_iter/4 must NOT be CAL_RUN_NO_RESP --
+     * the check is `got < samples_per_iter/4`. */
+    int32_t got_bound[25];
+    for (int i = 0; i < 25; i++) {
+        got_bound[i] = 2000;
+    }
+    if (cal_run_iteration_result(got_bound, 25, 100, 2000, 32742, &err, &kept, &new_total)
+        == CAL_RUN_NO_RESP) {
+        fails++;
+    }
+
+    /* Boundary: got one below samples_per_iter/4 must be CAL_RUN_NO_RESP. */
+    if (cal_run_iteration_result(got_bound, 24, 100, 2000, 32742, &err, &kept, &new_total)
+        != CAL_RUN_NO_RESP) {
+        fails++;
+    }
+
     return fails;
 }

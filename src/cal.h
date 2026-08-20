@@ -31,9 +31,9 @@ void cal_on_rx(const uint8_t *data, uint16_t len);
  *
  * `active`/`active_valid` are owned here so cal_is_valid()/cal_get_ant_dly()
  * always see a consistent value; cal_run.c calls these instead of touching
- * the state directly. Harmless to declare unconditionally -- nothing in a
- * production image calls them, and their definitions live only in
- * cal_run.c, which is absent from a production build's object files. */
+ * the state directly. Harmless to declare unconditionally -- declared here,
+ * defined in cal.c (present in every build), and the only caller is
+ * cal_run.c, which no production build compiles. */
 void cal_internal_activate(const struct cal_record *r);
 void cal_internal_invalidate(void);
 

@@ -1,7 +1,6 @@
 #include "../../src/cal_run_math.h"
 #include "../../src/cal_math.h"
 #include <stdio.h>
-#include <string.h>
 
 int main(void)
 {

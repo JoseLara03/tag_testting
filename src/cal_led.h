@@ -15,7 +15,7 @@
 void cal_led_init(const struct device *strip);
 
 /* Called from cal_set_last_result() with the verdict string just latched.
- * Recognises the fixed set of prefixes cal.c/uwb_ss_initiator.c produce
+ * Recognises the fixed set of prefixes cal_run.c produces
  * ("CAL running", "CAL OK...", "CAL FAIL...") and drives the LED
  * accordingly; any other latched string (e.g. "CAL none", a `cal status`
  * echo) leaves the LED as it was. */
