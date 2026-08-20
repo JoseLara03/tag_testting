@@ -248,20 +248,28 @@ static void cal_run_release_radio(void)
 /* Re-arm the radio to exactly the same state cal_run_claim_radio() /
  * cal_diag.c's claim_radio() put it in at claim time, before writing a new
  * antenna delay -- not just dwt_forcetrxoff() (tried, insufficient on its
- * own; confirmed on hardware via `cal probe <delay>`, which re-claims the
- * radio via this same sequence and reads back correct, physically
- * consistent distances at every delay tested, while this function's old
- * forcetrxoff()-only version still produced ~70 m-equivalent errors from
- * iteration 2 onward). The missing pieces were the sticky RX-timeout/
- * RX-error status bits and the interrupt mask: after ~100 back-to-back
- * exchanges in one iteration, something left in either evidently corrupts
- * the next exchange's timestamp/clock-offset reads even though the antenna
- * delay registers themselves were written correctly. */
+ * own). forcetrxoff() plus clearing the sticky RX-timeout/RX-error status
+ * bits plus re-masking interrupts (tried next, still insufficient) were
+ * still missing three timing registers claim time sets and this function
+ * never re-asserted: dwt_setrxaftertxdelay/dwt_setrxtimeout/
+ * dwt_setpreambledetecttimeout. Those are configured ONCE at claim time and
+ * never touched again across a whole run's ~400 exchanges. `cal probe`
+ * never exercises this gap -- it only ever does one exchange per fresh
+ * claim -- but iteration 1 alone hits a great many RX-timeout events (the
+ * link fails roughly half the time even at rest, confirmed via `cal
+ * probe`), and if any of these three doesn't reliably survive that many
+ * timeout/re-arm cycles, a later exchange can end up with a stale or
+ * unbounded RX window and catch the wrong frame entirely -- a plausible
+ * header match paired with garbage timestamps. Now re-asserting all three
+ * alongside the antenna delay, matching claim-time state exactly. */
 static void cal_run_apply_total_dly(uint16_t total, uint16_t *tx, uint16_t *rx)
 {
     dwt_forcetrxoff();
     dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
     dwt_setinterrupt(0xFFFFFFFFU, 0xFFFFFFFFU, DWT_DISABLE_INT);
+    dwt_setrxaftertxdelay(POLL_TX_TO_RESP_RX_DLY_UUS);
+    dwt_setrxtimeout(RESP_RX_TIMEOUT_UUS);
+    dwt_setpreambledetecttimeout(PRE_TIMEOUT);
     cal_split_dly(total, tx, rx);
     dwt_settxantennadelay(*tx);
     dwt_setrxantennadelay(*rx);
