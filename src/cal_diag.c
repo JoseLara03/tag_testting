@@ -28,6 +28,12 @@
 #define RESP_RX_TIMEOUT_UUS         2000U
 #define PRE_TIMEOUT                  128U
 
+/* Mirrors cal_run.c's SPEED_OF_LIGHT -- used only by the `cal probe`
+ * distance calculation below, so it can be compared directly against a
+ * `cal <mm>` run's per-sample math without any of that loop's averaging,
+ * outlier rejection, or iteration in the way. */
+#define SPEED_OF_LIGHT   299702547.0
+
 #define CAL_DIAG_RADIO_WAIT         K_SECONDS(2)
 #define CAL_DIAG_LISTEN_DEFAULT_MS  3000U
 #define CAL_DIAG_LISTEN_MAX_MS     10000U
@@ -88,6 +94,21 @@ static void release_radio(void)
     dwt_setrxantennadelay(rx);
 
     uwb_radio_release();
+}
+
+/* Little-endian 4-byte timestamp field reader, matching cal_run.c's
+ * cal_run_get_ts_4b() -- duplicated rather than shared for the same reason
+ * cal_run.c duplicates wait_any_sysstatus_lo() from this file: both are a
+ * few lines, and there is no shared header between these two cal-image-only
+ * siblings for helpers this small. */
+static uint32_t get_ts_4b(const uint8_t *b)
+{
+    uint32_t ts = 0;
+
+    for (int i = 0; i < 4; i++) {
+        ts |= (uint32_t)b[i] << (i * 8);
+    }
+    return ts;
 }
 
 /* Bounded wait for ANY bit in mask, polling SYS_STATUS_LO. Returns the
@@ -215,8 +236,42 @@ static void do_probe(uint32_t wire_id)
     uint8_t  type_byte   = buf[TYPE_BYTE_IDX];
     uint16_t plen        = (uint16_t)(flen - FCS_LEN);
 
+    /* Corrected distance, wire_id==0 (non-addressed calibration frame) only:
+     * the exact same clock-offset-corrected ToF formula cal_range_poll()
+     * uses in cal_run.c, applied to this single isolated exchange. Lets an
+     * operator compare one clean sample directly against a `cal <mm>` run's
+     * per-iteration error, with none of that loop's averaging, outlier
+     * rejection, or antenna-delay correction between samples. Not computed
+     * for an addressed (anchor) probe -- that is not the frame `cal <mm>`
+     * uses, so it is out of scope for this comparison. */
+    bool    have_dist = false;
+    int32_t dist_mm   = 0;
+
+    if (wire_id == 0 && flen >= UWB_WAVE_RESP_RESP_TX_TS_IDX + 4 + FCS_LEN) {
+        uint32_t poll_rx_ts = get_ts_4b(&buf[UWB_WAVE_RESP_POLL_RX_TS_IDX]);
+        uint32_t resp_tx_ts = get_ts_4b(&buf[UWB_WAVE_RESP_RESP_TX_TS_IDX]);
+        double   clock_offset_ratio =
+            ((double)dwt_readclockoffset()) / (uint32_t)(1 << 26);
+
+        int32_t rtd_init = (int32_t)(resp_rx_ts - poll_tx_ts);
+        int32_t rtd_resp = (int32_t)(resp_tx_ts - poll_rx_ts);
+
+        double tof = ((rtd_init - rtd_resp * (1 - clock_offset_ratio)) / 2.0)
+                     * DWT_TIME_UNITS;
+        dist_mm = (int32_t)(tof * SPEED_OF_LIGHT * 1000.0);
+        have_dist = true;
+    }
+
     release_radio();
     twr_log("F t=%u %02X %u\n", rtt_uus, type_byte, plen);
+    if (have_dist) {
+        /* Separate line: "F t=... %02X ..." plus a distance field would
+         * exceed the 20-byte NUS limit and twr_log()'s TWR_MSG_LEN, and
+         * that limit truncates silently -- see CLAUDE.md's NUS-payload
+         * hard-won fact. Keeping this on its own line is what keeps both
+         * readable. */
+        twr_log("F d=%dmm\n", dist_mm);
+    }
 }
 
 static void cal_diag_fn(void *p1, void *p2, void *p3)
