@@ -245,20 +245,23 @@ static void cal_run_release_radio(void)
     uwb_radio_release();
 }
 
-/* TEMPORARY diagnostic: force the radio idle before every antenna-delay
- * write, not just the first one at claim time. The seed application (before
- * the sampling loop) already runs right after cal_run_claim_radio()'s own
- * dwt_forcetrxoff(), so this changes nothing there -- but the between-
- * iterations re-application previously ran with no reset since the last of
- * ~100 back-to-back TX/RX cycles, mid-session. Testing whether that's why a
- * routine ~1050-unit (~2.4 m-equivalent) correction between iteration 1 and
- * 2 was producing a ~77 m swing in the reported distance -- a magnitude
- * that matches a known DW3000 antenna-delay-not-fully-applied class of bug
- * in the sibling ANCLA project. Remove this comment (keep the call) once
- * confirmed, or revert both if it doesn't change the symptom. */
+/* Re-arm the radio to exactly the same state cal_run_claim_radio() /
+ * cal_diag.c's claim_radio() put it in at claim time, before writing a new
+ * antenna delay -- not just dwt_forcetrxoff() (tried, insufficient on its
+ * own; confirmed on hardware via `cal probe <delay>`, which re-claims the
+ * radio via this same sequence and reads back correct, physically
+ * consistent distances at every delay tested, while this function's old
+ * forcetrxoff()-only version still produced ~70 m-equivalent errors from
+ * iteration 2 onward). The missing pieces were the sticky RX-timeout/
+ * RX-error status bits and the interrupt mask: after ~100 back-to-back
+ * exchanges in one iteration, something left in either evidently corrupts
+ * the next exchange's timestamp/clock-offset reads even though the antenna
+ * delay registers themselves were written correctly. */
 static void cal_run_apply_total_dly(uint16_t total, uint16_t *tx, uint16_t *rx)
 {
     dwt_forcetrxoff();
+    dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+    dwt_setinterrupt(0xFFFFFFFFU, 0xFFFFFFFFU, DWT_DISABLE_INT);
     cal_split_dly(total, tx, rx);
     dwt_settxantennadelay(*tx);
     dwt_setrxantennadelay(*rx);
