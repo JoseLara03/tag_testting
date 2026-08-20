@@ -1,112 +1,15 @@
 #include "cal.h"
 #include "cal_math.h"
 #include "ble_log.h"
-#include "phy_config.h"   /* CONFIG_OPTION */
+#include "phy_config.h"   /* CONFIG_OPTION, TX_ANT_DLY, RX_ANT_DLY */
 #include "storage.h"
-#ifdef CONFIG_TAG_CAL_MODE
-#include "cal_led.h"
-#endif
 
-#include <zephyr/kernel.h>
-#include <zephyr/device.h>
-#include <zephyr/devicetree.h>
-#include <errno.h>
 #include <string.h>
-#include <stdlib.h>
 #include <stdio.h>
 
-#define CAL_NVS_ID          1
-
 static struct cal_record active;
-static bool             active_valid;
+static bool               active_valid;
 
-static K_SEM_DEFINE(cal_req_sem, 0, 1);
-static volatile uint32_t cal_req_ref_mm;
-static volatile bool     cal_req_pending;
-
-/* Last-run verdict. Written by the ranging thread, read by the BT RX thread.
- * Both are short strings written once per run and read on command, so the worst
- * a race can produce is a torn line in a diagnostic -- not worth a lock on the
- * ranging thread's path. */
-#define CAL_LAST_LEN 20
-static char cal_last[CAL_LAST_LEN] = "CAL none\n";
-
-void cal_set_last_result(const char *s)
-{
-    strncpy(cal_last, s, sizeof(cal_last) - 1);
-    cal_last[sizeof(cal_last) - 1] = '\0';
-#ifdef CONFIG_TAG_CAL_MODE
-    cal_led_on_result(cal_last);
-#endif
-}
-
-const char *cal_get_last_result(void)
-{
-    return cal_last;
-}
-
-/* ---- command parser (runs in BT RX thread) -------------------------------- */
-void cal_on_rx(const uint8_t *data, uint16_t len)
-{
-    char buf[24];
-    uint16_t n = (len < sizeof(buf) - 1) ? len : (sizeof(buf) - 1);
-
-    memcpy(buf, data, n);
-    buf[n] = '\0';
-    /* strip trailing CR/LF */
-    while (n > 0 && (buf[n - 1] == '\r' || buf[n - 1] == '\n')) {
-        buf[--n] = '\0';
-    }
-
-    if (strcmp(buf, "cal clear") == 0) {
-        ble_log_send(cal_clear() == 0 ? "CAL cleared\n" : "CAL FAIL nvs\n");
-        return;
-    }
-    if (strcmp(buf, "cal status") == 0) {
-        if (active_valid) {
-            char msg[20];
-            (void)snprintf(msg, sizeof(msg), "CAL %u/%u\n",
-                           active.tx_ant_dly, active.rx_ant_dly);
-            ble_log_send(msg);
-        } else {
-            ble_log_send("CAL REQUIRED\n");
-        }
-        return;
-    }
-    if (strcmp(buf, "cal last") == 0) {
-        /* Verdict of the most recent run. "CAL none" means no run has finished
-         * since boot -- so if a run visibly happened and this still says none,
-         * the tag reset during it. */
-        ble_log_send(cal_get_last_result());
-        return;
-    }
-    if (strcmp(buf, "cal selftest") == 0) {
-        char msg[20];
-        (void)snprintf(msg, sizeof(msg), "SELFTEST %d\n", cal_math_selftest());
-        ble_log_send(msg);
-        return;
-    }
-    if (strncmp(buf, "cal ", 4) == 0) {
-        char *end;
-        long mm = strtol(buf + 4, &end, 10);
-        if (end != buf + 4 && mm > 0) {
-            cal_req_ref_mm = (uint32_t)mm;
-            cal_req_pending = true;
-            k_sem_give(&cal_req_sem);
-            /* Clear the previous verdict: from here until the run ends, the
-             * absence of a result is itself the state we want reported. */
-            cal_set_last_result("CAL running\n");
-            ble_log_send("CAL start\n");
-            return;
-        }
-    }
-    /* 19 bytes. The previous string was 23 and exceeded the 20-byte NUS
-     * payload limit, so bt_nus_send() returned -EMSGSIZE and a mistyped
-     * command was answered with silence. */
-    ble_log_send("CAL ERR cal <mm>\n");
-}
-
-/* ---- public API ------------------------------------------------------------ */
 bool cal_init(void)
 {
     struct cal_record r;
@@ -124,11 +27,9 @@ bool cal_init(void)
 void cal_get_ant_dly(uint16_t *tx, uint16_t *rx)
 {
     if (!active_valid) {
-        /* No stored record: hand back the factory reference, as
-         * active_total_seed() already does. `active` lives in BSS, so the old
-         * behaviour was to return zero -- an ~8 m bias that looked like a
-         * plausible reading. Callers that must not range uncalibrated are
-         * gated by uwb_net_gate_actions(); this is the backstop for the rest. */
+        /* No stored record: hand back the factory reference. Callers that
+         * must not range uncalibrated are gated by uwb_net_gate_actions();
+         * this is the backstop for the rest. */
         *tx = TX_ANT_DLY;
         *rx = RX_ANT_DLY;
         return;
@@ -143,48 +44,43 @@ bool cal_is_valid(void)
     return active_valid;
 }
 
-int cal_clear(void)
+void cal_internal_activate(const struct cal_record *r)
 {
-    int rc = storage_delete(CAL_NVS_ID);
-
-    if (rc == 0) {
-        active_valid = false;
-    }
-    return rc;
-}
-
-bool cal_take_request(uint32_t *out_ref_mm)
-{
-    if (!cal_req_pending) {
-        return false;
-    }
-    *out_ref_mm = cal_req_ref_mm;
-    cal_req_pending = false;
-    return true;
-}
-
-void cal_wait_request(void)
-{
-    k_sem_take(&cal_req_sem, K_FOREVER);
-}
-
-int cal_store(uint16_t tx, uint16_t rx, uint32_t ref_mm, uint16_t residual_mm)
-{
-    struct cal_record r = {0};
-
-    r.phy_option  = (uint8_t)CONFIG_OPTION;
-    r.tx_ant_dly  = tx;
-    r.rx_ant_dly  = rx;
-    r.ref_mm      = ref_mm;
-    r.residual_mm = residual_mm;
-    cal_record_finalize(&r);
-
-    int rc = storage_write(CAL_NVS_ID, &r, sizeof(r));
-
-    if (rc < 0) {
-        return rc;
-    }
-    active = r;
+    active = *r;
     active_valid = true;
-    return 0;
+}
+
+void cal_internal_invalidate(void)
+{
+    active_valid = false;
+}
+
+void cal_on_rx(const uint8_t *data, uint16_t len)
+{
+    char buf[24];
+    uint16_t n = (len < sizeof(buf) - 1) ? len : (sizeof(buf) - 1);
+
+    memcpy(buf, data, n);
+    buf[n] = '\0';
+    while (n > 0 && (buf[n - 1] == '\r' || buf[n - 1] == '\n')) {
+        buf[--n] = '\0';
+    }
+
+    if (strcmp(buf, "cal status") == 0) {
+        if (active_valid) {
+            char msg[20];
+
+            (void)snprintf(msg, sizeof(msg), "CAL %u/%u\n",
+                           active.tx_ant_dly, active.rx_ant_dly);
+            ble_log_send(msg);
+        } else {
+            ble_log_send("CAL REQUIRED\n");
+        }
+        return;
+    }
+
+    /* Every other `cal ...` command writes or drives the radio, and a
+     * production build never does either -- see
+     * docs/superpowers/specs/2026-08-20-cal-image-rewrite-design.md. */
+    ble_log_send("CAL ERR unavailable\n");
 }

@@ -47,6 +47,8 @@ target_sources(app PRIVATE
 target_sources_ifdef(CONFIG_TAG_CAL_MODE app PRIVATE
     src/cal_diag.c
     src/cal_led.c
+    src/cal_run_math.c
+    src/cal_run.c
 )
 
 target_include_directories(app PRIVATE
