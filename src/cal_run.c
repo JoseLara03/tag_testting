@@ -39,12 +39,25 @@ const char *cal_get_last_result(void)
     return cal_last;
 }
 
+/* RAM-only, cal_run_execute()'s single-pass convergence state -- see the
+ * comment on cal_run_active_total_seed() and the end of cal_run_execute()
+ * for why this exists instead of correcting and re-sampling within one
+ * claim. Never written to NVS: an unconverged delay must never become the
+ * active calibration. Lost on reboot (acceptable for a bench procedure);
+ * cal_clear() also resets it so an operator abandoning a partial run and
+ * starting over gets a clean slate. */
+static bool     cal_run_provisional_valid;
+static uint16_t cal_run_provisional_total;
+static uint32_t cal_run_provisional_pass;
+
 int cal_clear(void)
 {
     int rc = storage_delete(CAL_NVS_ID);
 
     if (rc == 0) {
         cal_internal_invalidate();
+        cal_run_provisional_valid = false;
+        cal_run_provisional_pass  = 0;
     }
     return rc;
 }
@@ -245,38 +258,27 @@ static void cal_run_release_radio(void)
     uwb_radio_release();
 }
 
-/* Re-arm the radio to exactly the same state cal_run_claim_radio() /
- * cal_diag.c's claim_radio() put it in at claim time, before writing a new
- * antenna delay -- not just dwt_forcetrxoff() (tried, insufficient on its
- * own). forcetrxoff() plus clearing the sticky RX-timeout/RX-error status
- * bits plus re-masking interrupts (tried next, still insufficient) were
- * still missing three timing registers claim time sets and this function
- * never re-asserted: dwt_setrxaftertxdelay/dwt_setrxtimeout/
- * dwt_setpreambledetecttimeout. Those are configured ONCE at claim time and
- * never touched again across a whole run's ~400 exchanges. `cal probe`
- * never exercises this gap -- it only ever does one exchange per fresh
- * claim -- but iteration 1 alone hits a great many RX-timeout events (the
- * link fails roughly half the time even at rest, confirmed via `cal
- * probe`), and if any of these three doesn't reliably survive that many
- * timeout/re-arm cycles, a later exchange can end up with a stale or
- * unbounded RX window and catch the wrong frame entirely -- a plausible
- * header match paired with garbage timestamps. Now re-asserting all three
- * alongside the antenna delay, matching claim-time state exactly. */
+/* Split and apply one combined antenna delay. Called exactly once per
+ * cal_run_execute() call, immediately after cal_run_claim_radio() has
+ * already put the radio in a freshly-armed state -- see cal_run_execute()'s
+ * header comment for why this is no longer called a second time mid-claim
+ * to apply a correction. */
 static void cal_run_apply_total_dly(uint16_t total, uint16_t *tx, uint16_t *rx)
 {
-    dwt_forcetrxoff();
-    dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
-    dwt_setinterrupt(0xFFFFFFFFU, 0xFFFFFFFFU, DWT_DISABLE_INT);
-    dwt_setrxaftertxdelay(POLL_TX_TO_RESP_RX_DLY_UUS);
-    dwt_setrxtimeout(RESP_RX_TIMEOUT_UUS);
-    dwt_setpreambledetecttimeout(PRE_TIMEOUT);
     cal_split_dly(total, tx, rx);
     dwt_settxantennadelay(*tx);
     dwt_setrxantennadelay(*rx);
 }
 
+/* The delay to seed this pass with: an in-progress convergence attempt's
+ * last correction (RAM only -- see cal_run_provisional_valid above) takes
+ * priority over the stored calibration, which in turn takes priority over
+ * the factory default. */
 static uint16_t cal_run_active_total_seed(void)
 {
+    if (cal_run_provisional_valid) {
+        return cal_run_provisional_total;
+    }
     if (cal_is_valid()) {
         uint16_t tx, rx;
 
@@ -306,13 +308,26 @@ static void cal_run_verdict(const char *fmt, ...)
 BUILD_ASSERT(CAL_SAMPLES_PER_ITER <= CAL_MAX_SAMPLES,
              "cal sample budget exceeds the samples[] array");
 
-/* Iterative auto-solve: collect CAL_SAMPLES_PER_ITER polled ranges per
- * iteration, reject outliers, correct the combined antenna delay toward
- * ref_mm, repeat until the residual is within CAL_ACCEPT_MM or CAL_MAX_ITERS
- * is exhausted. Stores to NVS on success. Same algorithm as the old
- * run_calibration_locked() -- only the exchange primitive (polling, not
- * interrupt-driven) and the decision logic's location (cal_run_math.c,
- * host-tested) changed. */
+/* Single-pass auto-solve: collect CAL_SAMPLES_PER_ITER polled ranges at ONE
+ * antenna delay -- applied once, immediately after a fresh claim -- reject
+ * outliers, and either store the result (converged) or hand the correction
+ * to the NEXT `cal <mm>` invocation as the seed (not converged). Convergence
+ * that used to happen as up to CAL_MAX_ITERS iterations *within* one claim
+ * now happens as up to CAL_MAX_ITERS separate invocations, each its own
+ * fresh claim.
+ *
+ * This replaces re-applying a corrected antenna delay mid-claim, which
+ * could not be made reliable on hardware despite three rounds of matching
+ * it to claim-time state exactly (forcing the radio idle; clearing the
+ * sticky RX-timeout/RX-error status bits and re-masking interrupts;
+ * re-asserting dwt_setrxaftertxdelay/dwt_setrxtimeout/
+ * dwt_setpreambledetecttimeout) -- every one of those closed a real gap
+ * without changing the symptom (~70 m-equivalent errors from the second
+ * antenna-delay application onward). Meanwhile `cal probe <delay>` --
+ * which only ever applies a delay once, right after its own fresh claim --
+ * read back correct, physically consistent distances at every delay tested
+ * on hardware. Never re-applying delay within a claim at all sidesteps
+ * whichever part of that difference the true cause turns out to be. */
 static void cal_run_execute(uint32_t ref_mm)
 {
     static int32_t samples[CAL_MAX_SAMPLES];
@@ -322,55 +337,65 @@ static void cal_run_execute(uint32_t ref_mm)
 
     cal_run_apply_total_dly(total, &tx, &rx);
 
-    for (uint32_t it = 0; it < CAL_MAX_ITERS; it++) {
-        size_t   got = 0;
-        uint32_t t_end = k_uptime_get_32() + CAL_ITER_BUDGET_MS;
+    size_t   got = 0;
+    uint32_t t_end = k_uptime_get_32() + CAL_ITER_BUDGET_MS;
 
-        for (uint32_t i = 0; i < CAL_SAMPLES_PER_ITER; i++) {
-            if ((int32_t)(t_end - k_uptime_get_32()) <= 0) {
-                break;
-            }
-            int32_t mm;
-
-            if (cal_range_poll(&mm) && got < CAL_MAX_SAMPLES) {
-                samples[got++] = mm;
-            }
-            k_sleep(K_MSEC(5));
+    for (uint32_t i = 0; i < CAL_SAMPLES_PER_ITER; i++) {
+        if ((int32_t)(t_end - k_uptime_get_32()) <= 0) {
+            break;
         }
+        int32_t mm;
 
-        int32_t  err;
-        size_t   kept;
-        uint16_t new_total;
-        enum cal_run_verdict v = cal_run_iteration_result(
-            samples, got, CAL_SAMPLES_PER_ITER, (int32_t)ref_mm, total,
-            &err, &kept, &new_total);
-        /* kept is captured by the shared decision function but not
-         * currently logged -- the per-iteration IT%u D=... K=... line that
-         * used to consume it was deliberately removed as a debugging-only
-         * diagnostic earlier in this rewrite. */
-        (void)kept;
-
-        if (v == CAL_RUN_NO_RESP) {
-            cal_run_verdict("CAL FAIL no-resp\n");
-            return;
+        if (cal_range_poll(&mm) && got < CAL_MAX_SAMPLES) {
+            samples[got++] = mm;
         }
-
-        twr_log("CAL it%u e=%dmm\n", it + 1, err);
-
-        if (v == CAL_RUN_CONVERGED) {
-            /* Latch OK before the NVS write -- the write is the single
-             * most likely point for the BLE link to drop. */
-            cal_run_verdict("CAL OK %u/%u\n", tx, rx);
-            if (cal_store(tx, rx, ref_mm, (uint16_t)((err < 0) ? -err : err)) != 0) {
-                cal_run_verdict("CAL FAIL nvs\n");
-            }
-            return;
-        }
-
-        total = new_total;
-        cal_run_apply_total_dly(total, &tx, &rx);
+        k_sleep(K_MSEC(5));
     }
-    cal_run_verdict("CAL FAIL res\n");
+
+    int32_t  err;
+    size_t   kept;
+    uint16_t new_total;
+    enum cal_run_verdict v = cal_run_iteration_result(
+        samples, got, CAL_SAMPLES_PER_ITER, (int32_t)ref_mm, total,
+        &err, &kept, &new_total);
+    /* kept is captured by the shared decision function but not currently
+     * logged -- the per-pass IT%u D=... K=... line that used to consume it
+     * was deliberately removed as a debugging-only diagnostic earlier in
+     * this rewrite. */
+    (void)kept;
+
+    if (v == CAL_RUN_NO_RESP) {
+        cal_run_verdict("CAL FAIL no-resp\n");
+        return;
+    }
+
+    cal_run_provisional_pass++;
+    twr_log("CAL it%u e=%dmm\n", cal_run_provisional_pass, err);
+
+    if (v == CAL_RUN_CONVERGED) {
+        /* Latch OK before the NVS write -- the write is the single most
+         * likely point for the BLE link to drop. */
+        cal_run_verdict("CAL OK %u/%u\n", tx, rx);
+        cal_run_provisional_valid = false;
+        cal_run_provisional_pass  = 0;
+        if (cal_store(tx, rx, ref_mm, (uint16_t)((err < 0) ? -err : err)) != 0) {
+            cal_run_verdict("CAL FAIL nvs\n");
+        }
+        return;
+    }
+
+    if (cal_run_provisional_pass >= CAL_MAX_ITERS) {
+        cal_run_verdict("CAL FAIL res\n");
+        cal_run_provisional_valid = false;
+        cal_run_provisional_pass  = 0;
+        return;
+    }
+
+    /* Not converged, passes remain: hand the correction to the next
+     * invocation instead of re-applying it here. RAM only -- never NVS. */
+    cal_run_provisional_total = new_total;
+    cal_run_provisional_valid = true;
+    cal_set_last_result("CAL again\n");
 }
 
 /* Set before cal_run_run() starts work and cleared when it returns. cal_run_q
