@@ -18,7 +18,6 @@
 #include "ble_log.h"
 #include "phy_config.h"
 #include "cal.h"
-#include "cal_math.h"
 #include "pos_solver.h"
 #include "uwb_radio_owner.h"
 #include "uwb_frame_802_15_4z.h"
@@ -42,39 +41,12 @@
 /* Settle time between anchors within one cycle (radio turnaround margin). */
 #define INTER_ANCHOR_DELAY_MS  10U
 
-/* Calibration procedure parameters. */
-#define CAL_SAMPLES_PER_ITER  100U   /* ranges averaged per iteration */
-#define CAL_MAX_ITERS         4U     /* give up after this many corrections */
-#define CAL_ACCEPT_MM         15     /* residual error considered converged */
-/* Wall-clock ceiling for one sampling iteration. A responding peer costs ~7 ms
- * per sample (~0.7 s for 100), but every sample that times out costs the full
- * 20 ms wait_event budget plus the 5 ms settle, so an iteration against a poor
- * link legitimately approaches 2.5 s. 5 s keeps this a backstop against a
- * runaway loop rather than something that can truncate a healthy run and make
- * it look like "no-resp". */
-#define CAL_ITER_BUDGET_MS    5000U
-/* TEMPORARY, for the rate-dependence experiment below: at the widened
- * inter-sample gap, one iteration now legitimately takes up to ~100*310ms =
- * 31s, which the normal 5s budget would truncate to ~16 samples (a false
- * "no-resp" fail, not a real one). Remove alongside the gap widening once the
- * experiment concludes either way. */
-#define CAL_ITER_BUDGET_MS_TEST  40000U
-
-/* samples[] is CAL_MAX_SAMPLES long and one iteration can fill one entry per
- * pass, so the per-iteration count must never exceed it. Caught at compile
- * time rather than as a BSS overrun into the next variable. */
-BUILD_ASSERT(CAL_SAMPLES_PER_ITER <= CAL_MAX_SAMPLES,
-             "cal sample budget exceeds the samples[] array");
-
 /* SPEED_OF_LIGHT is a Qorvo shared_defines macro not present in this project's
  * driver headers; define it locally (m/s, as used by the Qorvo examples). */
 #define SPEED_OF_LIGHT  299702547.0
 
 /* ---- Frames (tag convention: no FCS placeholder; +FCS_LEN in writetxfctrl) -- */
 #define RX_BUF_LEN               32
-
-static uint8_t tx_poll_msg[] = UWB_WAVE_POLL_INIT;
-static uint8_t rx_resp_msg[] = UWB_WAVE_RESP_INIT;
 
 /* ---- Positioning frames (addressed; anchor self-reports its (x,y)) --------
  * Poll : [hdr 0..9][anchor_id @10]
@@ -216,69 +188,6 @@ static struct k_thread ss_twr_tid;
                        DWT_INT_RXPTO_BIT_MASK  | SYS_STATUS_ALL_RX_ERR)
 
 /*
- * Run a single SS-TWR exchange. On a valid response, writes the measured
- * distance in millimetres to *out_mm and returns true. Returns false on
- * timeout, RX error, or an unexpected frame. Assumes interrupts/antenna delay
- * are already configured by the caller.
- */
-static bool do_one_range(int32_t *out_mm)
-{
-    dwt_setinterrupt(INT_RX_PHASE, 0, DWT_ENABLE_INT_ONLY);
-
-    tx_poll_msg[ALL_MSG_SN_IDX] = frame_seq_nb;
-    dwt_writetxdata(sizeof(tx_poll_msg), tx_poll_msg, 0);
-    dwt_writetxfctrl(sizeof(tx_poll_msg) + FCS_LEN, 0, 1);
-    /* The positioning path checks this too. A poll rejected before it reaches
-     * the air must not look like a poll that got no answer. */
-    if (dwt_starttx(DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED) != DWT_SUCCESS) {
-        frame_seq_nb++;
-        return false;
-    }
-    frame_seq_nb++;
-
-    irq_evt_t evt = wait_event(K_MSEC(20));
-
-    if (evt != EVT_RXFCG) {
-        dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
-        return false;
-    }
-
-    uint16_t flen = dwt_getframelength();
-    if (flen > RX_BUF_LEN) {
-        /* The frame does not fit, so rx_buf still holds the PREVIOUS exchange.
-         * Falling through would pair stale anchor timestamps with fresh local
-         * ones and yield a plausible-looking but meaningless distance --
-         * silently, because the stale header still passes the memcmp below.
-         * do_one_range_anchor() already rejects oversized frames; this path
-         * did not. */
-        dwt_writesysstatuslo(DWT_INT_RXFCG_BIT_MASK);
-        return false;
-    }
-    dwt_readrxdata(rx_buf, flen, 0);
-    rx_buf[ALL_MSG_SN_IDX] = 0;
-
-    if (memcmp(rx_buf, rx_resp_msg, ALL_MSG_COMMON_LEN) != 0) {
-        dwt_writesysstatuslo(DWT_INT_RXFCG_BIT_MASK);
-        return false;
-    }
-
-    uint32_t poll_tx_ts = dwt_readtxtimestamplo32();
-    uint32_t resp_rx_ts = dwt_readrxtimestamplo32();
-    double clock_offset_ratio =
-        ((double)dwt_readclockoffset()) / (uint32_t)(1 << 26);
-    uint32_t poll_rx_ts = get_ts_4b(&rx_buf[UWB_WAVE_RESP_POLL_RX_TS_IDX]);
-    uint32_t resp_tx_ts = get_ts_4b(&rx_buf[UWB_WAVE_RESP_RESP_TX_TS_IDX]);
-
-    int32_t rtd_init = (int32_t)(resp_rx_ts - poll_tx_ts);
-    int32_t rtd_resp = (int32_t)(resp_tx_ts - poll_rx_ts);
-
-    double tof = ((rtd_init - rtd_resp * (1 - clock_offset_ratio)) / 2.0)
-                 * DWT_TIME_UNITS;
-    *out_mm = (int32_t)(tof * SPEED_OF_LIGHT * 1000.0);
-    return true;
-}
-
-/*
  * Run a single addressed SS-TWR exchange against anchor `aid`. On a valid,
  * id-matched response, writes the range in metres to *range_m and the anchor's
  * self-reported coordinates to *ax and *ay, then returns true. Returns false on
@@ -341,199 +250,6 @@ bool do_one_range_anchor(uint8_t aid, float *range_m, float *ax, float *ay)
     memcpy(ax, &rx_buf[UWB_WAVE_POS_ANCHOR_X_IDX], sizeof(float));
     memcpy(ay, &rx_buf[UWB_WAVE_POS_ANCHOR_Y_IDX], sizeof(float));
     return true;
-}
-
-/*
- * Emit a calibration verdict: enqueue it for BLE *and* latch it for `cal last`.
- *
- * A run owns the radio for seconds and ends with an NVS write; the BLE link
- * frequently does not survive that, and ble_log_send() drops silently with no
- * connection. Pushing the verdict alone means the operator learns nothing about
- * the run that just completed. Latching it makes the result retrievable after
- * reconnecting -- and, because the latch is RAM-only, "CAL none" after a
- * visible run is positive evidence that the tag reset rather than merely losing
- * the link.
- */
-static void cal_verdict(const char *fmt, ...)
-{
-    char line[TWR_MSG_LEN];
-    va_list ap;
-
-    va_start(ap, fmt);
-    vsnprintf(line, sizeof(line), fmt, ap);
-    va_end(ap);
-
-    cal_set_last_result(line);
-    twr_log("%s", line);
-}
-
-/* Apply a combined antenna delay to the DW3000 (split equally TX/RX). */
-static void apply_total_dly(uint16_t total, uint16_t *tx, uint16_t *rx)
-{
-    cal_split_dly(total, tx, rx);
-    dwt_settxantennadelay(*tx);
-    dwt_setrxantennadelay(*rx);
-}
-
-/* Combined antenna-delay seed for a fresh calibration run. */
-static uint16_t active_total_seed(void)
-{
-    if (cal_is_valid()) {
-        uint16_t tx, rx;
-        cal_get_ant_dly(&tx, &rx);
-        return (uint16_t)(tx + rx);
-    }
-    return (uint16_t)(TX_ANT_DLY + RX_ANT_DLY);  /* factory reference fallback */
-}
-
-/*
- * Iterative auto-solve: collect CAL_SAMPLES_PER_ITER ranges, reject outliers,
- * correct the combined antenna delay toward ref_mm, repeat until the residual
- * is within CAL_ACCEPT_MM or CAL_MAX_ITERS is exhausted. Stores to NVS on
- * success. Reports progress over BLE.
- */
-static void run_calibration_locked(uint32_t ref_mm)
-{
-    static int32_t samples[CAL_MAX_SAMPLES];
-
-    uint16_t tx, rx;
-    /* Seed from the active value if valid, else the factory reference. */
-    /* TEMPORARY diagnostic: `cal status` reporting "CAL REQUIRED" right
-     * before this run means cal_is_valid() was false at that instant, and
-     * active_total_seed()'s fallback (TX_ANT_DLY+RX_ANT_DLY=32742) cannot
-     * evaluate to 0 -- so if `v` prints 0 and `t` still prints 0 here, the
-     * bug is upstream of this function entirely (stale binary, or something
-     * clobbering the factory constants); if `v` prints 1, cal_is_valid()
-     * flipped back to true between the status check and this run. Remove
-     * once resolved. */
-    bool cal_valid_at_seed = cal_is_valid();
-    uint16_t total = active_total_seed();
-    twr_log("SEED v=%u t=%u\n", (unsigned)cal_valid_at_seed, total);
-    apply_total_dly(total, &tx, &rx);
-
-    for (uint32_t it = 0; it < CAL_MAX_ITERS; it++) {
-        size_t got = 0;
-
-        /* Wall-clock backstop for the sampling loop. The `i < N` bound alone was
-         * observed not to hold on hardware while the array overrun (below) was
-         * live: the loop-counter register held 0xff7e0000 instead of 0..100 and
-         * the run spun forever. A deadline cannot be defeated by a bad counter
-         * register, so this turns any recurrence into a reported failure rather
-         * than a hang. */
-        uint32_t t_end = k_uptime_get_32() + CAL_ITER_BUDGET_MS_TEST;
-
-        for (uint32_t i = 0; i < CAL_SAMPLES_PER_ITER; i++) {
-            if ((int32_t)(t_end - k_uptime_get_32()) <= 0) {
-                break;
-            }
-            int32_t mm;
-            /* The `got < CAL_MAX_SAMPLES` guard is not redundant with the loop
-             * bound, and removing it re-opens a confirmed memory-corruption
-             * bug. `got` cannot exceed CAL_SAMPLES_PER_ITER *if the loop runs
-             * the number of times it says it does* -- but this was caught on
-             * hardware writing samples[130] into a 128-element array, with the
-             * loop counter register holding 0xff7e0000 instead of 0..100.
-             *
-             * What it overwrote was not spare memory: samples[] is followed in
-             * BSS by int_cb -- the LIS2HH12 gpio_callback. The overrun landed
-             * exactly on int_cb.node.next, so a stray range measurement became
-             * the "next" pointer of a live entry in gpio0's callback list, and
-             * every DW3000 interrupt after that
-             * walked that list and dereferenced a range in millimetres as an
-             * address, taking a precise BusFault inside the GPIO ISR, halting
-             * the system, and letting the watchdog reset the tag ~120 ms later.
-             * From the outside: "cal disconnects and never reports a result".
-             *
-             * Bound the write at the write. */
-            if (do_one_range(&mm) && got < CAL_MAX_SAMPLES) {
-                samples[got++] = mm;
-            }
-            /* TEMPORARY rate-dependence experiment: production ranging
-             * (do_one_range_anchor via uwb_net_runner) shares this exact
-             * wait_event()/dwt_isr() path and does not corrupt anything, but
-             * it exchanges once every few hundred ms to seconds -- nothing
-             * like calibration's ~100 back-to-back exchanges a few ms apart.
-             * Widening the gap to roughly production's spacing tests whether
-             * the corruption is rate-dependent (a settling window between
-             * exchanges that calibration's tight loop never gives the
-             * previous IRQ/SPI cycle) rather than a straightforward logic
-             * bug in code both paths share equally. Every 10 samples is
-             * cheap to print at this rate. Remove once the experiment
-             * concludes either way. */
-            if (it == 0 && (i % 10) == 0) {
-                twr_log("T1.%u=%u\n", i, total);
-            }
-            k_sleep(K_MSEC(300));
-        }
-
-        int32_t mean;
-        size_t kept;
-
-        if (got < CAL_SAMPLES_PER_ITER / 4 ||
-            !cal_filtered_mean(samples, got, &mean, &kept)) {
-            cal_verdict("CAL FAIL no-resp\n");
-            return;
-        }
-
-        int32_t err = mean - (int32_t)ref_mm;
-        int32_t abserr = (err < 0) ? -err : err;
-        /* TEMPORARY diagnostic for the odd/even alternating-error bug under
-         * investigation: D is the total antenna delay actually applied while
-         * THIS iteration's 100 samples were collected (not the correction
-         * about to be computed from them), K is how many of those samples
-         * survived cal_filtered_mean()'s outlier rejection. Remove once the
-         * bug is understood, per CLAUDE.md's convention for this class of
-         * probe (Open Work item 1). */
-        twr_log("IT%u D=%u K=%u\n", it + 1, total, (unsigned)kept);
-        twr_log("CAL it%u e=%dmm\n", it + 1, err);
-
-        if (abserr <= CAL_ACCEPT_MM) {
-            /* Latch the solved values BEFORE the NVS write. The write is the
-             * single most likely point for the BLE link to drop (flash
-             * operations contend with the radio), and losing the link must not
-             * also lose the answer. */
-            cal_verdict("CAL OK %u/%u\n", tx, rx);
-            if (cal_store(tx, rx, ref_mm, (uint16_t)abserr) != 0) {
-                cal_verdict("CAL FAIL nvs\n");
-            }
-            return;
-        }
-
-        total = cal_solve_step(mean, (int32_t)ref_mm, total);
-        apply_total_dly(total, &tx, &rx);
-    }
-    cal_verdict("CAL FAIL res\n");
-}
-
-#define CAL_RADIO_WAIT  K_SECONDS(2)
-
-/* Calibration owns the radio for its whole run: consistent conditions across
- * all samples matter more than keeping beacon sync, and this is a bench
- * operation. The runner reacquires and re-locks afterwards.
- *
- * The wrapper exists so that every exit path of run_calibration_locked() --
- * two early returns plus the fall-through off the end -- releases the radio.
- * A missed release blocks the runner forever. */
-static void run_calibration(uint32_t ref_mm)
-{
-    if (!uwb_radio_request(CAL_RADIO_WAIT)) {
-        cal_verdict("CAL FAIL busy\n");
-        return;
-    }
-
-    dwt_forcetrxoff();
-    /* Clear whatever the abort asserted; a stale RX-error bit would otherwise
-     * surface as a spurious EVT_RXERR in the thread taking over the radio. */
-    dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
-    dwt_setrxaftertxdelay(POLL_TX_TO_RESP_RX_DLY_UUS);
-    dwt_setrxtimeout(RESP_RX_TIMEOUT_UUS);
-    dwt_setpreambledetecttimeout(PRE_TIMEOUT);
-
-    run_calibration_locked(ref_mm);
-
-    dwt_forcetrxoff();
-    dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
-    uwb_radio_release();
 }
 
 /* Format a metre value as a signed "x.xx" string (centimetre resolution),
@@ -646,9 +362,9 @@ static void ss_twr_fn(void *p1, void *p2, void *p3)
     dwt_setrxtimeout(RESP_RX_TIMEOUT_UUS);
     dwt_setpreambledetecttimeout(PRE_TIMEOUT);
 
-    bool ranging = cal_is_valid();
-    if (ranging) {
+    if (cal_is_valid()) {
         uint16_t tx, rx;
+
         cal_get_ant_dly(&tx, &rx);
         dwt_settxantennadelay(tx);
         dwt_setrxantennadelay(rx);
@@ -657,24 +373,12 @@ static void ss_twr_fn(void *p1, void *p2, void *p3)
         twr_log("CAL REQUIRED\n");
     }
 
-    /* Section (b) — the free-running ranging sweep — has been removed.
-     * The runner thread (uwb_net_runner.c) now owns the ranging cadence.
-     * This loop only services calibration requests. */
-    while (1) {
-        uint32_t ref_mm;
-        if (cal_take_request(&ref_mm)) {
-            run_calibration(ref_mm);
-            /* The antenna delays are applied by the runner's reacquire path,
-             * which is inside the handover. Writing them here would be an
-             * unsynchronized SPI access against a runner that is already back
-             * on the radio. */
-            ranging = cal_is_valid();
-        } else if (!ranging) {
-            cal_wait_request();   /* block until a cal command arrives */
-        } else {
-            k_sleep(K_MSEC(100)); /* yield while awaiting optional cal request */
-        }
-    }
+    /* One-time DW3000 setup for production ranging (do_one_range_anchor(),
+     * driven by uwb_net_runner.c's own thread) and, in the calibration
+     * image, for cal_run.c's polling-based exchanges -- neither depends on
+     * this thread running any further. See
+     * docs/superpowers/specs/2026-08-20-cal-image-rewrite-design.md. */
+    k_sleep(K_FOREVER);
 }
 
 /* Compatibility shim: motion.c calls this; route to the runner's motion API,
