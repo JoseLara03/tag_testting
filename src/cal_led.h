@@ -5,7 +5,7 @@
 
 /*
  * Cal-image status LED: reflects the last calibration verdict via
- * cal_set_last_result()'s funnel in cal.c. See spec §7.
+ * cal_set_last_result()'s funnel in cal_run.c. See spec §7.
  * Compiled only under CONFIG_TAG_CAL_MODE.
  */
 
