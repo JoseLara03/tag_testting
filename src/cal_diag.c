@@ -167,16 +167,20 @@ static void do_listen(uint32_t ms)
     twr_log("LSN n=%u e=%u\n", n, errors);
 }
 
-/* TEMPORARY diagnostic: `cal probe <n>` for n in 5..65000 overrides the
- * antenna delay for this ONE probe (still unaddressed -- wire_id stays 0),
- * applied via a completely fresh claim_radio(), the same clean-start path
- * that has given consistent, correct results every time so far. n in 1..4
- * keeps its existing meaning (addressed probe to that anchor id). Point:
- * isolate whether a freshly re-claimed radio at cal <mm>'s post-correction
- * delay (e.g. 31692) behaves differently than cal_run.c's mid-session
- * re-application (already tried, no change) -- i.e. is "more reset" the
- * fix, or is antenna-delay-mid-session simply not the mechanism at all.
- * Remove once answered either way. */
+/* `cal probe <n>` for n in 5..CAL_MAX_TOTAL_DLY overrides the antenna delay
+ * for this ONE probe (still unaddressed -- wire_id stays 0), applied via a
+ * completely fresh claim_radio(). n in 1..4 keeps its existing meaning
+ * (addressed probe to that anchor id).
+ *
+ * This is a permanent bench diagnostic, not leftover scaffolding: it is
+ * what isolated the bug behind Open Work item 1 in CLAUDE.md -- a
+ * freshly-claimed radio reads back correct, physically consistent
+ * distances at any delay tested, while cal_run.c's old mid-claim
+ * re-application of a corrected delay did not, for reasons never pinned
+ * down at the register level. cal_run.c's architecture now avoids that
+ * re-application entirely (see cal_run_execute()), but this command
+ * remains useful for reading back the distance at a specific delay
+ * without running a full calibration or touching NVS. */
 static void do_probe(uint32_t param)
 {
     uint8_t buf[RX_BUF_LEN];
