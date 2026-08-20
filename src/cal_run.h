@@ -21,4 +21,13 @@ int cal_clear(void);
 void        cal_set_last_result(const char *s);
 const char *cal_get_last_result(void);
 
+/* NUS command parser for `cal clear`/`cal last`/`cal selftest`/`cal <mm>`.
+ * Cal-image-only; tag_cmd.c routes every `cal ...` command except
+ * `cal status` here ahead of cal_on_rx() (src/cal.h). */
+void cal_run_on_rx(const uint8_t *data, uint16_t len);
+
+/* Start the calibration-run thread. Call once from main.c under
+ * CONFIG_TAG_CAL_MODE, after cal_init(). */
+void cal_run_start(void);
+
 #endif /* CAL_RUN_H */

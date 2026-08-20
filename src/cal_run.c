@@ -11,6 +11,14 @@
 
 #include <zephyr/kernel.h>
 
+#include "cal_run_math.h"
+#include "uwb_radio_owner.h"
+#include "uwb_ss_initiator.h"   /* twr_log() */
+#include "ble_log.h"
+
+#include <stdio.h>
+#include <stdarg.h>
+
 #define CAL_LAST_LEN 20
 static char cal_last[CAL_LAST_LEN] = "CAL none\n";
 
@@ -139,6 +147,13 @@ static bool cal_range_poll(int32_t *out_mm)
 
     uint16_t flen = dwt_getframelength();
 
+    if (flen < ALL_MSG_COMMON_LEN + FCS_LEN) {
+        /* Too short to be a real response: reading it would pair stale
+         * bytes past the received length with a header match that only
+         * looks valid -- the same stale-buffer hazard the oversized-frame
+         * check below guards against, mirroring cal_diag.c's do_probe(). */
+        return false;
+    }
     if (flen > RX_BUF_LEN) {
         /* Do not read: cal_run_rx_buf still holds the previous exchange, and
          * reading a mismatched length here would pair stale timestamps with
@@ -167,4 +182,262 @@ static bool cal_range_poll(int32_t *out_mm)
                  * DWT_TIME_UNITS;
     *out_mm = (int32_t)(tof * SPEED_OF_LIGHT * 1000.0);
     return true;
+}
+
+/* ---- radio ownership + PHY setup for one calibration run ------------------- */
+
+#define POLL_TX_TO_RESP_RX_DLY_UUS  1000U
+#define RESP_RX_TIMEOUT_UUS         2000U
+#define PRE_TIMEOUT                  128U
+#define CAL_RUN_RADIO_WAIT          K_SECONDS(2)
+
+/* Wall-clock backstop for one sampling iteration, independent of
+ * cal_range_poll()'s own per-exchange timeout -- cheap insurance against an
+ * unexpected stall, same reasoning uwb_ss_initiator.c's old
+ * CAL_ITER_BUDGET_MS used. */
+#define CAL_ITER_BUDGET_MS  5000U
+
+static bool cal_run_claim_radio(void)
+{
+    if (!uwb_radio_request(CAL_RUN_RADIO_WAIT)) {
+        return false;
+    }
+    dwt_forcetrxoff();
+    dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+    dwt_setinterrupt(0xFFFFFFFFU, 0xFFFFFFFFU, DWT_DISABLE_INT);
+    dwt_setrxaftertxdelay(POLL_TX_TO_RESP_RX_DLY_UUS);
+    dwt_setrxtimeout(RESP_RX_TIMEOUT_UUS);
+    dwt_setpreambledetecttimeout(PRE_TIMEOUT);
+    return true;
+}
+
+/* Restores the antenna delay per the uwb_radio_owner.h handover contract
+ * before releasing, mirroring cal_diag.c's release_radio(). */
+static void cal_run_release_radio(void)
+{
+    uint16_t tx, rx;
+
+    dwt_forcetrxoff();
+    dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+
+    if (cal_is_valid()) {
+        cal_get_ant_dly(&tx, &rx);
+    } else {
+        tx = TX_ANT_DLY;
+        rx = RX_ANT_DLY;
+    }
+    dwt_settxantennadelay(tx);
+    dwt_setrxantennadelay(rx);
+
+    uwb_radio_release();
+}
+
+static void cal_run_apply_total_dly(uint16_t total, uint16_t *tx, uint16_t *rx)
+{
+    cal_split_dly(total, tx, rx);
+    dwt_settxantennadelay(*tx);
+    dwt_setrxantennadelay(*rx);
+}
+
+static uint16_t cal_run_active_total_seed(void)
+{
+    if (cal_is_valid()) {
+        uint16_t tx, rx;
+
+        cal_get_ant_dly(&tx, &rx);
+        return (uint16_t)(tx + rx);
+    }
+    return (uint16_t)(TX_ANT_DLY + RX_ANT_DLY);
+}
+
+/* Emit a calibration verdict: enqueue it for BLE and latch it for `cal last`
+ * (see cal_run.h's comment on cal_set_last_result() for why both). */
+static void cal_run_verdict(const char *fmt, ...)
+{
+    char    line[24];
+    va_list ap;
+
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+
+    cal_set_last_result(line);
+    twr_log("%s", line);
+}
+
+/* samples[] is CAL_MAX_SAMPLES long and one iteration fills at most one
+ * entry per pass, so the per-iteration count must never exceed it. */
+BUILD_ASSERT(CAL_SAMPLES_PER_ITER <= CAL_MAX_SAMPLES,
+             "cal sample budget exceeds the samples[] array");
+
+/* Iterative auto-solve: collect CAL_SAMPLES_PER_ITER polled ranges per
+ * iteration, reject outliers, correct the combined antenna delay toward
+ * ref_mm, repeat until the residual is within CAL_ACCEPT_MM or CAL_MAX_ITERS
+ * is exhausted. Stores to NVS on success. Same algorithm as the old
+ * run_calibration_locked() -- only the exchange primitive (polling, not
+ * interrupt-driven) and the decision logic's location (cal_run_math.c,
+ * host-tested) changed. */
+static void cal_run_execute(uint32_t ref_mm)
+{
+    static int32_t samples[CAL_MAX_SAMPLES];
+
+    uint16_t tx, rx;
+    uint16_t total = cal_run_active_total_seed();
+
+    cal_run_apply_total_dly(total, &tx, &rx);
+
+    for (uint32_t it = 0; it < CAL_MAX_ITERS; it++) {
+        size_t   got = 0;
+        uint32_t t_end = k_uptime_get_32() + CAL_ITER_BUDGET_MS;
+
+        for (uint32_t i = 0; i < CAL_SAMPLES_PER_ITER; i++) {
+            if ((int32_t)(t_end - k_uptime_get_32()) <= 0) {
+                break;
+            }
+            int32_t mm;
+
+            if (cal_range_poll(&mm) && got < CAL_MAX_SAMPLES) {
+                samples[got++] = mm;
+            }
+            k_sleep(K_MSEC(5));
+        }
+
+        int32_t  err;
+        size_t   kept;
+        uint16_t new_total;
+        enum cal_run_verdict v = cal_run_iteration_result(
+            samples, got, CAL_SAMPLES_PER_ITER, (int32_t)ref_mm, total,
+            &err, &kept, &new_total);
+
+        if (v == CAL_RUN_NO_RESP) {
+            cal_run_verdict("CAL FAIL no-resp\n");
+            return;
+        }
+
+        twr_log("CAL it%u e=%dmm\n", it + 1, err);
+
+        if (v == CAL_RUN_CONVERGED) {
+            /* Latch OK before the NVS write -- the write is the single
+             * most likely point for the BLE link to drop. */
+            cal_run_verdict("CAL OK %u/%u\n", tx, rx);
+            if (cal_store(tx, rx, ref_mm, (uint16_t)((err < 0) ? -err : err)) != 0) {
+                cal_run_verdict("CAL FAIL nvs\n");
+            }
+            return;
+        }
+
+        total = new_total;
+        cal_run_apply_total_dly(total, &tx, &rx);
+    }
+    cal_run_verdict("CAL FAIL res\n");
+}
+
+static void cal_run_run(uint32_t ref_mm)
+{
+    if (!cal_run_claim_radio()) {
+        cal_run_verdict("CAL FAIL busy\n");
+        return;
+    }
+
+    cal_run_execute(ref_mm);
+
+    cal_run_release_radio();
+}
+
+/* ---- dedicated thread + command parsing ------------------------------------ */
+
+struct cal_run_req {
+    uint32_t ref_mm;
+};
+
+K_MSGQ_DEFINE(cal_run_q, sizeof(struct cal_run_req), 1, 4);
+
+#define CAL_RUN_PRIO   6
+#define CAL_RUN_STACK  4096   /* cal_filtered_mean() alone holds ~1 KB of
+                                * locals (two int32_t[128] arrays) -- the
+                                * deepest path in the cal image. */
+
+K_THREAD_STACK_DEFINE(cal_run_stack, CAL_RUN_STACK);
+static struct k_thread cal_run_tid;
+
+static void cal_run_fn(void *p1, void *p2, void *p3)
+{
+    ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
+
+    struct cal_run_req req;
+
+    while (1) {
+        k_msgq_get(&cal_run_q, &req, K_FOREVER);
+        cal_run_run(req.ref_mm);
+    }
+}
+
+/* Minimal unsigned-decimal parser, mirroring cal_diag.c's parse_u32(). */
+static bool cal_run_parse_u32(const char *s, uint32_t *out)
+{
+    if (*s < '0' || *s > '9') {
+        return false;
+    }
+    uint32_t v = 0;
+
+    while (*s >= '0' && *s <= '9') {
+        v = v * 10u + (uint32_t)(*s - '0');
+        s++;
+    }
+    *out = v;
+    return true;
+}
+
+void cal_run_on_rx(const uint8_t *data, uint16_t len)
+{
+    char buf[24];
+    uint16_t n = (len < sizeof(buf) - 1) ? len : (uint16_t)(sizeof(buf) - 1);
+
+    memcpy(buf, data, n);
+    buf[n] = '\0';
+    while (n > 0 && (buf[n - 1] == '\r' || buf[n - 1] == '\n')) {
+        buf[--n] = '\0';
+    }
+
+    if (strcmp(buf, "cal clear") == 0) {
+        ble_log_send(cal_clear() == 0 ? "CAL cleared\n" : "CAL FAIL nvs\n");
+        return;
+    }
+    if (strcmp(buf, "cal last") == 0) {
+        ble_log_send(cal_get_last_result());
+        return;
+    }
+    if (strcmp(buf, "cal selftest") == 0) {
+        char msg[20];
+
+        (void)snprintf(msg, sizeof(msg), "SELFTEST %d\n",
+                       cal_math_selftest() + cal_run_math_selftest());
+        ble_log_send(msg);
+        return;
+    }
+    if (strncmp(buf, "cal ", 4) == 0) {
+        uint32_t mm;
+
+        if (cal_run_parse_u32(buf + 4, &mm) && mm > 0) {
+            struct cal_run_req req = { .ref_mm = mm };
+
+            if (k_msgq_put(&cal_run_q, &req, K_NO_WAIT) == 0) {
+                cal_set_last_result("CAL running\n");
+                ble_log_send("CAL start\n");
+            } else {
+                ble_log_send("CAL FAIL busy\n");
+            }
+            return;
+        }
+    }
+    ble_log_send("CAL ERR cal <mm>\n");
+}
+
+void cal_run_start(void)
+{
+    k_thread_create(&cal_run_tid, cal_run_stack,
+                    K_THREAD_STACK_SIZEOF(cal_run_stack),
+                    cal_run_fn, NULL, NULL, NULL,
+                    CAL_RUN_PRIO, 0, K_NO_WAIT);
+    k_thread_name_set(&cal_run_tid, "calrun");
 }
