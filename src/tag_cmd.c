@@ -11,6 +11,7 @@
 #include "wdt.h"
 #ifdef CONFIG_TAG_CAL_MODE
 #include "cal_diag.h"
+#include "cal_run.h"
 #endif
 
 /* Parse a decimal unsigned from *p, advancing it past the digits and any
@@ -319,6 +320,10 @@ static void tag_cmd_on_rx(const uint8_t *data, uint16_t len)
 #ifdef CONFIG_TAG_CAL_MODE
 	if (strncmp(buf, "cal listen", 10) == 0 || strncmp(buf, "cal probe", 9) == 0) {
 		cal_diag_on_rx(data, len);
+		return;
+	}
+	if (strncmp(buf, "cal ", 4) == 0 && strcmp(buf, "cal status") != 0) {
+		cal_run_on_rx(data, len);
 		return;
 	}
 #endif

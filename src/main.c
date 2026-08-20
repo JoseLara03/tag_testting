@@ -22,6 +22,7 @@
 #include "uwb_radio_owner.h"
 #include "cal_diag.h"
 #include "cal_led.h"
+#include "cal_run.h"
 #endif
 
 static const struct device *strip = DEVICE_DT_GET(DT_ALIAS(led_strip));
@@ -87,6 +88,7 @@ int main(void)
         uwb_ss_initiator_start();
 #ifdef CONFIG_TAG_CAL_MODE
         cal_diag_start();
+        cal_run_start();
         cal_led_init(strip);
 #else
         uwb_net_runner_start(eui);
