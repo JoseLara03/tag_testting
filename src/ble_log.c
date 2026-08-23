@@ -193,21 +193,32 @@ void ble_log_wait_ready(void)
     k_sem_take(&notif_sem, K_FOREVER);
 }
 
-void ble_log_send(const char *msg)
+void ble_log_send_raw(const uint8_t *buf, uint16_t len)
 {
     struct bt_conn *conn = (struct bt_conn *)current_conn;
 
-    if (!conn) {
+    if (!conn || buf == NULL || len == 0) {
         return;
     }
 
     /* Retry on -ENOMEM: BLE TX buffer pool can be momentarily exhausted
      * when several sends are issued back-to-back. Block until drained. */
     for (int i = 0; i < 50; i++) {
-        int err = bt_nus_send(conn, (const uint8_t *)msg, strlen(msg));
+        int err = bt_nus_send(conn, buf, len);
         if (err != -ENOMEM) {
             return;
         }
         k_msleep(10);
     }
+}
+
+/* Text wrapper. Kept separate from the raw path because strlen() stops at the
+ * first NUL, which is exactly wrong for the binary debug records -- those go
+ * through ble_log_send_raw() with an explicit length. */
+void ble_log_send(const char *msg)
+{
+    if (msg == NULL) {
+        return;
+    }
+    ble_log_send_raw((const uint8_t *)msg, (uint16_t)strlen(msg));
 }

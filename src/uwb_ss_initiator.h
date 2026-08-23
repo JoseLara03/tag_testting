@@ -45,6 +45,12 @@ bool pos_last_get(float *x, float *y);
 /* Enqueue a BLE NUS log message (≤19 chars + NUL; drops if queue full). */
 void twr_log(const char *fmt, ...);
 
+/* Enqueue `len` raw bytes for BLE NUS (drops if queue full or len > 20).
+ * For the binary raw-range debug records, which contain NUL bytes and so
+ * cannot use twr_log(). TEMPORARY -- remove with the debug log, see the
+ * checklist in spec/2026-08-22-position-filtering-design.md. */
+void twr_log_raw(const uint8_t *buf, size_t len);
+
 /* Compatibility shim: called by motion.c; forwards the raw motion state to
  * uwb_net_set_moving() and wakes the runner out of any skip. */
 void uwb_set_moving(bool moving);

@@ -18,6 +18,7 @@
 #include "wdt.h"
 #include "storage.h"
 #include "nfc_tag.h"
+#include "pos_cfg.h"
 
 static const struct device *strip = DEVICE_DT_GET(DT_ALIAS(led_strip));
 
@@ -54,6 +55,12 @@ int main(void)
         } else {
             ble_log_send("CAL REQUIRED\n");
         }
+        /* Anchor/tag height for the 3D range model. Must run before the
+         * runner starts building measurements. Falls back to compiled
+         * defaults when NVS holds nothing -- read back with `pos z`, since
+         * anything sent here is dropped (no central is connected at boot). */
+        pos_cfg_init();
+
         if (nfc_tag_init() != 0) {
             ble_log_send("NFC fail\n");
         }

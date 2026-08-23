@@ -17,6 +17,12 @@ int  ble_log_init(void);
 void ble_log_wait_ready(void);
 void ble_log_send(const char *msg);
 
+/* Send `len` bytes verbatim. Needed for the binary raw-range debug records,
+ * which contain NUL bytes and so cannot go through the strlen()-based text
+ * path. Subject to the same 20-byte NUS limit: bt_nus_send does not fragment
+ * and anything longer fails -EMSGSIZE silently. */
+void ble_log_send_raw(const uint8_t *buf, uint16_t len);
+
 /* Register a handler invoked from the NUS RX callback (nrfxlib BT RX thread)
  * for every write the central sends. Pass NULL to unregister. */
 void ble_log_set_rx_handler(ble_rx_handler_t handler);
