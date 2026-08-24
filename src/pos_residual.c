@@ -12,7 +12,8 @@ float pos_residual_rms(const struct pos_meas *m, size_t n, float x, float y)
     for (size_t i = 0; i < n; i++) {
         float dx   = x - m[i].x;
         float dy   = y - m[i].y;
-        float pred = sqrtf(dx * dx + dy * dy);
+        float dz   = m[i].dz;
+        float pred = sqrtf(dx * dx + dy * dy + dz * dz);
         float err  = pred - m[i].range_m;
 
         acc += err * err;

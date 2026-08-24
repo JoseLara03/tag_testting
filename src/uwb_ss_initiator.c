@@ -64,13 +64,23 @@ static uint8_t  rx_buf[RX_BUF_LEN];
 /* ---- BLE result message queue ---------------------------------------------- */
 #define TWR_MSG_LEN  20
 
+/* `len` carries the payload length explicitly so the queue can hold binary
+ * records as well as text. The raw-range debug records contain NUL bytes, and
+ * the old strlen()-based send truncated at the first one.
+ * TEMPORARY, with the debug log -- see the removal checklist in
+ * spec/2026-08-22-position-filtering-design.md. */
 struct twr_msg {
-    char text[TWR_MSG_LEN];
+    uint8_t len;
+    char    text[TWR_MSG_LEN];
 };
 
 /* Unique symbol names: names kept distinct from the example in
- * examples/uwb_ds_initiator.c, which is not currently compiled. */
-K_MSGQ_DEFINE(ss_twr_msgq, sizeof(struct twr_msg), 8, 4);
+ * examples/uwb_ds_initiator.c, which is not currently compiled.
+ *
+ * Depth 16, not 8, for the duration of the raw-range capture campaign: the
+ * debug log adds one record per sweep on top of the existing traffic and
+ * k_msgq_put() drops silently when full. Revert to 8 with the log. */
+K_MSGQ_DEFINE(ss_twr_msgq, sizeof(struct twr_msg), 16, 4);
 
 void twr_log(const char *fmt, ...)
 {
@@ -80,6 +90,19 @@ void twr_log(const char *fmt, ...)
     va_start(ap, fmt);
     vsnprintf(m.text, TWR_MSG_LEN, fmt, ap);
     va_end(ap);
+    m.len = (uint8_t)strlen(m.text);
+    k_msgq_put(&ss_twr_msgq, &m, K_NO_WAIT); /* drop if full */
+}
+
+void twr_log_raw(const uint8_t *buf, size_t len)
+{
+    struct twr_msg m;
+
+    if (buf == NULL || len == 0 || len > TWR_MSG_LEN) {
+        return;
+    }
+    memcpy(m.text, buf, len);
+    m.len = (uint8_t)len;
     k_msgq_put(&ss_twr_msgq, &m, K_NO_WAIT); /* drop if full */
 }
 
@@ -97,7 +120,7 @@ static void ble_tx_fn(void *p1, void *p2, void *p3)
     ARG_UNUSED(p1); ARG_UNUSED(p2); ARG_UNUSED(p3);
     while (1) {
         if (k_msgq_get(&ss_twr_msgq, &m, K_FOREVER) == 0) {
-            ble_log_send(m.text);
+            ble_log_send_raw((const uint8_t *)m.text, m.len);
         }
     }
 }

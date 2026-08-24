@@ -14,6 +14,9 @@
 #include "uwb_frame_802_15_4z.h"
 #include "uwb_ss_initiator.h"
 #include "pos_solver.h"
+#include "pos_ekf.h"
+#include "pos_cfg.h"
+#include "pos_dbg.h"   /* TEMPORARY -- remove with the raw-range debug log */
 #include "uwb_radio_owner.h"
 #include "port.h"
 #include "deca_device_api.h"
@@ -92,6 +95,28 @@ static uint8_t        n_selected;
  * inline condition here, and in that shape it latched the tag out of ranging
  * for good after a single short sweep. See struct uwb_sweep_gate. */
 static struct uwb_sweep_gate sweep_gate;
+
+/* The debug log indexes by SELECTED slot, not by the compacted pos_meas array,
+ * because a slot's identity does not stop existing when its anchor misses one
+ * sweep -- see the caller contract on pos_dbg_sweep(). Coordinates persist per
+ * slot and are cleared only when the slot is reassigned to a different anchor.
+ * TEMPORARY, with the debug log. */
+BUILD_ASSERT(ANCHOR_SELECT_MAX == POS_MAX_ANCHORS,
+             "the per-slot debug arrays are sized by POS_MAX_ANCHORS");
+static uint8_t  sweep_aid[POS_MAX_ANCHORS];
+static int16_t  sweep_ax_cm[POS_MAX_ANCHORS];
+static int16_t  sweep_ay_cm[POS_MAX_ANCHORS];
+static int16_t  sweep_r_cm[POS_MAX_ANCHORS];
+static uint8_t  sweep_mask;
+
+/* ---- Position filter ------------------------------------------------------
+ * Tightly-coupled EKF over the raw ranges. Owned by the runner thread and
+ * touched from nowhere else, so it needs no lock.
+ * See spec/2026-08-22-position-filtering-design.md. */
+static struct pos_ekf     ekf;
+static struct pos_ekf_cfg ekf_cfg;
+static uint32_t           last_fix_ms;
+static bool               have_last_fix;
 
 /* ---- Runner thread parameters ---- */
 #define RUNNER_PRIO    2
@@ -411,6 +436,29 @@ static int anchor_sweep(struct pos_meas *out, size_t max)
 
     size_t n = 0;
 
+    /* One dz for every anchor: all anchors are ceiling-mounted at one height,
+     * so v1 carries a single tag-side pair of constants rather than per-anchor
+     * z in the E1 frame (which would need anchor firmware). Read once per
+     * sweep -- it can change under us from the BT RX thread via `pos z`, and a
+     * fix built from two different dz values would be incoherent. */
+    const float dz = pos_cfg_dz_m();
+
+    /* Reset the per-slot debug snapshot. Coordinates survive a missed sweep
+     * but not a slot reassignment. */
+    for (size_t i = 0; i < POS_MAX_ANCHORS; i++) {
+        if (i >= n_selected) {
+            sweep_aid[i]   = POS_DBG_AID_NONE;
+            sweep_ax_cm[i] = 0;
+            sweep_ay_cm[i] = 0;
+        } else if (sweep_aid[i] != selected[i]) {
+            sweep_aid[i]   = selected[i];
+            sweep_ax_cm[i] = 0;
+            sweep_ay_cm[i] = 0;
+        }
+        sweep_r_cm[i] = 0;
+    }
+    sweep_mask = 0;
+
     for (size_t i = 0; i < n_selected && n < max; i++) {
         if (i > 0) {
             k_sleep(K_USEC(INTER_ANCHOR_DELAY_US));
@@ -422,8 +470,14 @@ static int anchor_sweep(struct pos_meas *out, size_t max)
         if (ok) {
             out[n].x       = ax;
             out[n].y       = ay;
+            out[n].dz      = dz;
             out[n].range_m = r;
             n++;
+
+            sweep_ax_cm[i] = pos_dbg_m_to_cm(ax);
+            sweep_ay_cm[i] = pos_dbg_m_to_cm(ay);
+            sweep_r_cm[i]  = pos_dbg_m_to_cm(r);
+            sweep_mask    |= (uint8_t)(1u << i);
         }
     }
 
@@ -955,10 +1009,91 @@ static void runner_fn(void *p1, void *p2, void *p3)
 
                 uwb_sweep_gate_swept(&sweep_gate, (uint8_t)(n > 0 ? n : 0));
 
+                /* Seed the solve from the filter. Gauss-Newton converges more
+                 * reliably from the previous fix than from a cold linear
+                 * seed, and once the filter is running this is the normal
+                 * path -- which is also why the solver's degeneracy check has
+                 * to hold with a seed, not just without one. */
+                float        seed[2] = { 0.0f, 0.0f };
+                const float *seed_p = pos_ekf_get(&ekf, &seed[0], &seed[1],
+                                                  NULL, NULL) ? seed : NULL;
+
                 struct pos_result pos;
-                if (n >= 3 && pos_solve(meas, (size_t)n, &pos)) {
+                bool solved = (n >= 3) &&
+                              pos_solve(meas, (size_t)n, seed_p, &pos);
+
+                /* Run the filter on every sweep that produced ranges, whether
+                 * or not the snapshot converged: the gating and the ZUPT are
+                 * still meaningful, and skipping the predict would leave dt
+                 * wrong for the next one.
+                 *
+                 * dt is measured, never assumed -- it varies with the tier and
+                 * with skipped superframes, which is the whole reason the
+                 * filter cannot hardcode a superframe period. */
+                uint32_t now  = uwb_radio_now_ms();
+                float    dt_s = have_last_fix
+                              ? (float)(uint32_t)(now - last_fix_ms) / 1000.0f
+                              : 0.0f;
+
+                last_fix_ms   = now;
+                have_last_fix = true;
+
+                if (!pos_ekf_get(&ekf, NULL, NULL, NULL, NULL)) {
+                    if (solved) {
+                        pos_ekf_seed(&ekf, pos.x, pos.y);
+                    }
+                } else {
+                    pos_ekf_predict(&ekf, &ekf_cfg, dt_s, motion_moving);
+                    if (n > 0) {
+                        (void)pos_ekf_update_ranges(&ekf, &ekf_cfg, meas,
+                                                    (size_t)n);
+                    }
+                    /* The accelerometer is a mode discriminator, not an
+                     * inertial sensor: this is the whole of its contribution
+                     * besides scheduling the process noise above. */
+                    if (!motion_moving) {
+                        pos_ekf_zupt(&ekf, &ekf_cfg);
+                    }
+                    /* Kidnapped tag, or carried while the accelerometer said
+                     * still: every range disagreed for reset_after fixes
+                     * running, so trust the snapshot over the filter. */
+                    if (solved && pos_ekf_needs_reseed(&ekf, &ekf_cfg)) {
+                        pos_ekf_seed(&ekf, pos.x, pos.y);
+                    }
+                }
+
+                /* When a fix is published is deliberately UNCHANGED: still
+                 * >= 3 anchors and a converged snapshot solve. The filter
+                 * changes the value, not the criteria -- publishing a pure
+                 * prediction is a separate decision that should be made
+                 * against captured data rather than assumed here.
+                 *
+                 * residual_m stays the snapshot's. It measures range
+                 * consistency, which is what makes it worth reporting; it is
+                 * not a statement about the filter's confidence, and it is
+                 * evaluated at the snapshot point rather than the filtered
+                 * one. */
+                if (solved) {
+                    float fx, fy;
+
+                    if (pos_ekf_get(&ekf, &fx, &fy, NULL, NULL)) {
+                        pos.x = fx;
+                        pos.y = fy;
+                    }
                     position_publish(&pos, (uint8_t)n, ctx.short_addr);
                 }
+
+                /* TEMPORARY: raw-range capture for EKF tuning -- remove with
+                 * the module. Quality is passed NULL: the per-range
+                 * dwt_readdiagnostics() read is design step 6 and is not
+                 * implemented, so `dbg q on` currently gates nothing and the
+                 * quality bytes are always zero. */
+                pos_dbg_sweep(now, sweep_aid, sweep_ax_cm, sweep_ay_cm,
+                              sweep_r_cm, NULL, sweep_mask,
+                              (uint8_t)ctx.tier, motion_moving, solved,
+                              solved
+                                ? (uint16_t)pos_dbg_m_to_cm(pos.residual_m)
+                                : POS_DBG_RES_NONE);
 
                 struct uwb_net_event sev = {
                     .kind      = UWB_EV_SWEPT,
@@ -1057,6 +1192,13 @@ size_t uwb_net_runner_stack_unused(void)
 void uwb_net_runner_start(const uint8_t eui[8])
 {
     memcpy(runner_eui, eui, UWB_FRAME_EUI_LEN);
+
+    /* Before the thread starts, so the first sweep sees a defined filter.
+     * r_range in these defaults is the design's ASSUMED range sigma, not a
+     * measurement -- the static-soak campaign is what settles it. */
+    pos_ekf_cfg_defaults(&ekf_cfg);
+    pos_ekf_reset(&ekf);
+    have_last_fix = false;
 
     k_thread_create(&runner_tid, runner_stack,
                     K_THREAD_STACK_SIZEOF(runner_stack),
