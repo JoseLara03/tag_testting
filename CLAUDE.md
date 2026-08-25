@@ -78,7 +78,14 @@ src/
   uwb_ss_initiator.c/h  — SS-TWR initiator: do_one_range_anchor(), position_publish(), twr_log() + 8-slot msgq
   uwb_net_runner.c/h    — Dynamic anchor selection runner: run_discovery(), anchor_sweep(), uwb_radio_ops impl
   uwb_net.c/h           — MAC FSM: state machine driving DISCOVER / SWEEP / JOIN / KEEPALIVE actions
-  uwb_frame_802_15_4z.c/h — Frame builders/parsers: E0 poll, E1 ranging resp, E2 discovery, E4 disc-resp, E5 beacon, EB alert
+  uwb_frame_802_15_4z.c/h — Frame builders/parsers: E0 poll, E1 ranging resp, E2 discovery, E4 disc-resp, E5 beacon, EE alert
+                          — ALERT moved EB->EE on 2026-08-25: the anchor project
+                            had EB as APOS_FRAME_TYPE, and the collision was exact
+                            (same 34-byte length, same discriminating offset 10).
+                            proto_ver is 3; a v2 tag is deaf to a v3 gateway, so
+                            both firmwares reflash together. **Byte-identical with
+                            ANCLA_ESP32S3's copy, and so is tests/uwb_frame/** --
+                            the anchor owns the file, this side copies it whole.
   alert_relay.c/h       — Pure dedup cache + gradient relay decision + gateway latch FSM for the 0xEB ALERT frame; compiled into both tag and anchor firmware; host-tested
   tag_alert_core.c/h    — Pure tag-side alert state (epoch/repeat/cancel scheduling), no Zephyr; host-tested
   tag_alert.c/h         — Zephyr glue for tag_alert_core: NVS epoch (storage id 3), k_mutex between the UI and runner threads
