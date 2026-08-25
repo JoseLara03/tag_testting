@@ -160,7 +160,7 @@ static void test_grant_discover(void)
     struct uwb_net_event g = ev_grant(0x0007, 3, UWB_TIER_FAST, 50);
     CHECK(uwb_net_handle(&c, &g) == UWB_ACT_RUN_DISCOVER);
     CHECK(c.state == UWB_ST_DISCOVER);
-    CHECK(c.short_addr == 0x0007 && c.slot_index == 3);
+    CHECK(c.short_addr == 0x0007 && c.seat_id == 3);
     CHECK(c.tier == UWB_TIER_FAST && c.lease_remaining == 50);
 
     /* Discovery finds too few anchors -> retry. */
@@ -174,12 +174,19 @@ static void test_grant_discover(void)
     CHECK(uwb_net_handle(&c, &d) == UWB_ACT_NONE);
     CHECK(c.state == UWB_ST_RANGING && c.n_anchors == 4);
 
-    /* Lease reclaimed mid-DISCOVER (addr absent) -> SCAN. */
+    /* One absence mid-DISCOVER is NOT a reclaim under contract v3 -- the slot
+     * map is a schedule, so being left out of one is the ordinary case. This
+     * assertion is deliberately inverted from what it was under v2, where a
+     * single absence dropped the tag to SCAN and thereby made gateway-side slot
+     * multiplexing impossible. Loss is now detected by
+     * UWB_NET_SCHED_GAP_MAX; see test_absence_beyond_the_gap_rejoins. */
     struct uwb_net_ctx c2; uwb_net_init(&c2, EUI);
     uwb_net_handle(&c2, &b); uwb_net_handle(&c2, &g);   /* DISCOVER */
     struct uwb_net_event lost = ev_beacon(1, false, 0); /* in_map = false */
-    CHECK(uwb_net_handle(&c2, &lost) == UWB_ACT_TO_SCAN);
-    CHECK(c2.state == UWB_ST_SCAN);
+    uint32_t la = uwb_net_handle(&c2, &lost);
+    CHECK(!(la & UWB_ACT_TO_SCAN));
+    CHECK(la & UWB_ACT_SLEEP);
+    CHECK(c2.state == UWB_ST_DISCOVER);
 }
 
 /* Regression: a tag stuck in DISCOVER must keep renewing its lease, otherwise
@@ -208,7 +215,8 @@ static void test_discover_keeps_lease(void)
         CHECK(c.lease_remaining > 0);
     }
     CHECK(saw_keepalive);
-    CHECK(c.slot_index == 3);
+    CHECK(c.seat_id == 3);
+    CHECK(c.tx_slot == 3);
 }
 
 /* Helper: drive a fresh ctx into RANGING with the given tier. */
@@ -230,7 +238,8 @@ static void test_ranging(void)
     uint32_t a = uwb_net_handle(&c, &b);
     CHECK(a & UWB_ACT_RUN_SWEEP);
     CHECK(!(a & UWB_ACT_SEND_KEEPALIVE));
-    CHECK(c.slot_index == 3);
+    /* The scheduled slot, which is what the runner uses for TDMA timing. */
+    CHECK(c.tx_slot == 3);
 
     /* range_every counts *participations*, not frame counters: once whole
      * superframes are skipped the frame counter advances while the tag is
@@ -275,11 +284,15 @@ static void test_ranging(void)
     CHECK(uwb_net_handle(&cm, &miss) == UWB_ACT_TO_SCAN);
     CHECK(cm.state == UWB_ST_SCAN);
 
-    /* Addr absent from map -> SCAN immediately. */
+    /* Absent from the map -> sleep, keep the seat. Inverted from v2 for the
+     * same reason as the DISCOVER case above. */
     struct uwb_net_ctx cr; to_ranging(&cr, UWB_TIER_FAST);
     struct uwb_net_event gone = ev_beacon(2, false, 0);
-    CHECK(uwb_net_handle(&cr, &gone) == UWB_ACT_TO_SCAN);
-    CHECK(cr.state == UWB_ST_SCAN);
+    uint32_t ga = uwb_net_handle(&cr, &gone);
+    CHECK(!(ga & UWB_ACT_TO_SCAN));
+    CHECK(ga & UWB_ACT_SLEEP);
+    CHECK(!(ga & UWB_ACT_RUN_SWEEP));
+    CHECK(cr.state == UWB_ST_RANGING);
 
     /* Sweep returns too few anchors -> re-discover. */
     struct uwb_net_ctx cd; to_ranging(&cd, UWB_TIER_FAST);
@@ -577,6 +590,211 @@ static void test_sweep_gate_interval(void)
               0x00000100u + UWB_NET_REDISCOVER_INTERVAL_MS));
 }
 
+
+/* ---- Contract v3: the slot map is a SCHEDULE, not an ownership table ----
+ *
+ * Under v2 a single absence from the map meant "seat reclaimed" and dropped the
+ * tag to SCAN. That is what made the gateway unable to time-multiplex slots: any
+ * superframe it left a seated tag out of the map, that tag tore down and
+ * rejoined. These tests pin the new behaviour.
+ */
+
+/* Absence is the ORDINARY case for every tier but FAST, and it must cost the
+ * tag nothing but a sleep. */
+static void test_absent_from_map_sleeps_and_keeps_seat(void)
+{
+    struct uwb_net_ctx c;
+    to_ranging(&c, UWB_TIER_IDLE);
+
+    uint16_t addr = c.short_addr;
+    uint8_t  seat = c.seat_id;
+
+    /* Scheduled once, then absent for a full IDLE period. */
+    for (uint32_t fc = 1; fc <= 24; fc++) {
+        struct uwb_net_event b = ev_beacon(fc, false, 0);
+        uint32_t a = uwb_net_handle(&c, &b);
+
+        CHECK(c.state == UWB_ST_RANGING);        /* NOT bounced to SCAN */
+        CHECK(!(a & UWB_ACT_TO_SCAN));
+        CHECK(a & UWB_ACT_SLEEP);                /* just sleep */
+        CHECK(!(a & UWB_ACT_RUN_SWEEP));         /* and do not transmit */
+        CHECK(c.short_addr == addr);
+        CHECK(c.seat_id == seat);
+    }
+}
+
+/* But absence cannot be tolerated forever, or a tag whose seat really was
+ * reclaimed would sleep and self-renew against a gateway that forgot it. */
+static void test_absence_beyond_the_gap_rejoins(void)
+{
+    struct uwb_net_ctx c;
+    to_ranging(&c, UWB_TIER_IDLE);
+
+    bool went_to_scan = false;
+
+    for (uint32_t fc = 1; fc <= UWB_NET_SCHED_GAP_MAX + 2u; fc++) {
+        struct uwb_net_event b = ev_beacon(fc, false, 0);
+        uint32_t a = uwb_net_handle(&c, &b);
+
+        if (a & UWB_ACT_TO_SCAN) {
+            went_to_scan = true;
+            CHECK(c.state == UWB_ST_SCAN);
+            /* Not one superframe early: the threshold is a real bound. */
+            CHECK(fc > UWB_NET_SCHED_GAP_MAX);
+            break;
+        }
+    }
+    CHECK(went_to_scan);
+}
+
+/* Being scheduled resets the clock, so a tag served at its cadence never
+ * accumulates toward the gap however long it runs. */
+static void test_scheduled_at_cadence_never_times_out(void)
+{
+    struct uwb_net_ctx c;
+    to_ranging(&c, UWB_TIER_IDLE);
+
+    /* Served every 25th superframe, as the gateway's IDLE cadence does. */
+    for (uint32_t fc = 1; fc <= UWB_NET_SCHED_GAP_MAX * 6u; fc++) {
+        bool sched = (fc % 25u == 1u);
+        struct uwb_net_event b = ev_beacon(fc, sched, 4);
+
+        uwb_net_handle(&c, &b);
+        CHECK(c.state == UWB_ST_RANGING);
+    }
+}
+
+/* KEEPALIVE is CAP traffic and owes nothing to the CFP schedule. If it stopped
+ * while the tag was unscheduled, a slow-tier tag would stop renewing exactly
+ * while it waited to be scheduled, and the gateway would reclaim the seat it
+ * was waiting on. */
+static void test_keepalive_fires_while_unscheduled(void)
+{
+    struct uwb_net_ctx c;
+    to_ranging(&c, UWB_TIER_IDLE);
+
+    bool saw = false;
+
+    for (uint32_t fc = 1; fc <= UWB_NET_SCHED_GAP_MAX; fc++) {
+        struct uwb_net_event b = ev_beacon(fc, false, 0);
+        uint32_t a = uwb_net_handle(&c, &b);
+
+        if (a & UWB_ACT_SEND_KEEPALIVE) { saw = true; break; }
+    }
+    CHECK(saw);
+}
+
+/* seat_id and tx_slot are different things, and conflating them is the trap
+ * this split exists to remove: the runner uses tx_slot for TDMA timing, and a
+ * seat id can reach GW_MAX_SEATS (128), which as a slot offset would place the
+ * poll far outside the superframe. */
+static void test_seat_id_and_tx_slot_are_independent(void)
+{
+    struct uwb_net_ctx c;
+    uwb_net_init(&c, EUI);
+
+    struct uwb_net_event b = ev_beacon(0, false, 0);
+    uwb_net_handle(&c, &b);
+
+    /* A seat id well beyond N_CFP, as the gateway will now hand out. */
+    struct uwb_net_event g = ev_grant(0x0123, 77, UWB_TIER_FAST, UWB_NET_LEASE_SF);
+    uwb_net_handle(&c, &g);
+    CHECK(c.seat_id == 77);
+
+    struct uwb_net_event d;
+    memset(&d, 0, sizeof(d));
+    d.kind = UWB_EV_DISCOVERED;
+    d.n_anchors = 4;
+    uwb_net_handle(&c, &d);
+
+    /* The beacon schedules it in slot 2. seat_id must NOT follow. */
+    struct uwb_net_event b2 = ev_beacon(1, true, 2);
+    uwb_net_handle(&c, &b2);
+    CHECK(c.tx_slot == 2);
+    CHECK(c.seat_id == 77);
+
+    /* A different slot next time; the seat is still the same seat. */
+    struct uwb_net_event b3 = ev_beacon(2, true, 9);
+    uwb_net_handle(&c, &b3);
+    CHECK(c.tx_slot == 9);
+    CHECK(c.seat_id == 77);
+}
+
+/* A fresh GRANT must start the unscheduled-gap clock. Left at 0 it would look
+ * like a 4-billion-superframe gap against any live gateway counter and drop the
+ * tag straight back to SCAN on its first beacon. */
+static void test_grant_seeds_the_gap_clock(void)
+{
+    struct uwb_net_ctx c;
+    uwb_net_init(&c, EUI);
+
+    /* A gateway that has been up a long time. */
+    struct uwb_net_event b = ev_beacon(4000000000u, false, 0);
+    uwb_net_handle(&c, &b);
+
+    struct uwb_net_event g = ev_grant(0x0009, 5, UWB_TIER_IDLE, UWB_NET_LEASE_SF);
+    uwb_net_handle(&c, &g);
+    CHECK(c.state == UWB_ST_DISCOVER);
+
+    struct uwb_net_event b2 = ev_beacon(4000000001u, false, 0);
+    uwb_net_handle(&c, &b2);
+    CHECK(c.state == UWB_ST_DISCOVER);      /* not thrown back to SCAN */
+}
+
+/* The gateway's frame counter wraps at 2^32. The gap is an unsigned difference,
+ * so a tag straddling the wrap must not read it as an enormous absence. */
+static void test_gap_survives_frame_counter_wrap(void)
+{
+    struct uwb_net_ctx c;
+    uwb_net_init(&c, EUI);
+
+    struct uwb_net_event b = ev_beacon(0xFFFFFFF0u, false, 0);
+    uwb_net_handle(&c, &b);
+    struct uwb_net_event g = ev_grant(0x000A, 1, UWB_TIER_FAST, UWB_NET_LEASE_SF);
+    uwb_net_handle(&c, &g);
+    struct uwb_net_event d;
+    memset(&d, 0, sizeof(d));
+    d.kind = UWB_EV_DISCOVERED;
+    d.n_anchors = 4;
+    uwb_net_handle(&c, &d);
+
+    /* Straight across the wrap, scheduled throughout. */
+    uint32_t fcs[] = { 0xFFFFFFF1u, 0xFFFFFFF8u, 0xFFFFFFFFu, 0u, 1u, 8u };
+
+    for (unsigned int i = 0; i < sizeof(fcs) / sizeof(fcs[0]); i++) {
+        struct uwb_net_event bi = ev_beacon(fcs[i], true, 0);
+
+        uwb_net_handle(&c, &bi);
+        CHECK(c.state == UWB_ST_RANGING);
+    }
+}
+
+/* DISCOVER has the same rule: unscheduled means sleep, not tear down. A tag
+ * that has a seat but not yet enough anchors must keep the seat. */
+static void test_discover_absent_from_map_keeps_seat(void)
+{
+    struct uwb_net_ctx c;
+    uwb_net_init(&c, EUI);
+
+    struct uwb_net_event b = ev_beacon(0, false, 0);
+    uwb_net_handle(&c, &b);
+    struct uwb_net_event g = ev_grant(0x0007, 3, UWB_TIER_SLOW, UWB_NET_LEASE_SF);
+    uwb_net_handle(&c, &g);
+
+    for (uint32_t fc = 1; fc <= 4; fc++) {
+        struct uwb_net_event bi = ev_beacon(fc, false, 0);
+        uint32_t a = uwb_net_handle(&c, &bi);
+
+        CHECK(c.state == UWB_ST_DISCOVER);
+        CHECK(!(a & UWB_ACT_RUN_DISCOVER));   /* discovery needs a slot */
+        CHECK(a & UWB_ACT_SLEEP);
+    }
+
+    /* Scheduled: now it may discover. */
+    struct uwb_net_event bs = ev_beacon(5, true, 1);
+    CHECK(uwb_net_handle(&c, &bs) & UWB_ACT_RUN_DISCOVER);
+}
+
 int main(void)
 {
     test_proto_ver_matches_frame_module();
@@ -593,6 +811,14 @@ int main(void)
     test_send_alert();
     test_sweep_gate_recovers_after_short_sweep();
     test_sweep_gate_interval();
+    test_absent_from_map_sleeps_and_keeps_seat();
+    test_absence_beyond_the_gap_rejoins();
+    test_scheduled_at_cadence_never_times_out();
+    test_keepalive_fires_while_unscheduled();
+    test_seat_id_and_tx_slot_are_independent();
+    test_grant_seeds_the_gap_clock();
+    test_gap_survives_frame_counter_wrap();
+    test_discover_absent_from_map_keeps_seat();
     printf(g_fail ? "FAILED %d\n" : "OK\n", g_fail);
     return g_fail ? 1 : 0;
 }

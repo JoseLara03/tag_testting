@@ -237,10 +237,14 @@ static uint32_t uwb_net_handle_core(struct uwb_net_ctx *c, const struct uwb_net_
     case UWB_ST_JOINING:
         if (ev->kind == UWB_EV_GRANT) {
             c->short_addr      = ev->g_short_addr;
-            c->slot_index      = ev->g_slot;
+            c->seat_id         = ev->g_slot;
             c->tier            = (uwb_tier_t)ev->g_tier;
             c->lease_remaining = ev->g_lease;
             c->miss_count      = 0;
+            /* Start the unscheduled-gap clock now. Left at 0 it would already
+             * look like a 4-billion-superframe gap against any live gateway
+             * counter and drop the tag straight back to SCAN. */
+            c->last_sched_fc   = c->frame_counter;
             c->state           = UWB_ST_DISCOVER;
             return UWB_ACT_RUN_DISCOVER;
         }
@@ -279,22 +283,34 @@ static uint32_t uwb_net_handle_core(struct uwb_net_ctx *c, const struct uwb_net_
             c->miss_count = 0;
             lease_age(c, ev);
             c->frame_counter = ev->frame_counter;
-            if (!ev->in_map) {             /* gateway reclaimed our seat */
+            if (ev->in_map) {
+                c->tx_slot       = ev->map_slot;
+                c->last_sched_fc = ev->frame_counter;
+            } else if ((uint32_t)(ev->frame_counter - c->last_sched_fc) >
+                       UWB_NET_SCHED_GAP_MAX) {
                 c->state = UWB_ST_SCAN;
                 return UWB_ACT_TO_SCAN;
             }
-            c->slot_index = ev->map_slot;
 
             /* The seat's lease ages every superframe on the gateway, including
              * while we are still discovering.  Renew it here too — otherwise a
              * tag that needs more than the lease to gather >= MIN_ANCHORS is
-             * reclaimed and bounced back to SCAN before it can ever range. */
-            uint32_t act = UWB_ACT_RUN_DISCOVER;   /* retry until >= MIN_ANCHORS */
+             * reclaimed and bounced back to SCAN before it can ever range.
+             *
+             * KEEPALIVE is CAP traffic and owes nothing to the CFP schedule, so
+             * it must still go out in a superframe we were NOT scheduled in --
+             * otherwise a tag at a slow tier stops renewing exactly while it
+             * waits to be scheduled, and the gateway reclaims the seat it is
+             * waiting on. */
+            uint32_t act = 0;
             if (c->lease_remaining <= (UWB_NET_LEASE_SF / 2)) {
                 act |= UWB_ACT_SEND_KEEPALIVE;
                 c->lease_remaining = UWB_NET_LEASE_SF;   /* optimistic renew */
             }
-            return act;
+            if (!ev->in_map) {
+                return act | UWB_ACT_SLEEP;
+            }
+            return act | UWB_ACT_RUN_DISCOVER;   /* retry until >= MIN_ANCHORS */
         }
         return UWB_ACT_NONE;
 
@@ -317,16 +333,25 @@ static uint32_t uwb_net_handle_core(struct uwb_net_ctx *c, const struct uwb_net_
             c->miss_count = 0;
             lease_age(c, ev);
             c->frame_counter = ev->frame_counter;
-            if (!ev->in_map) {              /* lease reclaimed */
+            if (ev->in_map) {
+                c->tx_slot       = ev->map_slot;
+                c->last_sched_fc = ev->frame_counter;
+            } else if ((uint32_t)(ev->frame_counter - c->last_sched_fc) >
+                       UWB_NET_SCHED_GAP_MAX) {
                 c->state = UWB_ST_SCAN;
                 return UWB_ACT_TO_SCAN;
             }
-            c->slot_index = ev->map_slot;
 
             uint32_t act = 0;
             if (c->lease_remaining <= (UWB_NET_LEASE_SF / 2)) {
                 act |= UWB_ACT_SEND_KEEPALIVE;
                 c->lease_remaining = UWB_NET_LEASE_SF;   /* optimistic renew */
+            }
+            /* Not our turn this superframe: sleep rather than sweep. Under
+             * contract v3 this is the ordinary case for every tier but FAST,
+             * and it is what lets 11 slots serve 100 tags. */
+            if (!ev->in_map) {
+                return act | UWB_ACT_SLEEP;
             }
             /* Count participations, not frame counters -- see part_count in
              * uwb_net.h for why the modulo test had to go. */

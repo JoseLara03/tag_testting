@@ -917,7 +917,10 @@ static void runner_fn(void *p1, void *p2, void *p3)
             int klen = uwb_frame_keepalive_build(ka_buf, sizeof(ka_buf),
                                                  ctx.short_addr,
                                                  (uint8_t)ctx.req_tier,
-                                                 ctx.slot_index);
+                                                 /* SEAT id: a stable identity
+                                                  * for the gateway to check,
+                                                  * not this superframe's slot. */
+                                                 ctx.seat_id);
             if (klen > 0) {
                 uint8_t mslot = (uint8_t)(sys_rand32_get() % N_CAP);
                 uwb_radio_tx_cap(ka_buf, (size_t)klen, mslot);
@@ -996,7 +999,10 @@ static void runner_fn(void *p1, void *p2, void *p3)
                 uint32_t slot_start = t0_ms
                     + T_BEACON_MS + T_GUARD_MS
                     + (uint32_t)N_CAP * T_MINISLOT_MS + T_GUARD_MS
-                    + (uint32_t)ctx.slot_index * (T_SLOT_MS + T_GUARD_MS);
+                    /* tx_slot, NOT seat_id. This is a TDMA slot offset, and
+                     * seat ids run to GW_MAX_SEATS (128) -- using one here
+                     * would place the poll far outside the superframe. */
+                    + (uint32_t)ctx.tx_slot * (T_SLOT_MS + T_GUARD_MS);
 
                 /* Strict: this is the tag's TDMA slot boundary. Returning
                  * early would put the poll outside the slot and straight into

@@ -10,6 +10,29 @@
 #define UWB_NET_MISS_MAX        3    /* M: consecutive beacon misses -> lost */
 #define UWB_NET_JOIN_RETRY_MAX  4    /* N: join attempts -> back to scan */
 #define UWB_NET_MIN_ANCHORS     3    /* need >=3 for a 2D fix */
+
+/* Superframes without appearing in the beacon's slot map after which the seat
+ * is presumed gone.
+ *
+ * Contract v3 makes the slot map a SCHEDULE rather than an ownership table, so
+ * absence is normal: a tag at the IDLE tier is legitimately absent from 24 of
+ * every 25 maps. Treating one absence as a reclaim -- which is what v2 did --
+ * would bounce every non-FAST tag to SCAN on its very first unscheduled
+ * superframe.
+ *
+ * UWB_NET_LEASE_SF is the right threshold rather than an invented one: it is
+ * exactly the window in which the gateway reclaims an unrenewed seat, so if the
+ * gateway still held our seat it would have scheduled us inside it. It also
+ * clears the slowest legitimate cadence (IDLE, 25 superframes) by 2x.
+ *
+ * This exists because `lease_remaining` is NOT a seat-loss detector, contrary
+ * to what the design spec first claimed. Its only consumers are the keepalive
+ * threshold -- which resets it to full OPTIMISTICALLY, whether or not the
+ * gateway ever received the keepalive -- and the GRANT. Nothing drives a state
+ * change off it, so the `!in_map` test was v2's ONLY way to notice a lost
+ * seat, and deleting it without this counter would leave the tag sleeping and
+ * self-renewing forever against a gateway that had long since forgotten it. */
+#define UWB_NET_SCHED_GAP_MAX   UWB_NET_LEASE_SF
 /* Must equal UWB_PROTO_VER in uwb_frame_802_15_4z.h -- the gateway stamps beacon
  * byte 10 with that one and the tag drops any beacon that does not match this
  * one. Bumping only the frame module leaves the tag deaf in SCAN with no
@@ -135,7 +158,7 @@ struct uwb_net_event {
     uint8_t  proto_ver;
     uint32_t frame_counter;
     bool     in_map;     /* our short addr present in the slot map */
-    uint8_t  map_slot;   /* slot index we occupy (valid iff in_map) */
+    uint8_t  map_slot;   /* CFP slot we were scheduled in (valid iff in_map) */
     /* GRANT */
     uint16_t g_short_addr;
     uint8_t  g_slot;
@@ -191,7 +214,19 @@ struct uwb_net_ctx {
     uwb_net_state_t state;
     uint8_t   eui[8];
     uint16_t  short_addr;
-    uint8_t   slot_index;
+    /* Seat identity, from the GRANT. Stable for the life of the seat, echoed
+     * in KEEPALIVE so the gateway can sanity-check. NOT a slot index under
+     * contract v3 -- GW_MAX_SEATS is 128, so this can exceed N_CFP. */
+    uint8_t   seat_id;
+    /* The CFP slot the beacon scheduled us in THIS superframe. Valid only for
+     * the superframe it was read from, and the only value the runner may use
+     * for TX timing -- using seat_id there would compute a slot offset far
+     * outside the superframe once seat ids exceed N_CFP. */
+    uint8_t   tx_slot;
+    /* Frame counter of the last beacon that scheduled us, for
+     * UWB_NET_SCHED_GAP_MAX. Compared with unsigned difference, so it is safe
+     * across the gateway counter's 2^32 wrap. */
+    uint32_t  last_sched_fc;
     uwb_tier_t tier;            /* granted tier */
     uwb_tier_t req_tier;        /* motion-driven request */
     uint16_t  lease_remaining;  /* superframes until expiry */
