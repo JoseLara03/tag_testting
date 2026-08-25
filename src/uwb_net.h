@@ -6,7 +6,12 @@
 #include <stddef.h>
 
 /* Lifecycle/config constants (contract v2). */
-#define UWB_NET_LEASE_SF        50   /* lease length, superframes */
+/* Lease length, superframes. Raised 50 -> 75 on 2026-08-25 to match the
+ * gateway's GW_LEASE_SF; the GRANT carries this value, so the two must agree.
+ * See gw_core.h for the derivation -- in short, the lease, the tier period and
+ * listen_skip are one parameter, and 50 put the slowest tier exactly on its own
+ * renewal deadline. */
+#define UWB_NET_LEASE_SF        75
 #define UWB_NET_MISS_MAX        3    /* M: consecutive beacon misses -> lost */
 #define UWB_NET_JOIN_RETRY_MAX  4    /* N: join attempts -> back to scan */
 #define UWB_NET_MIN_ANCHORS     3    /* need >=3 for a 2D fix */
@@ -63,22 +68,69 @@ struct uwb_tier_params {
     uint16_t range_every;
 };
 
-/* Hard cap applied to listen_skip on read, until the gateway implements the
- * lease contract in design §7.
+/* ---- listen_skip, the tier period, and the lease are ONE parameter ------
  *
- * UWB_NET_LEASE_SF is 50 superframes (10 s) and is renewed at half that, so a
- * tag that sleeps for more than 25 superframes cannot renew its lease: it
- * loses its seat on every skip and pays a full JOIN + GRANT + re-discovery
- * cycle each time, which costs more than the skip saves. Until the gateway
- * sizes the lease from a declared skip factor, no tier's design value works
- * against today's gateway: a skip of exactly 25 lands every renewal on its own
- * deadline, and on the bench a tag at "pwr tier f 25 1" emitted keepalives and
- * no position fixes at all. That is why the FAST default is 1 rather than the
- * design's 25 -- see tier_defaults in uwb_net.c.
+ * The cap stays, and the reason it stays is worth stating because the scale
+ * design's task list predicted the opposite. Separating a tag's SEAT from the
+ * SLOT it transmits in (contract v3) did not remove this constraint: the
+ * gateway still ages every lease once per superframe and reclaims at zero, so a
+ * tag that sleeps past its renewal deadline still loses its seat, exactly as
+ * before. Verified against gw_core.c rather than assumed.
  *
- * Clamped on read, not on write, so lifting this cap is a one-line edit that
- * does not require rewriting any stored value. */
+ * What contract v3 DID add is a second, different constraint that did not exist
+ * before, and it binds tighter than the lease:
+ *
+ *   The gateway now RESERVES airtime according to the granted tier and
+ *   schedules the tag once per tier period. A tag that sleeps longer than its
+ *   tier period sleeps through slots reserved for it -- wasting capacity that
+ *   now genuinely costs other tags. Under the old code a tag owned its slot
+ *   permanently, so oversleeping cost nothing and the two cadences could drift
+ *   apart unnoticed.
+ *
+ * So the design's listen_skip values (300 / 75 / 1) are wrong twice over: too
+ * long for the lease, AND far longer than the tier periods (25 / 5 / 1) the
+ * gateway schedules against. The three numbers are one number:
+ *
+ *     participate every N superframes
+ *       => tier period  = N
+ *       => listen_skip  = N
+ *       => lease        > 2N + margin
+ *
+ * uwb_net_tier_listen_skip() derives the skip from the granted tier so they
+ * cannot disagree, and tests/uwb_net pins the lease inequality for every tier.
+ * Deep skipping (N in the hundreds) needs a lease sized from a declared skip
+ * factor AND a tier period to match -- a gateway change, not a tag one, and out
+ * of scope for contract v3.
+ *
+ * The cap equals the slowest tier's period, which is what makes it a
+ * consequence rather than an arbitrary clamp. Applied on read, not on write, so
+ * changing it needs no stored value rewritten. */
 #define UWB_LISTEN_SKIP_CAP  25u
+
+/* Superframes between participations for each tier. MUST match the gateway's
+ * tier_period[] in gw_core.c -- it is the cadence the beacon's slot map is
+ * built from, so a disagreement means the tag sleeps through slots reserved for
+ * it or wakes for slots that were never coming. */
+#define UWB_NET_PERIOD_FAST     1u
+#define UWB_NET_PERIOD_SLOW     5u
+#define UWB_NET_PERIOD_IDLE     25u
+
+/* Margin between the wake cadence and the renewal deadline; mirrors the
+ * gateway's GW_LEASE_MARGIN_SF. */
+#define UWB_NET_LEASE_MARGIN_SF 4u
+
+/* Superframes between participations for `tier`. Unknown tiers read as IDLE --
+ * the slowest, never the fastest, so a corrupt grant cannot make a tag
+ * transmit more often than it was allowed. Pure. */
+uint16_t uwb_net_tier_period(uwb_tier_t tier);
+
+/* The listen-skip a tag at `tier` should actually use: its tier period, capped
+ * by UWB_LISTEN_SKIP_CAP and never zero. Derived rather than configured, so the
+ * wake cadence cannot drift away from the cadence the gateway schedules. Pure.
+ *
+ * `pwr tier` still sets listen_skip directly for experiments; this is what the
+ * runner should use in normal operation. */
+uint16_t uwb_net_tier_listen_skip(uwb_tier_t tier);
 
 /* Wall-clock interval between forced re-discovery rounds, milliseconds. Was
  * counted in participations, which becomes ~10 minutes once the IDLE tier

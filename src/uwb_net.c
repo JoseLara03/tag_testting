@@ -26,6 +26,25 @@ static struct uwb_tier_params tier_params[UWB_TIER_COUNT] = {
     {   1u, 1u },
 };
 
+uint16_t uwb_net_tier_period(uwb_tier_t tier)
+{
+    switch (tier) {
+    case UWB_TIER_FAST: return UWB_NET_PERIOD_FAST;
+    case UWB_TIER_SLOW: return UWB_NET_PERIOD_SLOW;
+    case UWB_TIER_IDLE: return UWB_NET_PERIOD_IDLE;
+    default:            return UWB_NET_PERIOD_IDLE;
+    }
+}
+
+uint16_t uwb_net_tier_listen_skip(uwb_tier_t tier)
+{
+    uint16_t p = uwb_net_tier_period(tier);
+
+    if (p > UWB_LISTEN_SKIP_CAP) p = UWB_LISTEN_SKIP_CAP;
+    if (p == 0u) p = 1u;
+    return p;
+}
+
 void uwb_net_reset_tier_params(void)
 {
     memcpy(tier_params, tier_defaults, sizeof(tier_params));

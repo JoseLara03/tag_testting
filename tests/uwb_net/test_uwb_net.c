@@ -340,12 +340,32 @@ static void test_lease_ages_by_elapsed(void)
 {
     struct uwb_net_ctx c; to_ranging(&c, UWB_TIER_FAST);
 
-    /* A single beacon 25 superframes later must age the lease by 25, which is
-     * exactly the renewal threshold. */
+    /* A single beacon 25 superframes later must age the lease by 25 -- that is
+     * what this test is really about, and it still holds.
+     *
+     * What changed: the renewal threshold is UWB_NET_LEASE_SF / 2, so at a
+     * lease of 50 a 25-superframe skip landed EXACTLY on it and the keepalive
+     * fired on every single wake with no margin at all. This test asserted that
+     * as correct behaviour; it was in fact the zero-margin condition the lease
+     * was raised to 75 to remove. Now 75 - 25 = 50 is still comfortably above
+     * the threshold of 37, so no keepalive is due yet, and that gap IS the fix.
+     *
+     * Whether zero margin was the whole of the bench failure recorded in
+     * uwb_net.h ("keepalives on the air and no position fixes") is not something
+     * these tests can settle -- margin can only help, and the claim here is no
+     * stronger than that. */
     uint32_t fc = c.frame_counter + 25u;
     struct uwb_net_event b = ev_beacon(fc, true, 3);
     uint32_t a = uwb_net_handle(&c, &b);
-    CHECK(a & UWB_ACT_SEND_KEEPALIVE);
+    CHECK(c.lease_remaining == UWB_NET_LEASE_SF - 25u);
+    CHECK(c.lease_remaining > (UWB_NET_LEASE_SF / 2));
+    CHECK(!(a & UWB_ACT_SEND_KEEPALIVE));           /* not due: margin exists */
+
+    /* One more skip and it IS due, still well before expiry. */
+    fc += 25u;
+    struct uwb_net_event b2 = ev_beacon(fc, true, 3);
+    uint32_t a2 = uwb_net_handle(&c, &b2);
+    CHECK(a2 & UWB_ACT_SEND_KEEPALIVE);
     CHECK(c.lease_remaining == UWB_NET_LEASE_SF);   /* renewed */
 
     /* Sustained: 200 re-syncs at skip 25 and the local lease must never run
@@ -795,6 +815,85 @@ static void test_discover_absent_from_map_keeps_seat(void)
     CHECK(uwb_net_handle(&c, &bs) & UWB_ACT_RUN_DISCOVER);
 }
 
+/* ---- T5: listen_skip, the tier period and the lease are one parameter --- */
+
+/* The inequality that makes a wake cadence sustainable. If this fails, a tag
+ * at that tier sleeps past its own renewal deadline and loses its seat every
+ * cycle -- which is the bench failure uwb_net.h records, and the reason the
+ * lease moved from 50 to 75. */
+static void test_every_tier_period_fits_the_lease(void)
+{
+    const uwb_tier_t tiers[] = { UWB_TIER_IDLE, UWB_TIER_SLOW,
+        		     UWB_TIER_FAST };
+
+    for (unsigned int i = 0; i < 3; i++) {
+        uint16_t p = uwb_net_tier_period(tiers[i]);
+
+        /* Renewal happens at half the lease, so the wake cadence plus a
+         * margin for missed beacons must fit inside that half. */
+        CHECK(p + UWB_NET_LEASE_MARGIN_SF < (UWB_NET_LEASE_SF / 2));
+    }
+
+    /* And at the OLD lease of 50 the slowest tier did NOT fit -- 25 + 4 is
+     * not less than 25. Pinned so the reason for 75 cannot be forgotten and
+     * quietly reverted. */
+    CHECK(!(UWB_NET_PERIOD_IDLE + UWB_NET_LEASE_MARGIN_SF < (50 / 2)));
+}
+
+/* The skip is DERIVED from the granted tier, not configured beside it. Under
+ * contract v3 the gateway reserves airtime per tier and schedules the tag once
+ * per tier period, so a skip longer than the period sleeps through slots
+ * reserved for it -- wasting capacity that now costs other tags. The design
+ * values (300 / 75 / 1) are wrong in exactly that way. */
+static void test_listen_skip_matches_the_tier_period(void)
+{
+    CHECK(uwb_net_tier_period(UWB_TIER_FAST) == 1u);
+    CHECK(uwb_net_tier_period(UWB_TIER_SLOW) == 5u);
+    CHECK(uwb_net_tier_period(UWB_TIER_IDLE) == 25u);
+
+    for (unsigned int t = 0; t < UWB_TIER_COUNT; t++) {
+        uwb_tier_t tier = (uwb_tier_t)t;
+        uint16_t skip = uwb_net_tier_listen_skip(tier);
+
+        CHECK(skip >= 1u);                       /* never zero */
+        CHECK(skip <= UWB_LISTEN_SKIP_CAP);
+        /* Never oversleeps its reserved slots. */
+        CHECK(skip <= uwb_net_tier_period(tier));
+    }
+
+    /* The cap equals the slowest tier period, which is what makes it a
+     * consequence of the tier table rather than an arbitrary clamp. */
+    CHECK(UWB_LISTEN_SKIP_CAP == UWB_NET_PERIOD_IDLE);
+
+    /* An out-of-range tier reads as the SLOWEST, never the fastest, so a
+     * corrupt grant cannot make a tag transmit more often than allowed. */
+    CHECK(uwb_net_tier_period((uwb_tier_t)99) == UWB_NET_PERIOD_IDLE);
+    CHECK(uwb_net_tier_listen_skip((uwb_tier_t)99) <=
+          UWB_NET_PERIOD_IDLE);
+}
+
+/* A tag sleeping its derived skip must survive indefinitely. This is the whole
+ * point of the exercise: the power saving the tag never actually collected,
+ * because every configuration that saved anything also lost the seat. */
+static void test_idle_tag_survives_sleeping_its_own_cadence(void)
+{
+    struct uwb_net_ctx c;
+    to_ranging(&c, UWB_TIER_IDLE);
+
+    uint16_t skip = uwb_net_tier_listen_skip(UWB_TIER_IDLE);
+    uint32_t fc = c.frame_counter;
+
+    for (int i = 0; i < 400; i++) {
+        fc += skip;
+        /* Scheduled on the wakes the gateway reserved for it. */
+        struct uwb_net_event b = ev_beacon(fc, true, 2);
+
+        uwb_net_handle(&c, &b);
+        CHECK(c.state == UWB_ST_RANGING);
+        CHECK(c.lease_remaining > 0);         /* never expires */
+    }
+}
+
 int main(void)
 {
     test_proto_ver_matches_frame_module();
@@ -807,6 +906,9 @@ int main(void)
     test_discover_keeps_lease();
     test_ranging();
     test_lease_ages_by_elapsed();
+    test_every_tier_period_fits_the_lease();
+    test_listen_skip_matches_the_tier_period();
+    test_idle_tag_survives_sleeping_its_own_cadence();
     test_gate_actions();
     test_send_alert();
     test_sweep_gate_recovers_after_short_sweep();
