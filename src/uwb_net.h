@@ -37,7 +37,7 @@
  * byte 10 with that one and the tag drops any beacon that does not match this
  * one. Bumping only the frame module leaves the tag deaf in SCAN with no
  * diagnostic. Pinned by tests/uwb_net/test_proto_ver_matches_frame_module. */
-#define UWB_NET_PROTO_VER       2
+#define UWB_NET_PROTO_VER       3
 
 typedef enum { UWB_TIER_IDLE = 0, UWB_TIER_SLOW = 1, UWB_TIER_FAST = 2 } uwb_tier_t;
 #define UWB_TIER_COUNT  3

@@ -3,7 +3,9 @@
 
 /*
  * Pure dedup cache, gradient relay decision, and gateway latch ordering for
- * the 0xEB ALERT frame. See spec/2026-08-16-uwb-help-alert-design.md §3/§6.
+ * the 0xEE ALERT frame (0xEB until 2026-08-25 -- it collided with the anchor
+ * survey's APOS_FRAME_TYPE; see uwb_frame_802_15_4z.h).
+ * See spec/2026-08-16-uwb-help-alert-design.md §3/§6.
  *
  * This module is meant to be compiled into BOTH the tag and the anchor/
  * gateway firmware unchanged -- the epoch-ordering rules in §3 and the relay
