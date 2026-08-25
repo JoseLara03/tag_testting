@@ -92,7 +92,14 @@ dwt_config_t config_options = {
 
 #if CONFIG_OPTION == CONFIG_OPTION_04
 /* Configuration option 04.
- * Channel 9, PRF 64M, Preamble Length 128, PAC 8, Preamble code 9, Data Rate 850k, STS Length 64
+ * Channel 9, PRF 64M, Preamble Length 1024, PAC 32, Preamble code 9, Data Rate 850k, STS Length 64
+ *
+ * Comment corrected 2026-08-25: it claimed PLEN 128 / PAC 8, but the struct
+ * below has always been PLEN_1024 / PAC32 with a matching SFD timeout of
+ * (1024 + 1 + 8 - 32). The CODE was right and internally consistent -- this is
+ * the channel-9 twin of option 07 -- only the comment was stale. Nothing here
+ * was changed; if you need a real PLEN-128 channel-9 option, add one rather
+ * than editing this.
  */
 dwt_config_t config_options = {
     9,                 /* Channel number. */
@@ -154,8 +161,19 @@ dwt_config_t config_options = {
 #endif
 
 #if CONFIG_OPTION == CONFIG_OPTION_07
-/* Configuration option 07.
- * Channel 5, PRF 64M, Preamble Length 1024, PAC 8, Preamble code 9, Data Rate 850k, STS Length 64
+/* Configuration option 07.  THE ACTIVE CONFIGURATION -- see CONFIG_OPTION.
+ * Channel 5, PRF 64M, Preamble Length 1024, PAC 32, Preamble code 9, Data Rate 850k, STS Length 64
+ *
+ * PAC is 32, not the 8 this comment claimed until 2026-08-25. The SFD timeout
+ * below must be derived from the PAC actually in the struct: it was
+ * (1024 + 1 + 8 - 8) = 1025, i.e. computed for PAC8 while the struct ran
+ * PAC32, which left the RX window open ~24 symbols longer than needed after a
+ * false preamble detect. Harmless enough to go unnoticed, but the anchor's
+ * src/uwb_phy.h -- the fixed PHY contract both sides must match EXACTLY --
+ * carries (1025 + 8 - 32) = 1001, so the two repos disagreed on a value the
+ * contract says is identical everywhere. 1001 is the correct one.
+ * See ANCLA_ESP32S3/docs/superpowers/specs/2026-08-25-rtls-scale-tdoa-design.md
+ * section 2.8. Do not "simplify" this back to - 8 without changing DWT_PAC32.
  */
 dwt_config_t config_options = {
     5,                  /* Channel number. */
@@ -167,7 +185,7 @@ dwt_config_t config_options = {
     DWT_BR_850K,        /* Data rate. */
     DWT_PHRMODE_STD,    /* PHY header mode. */
     DWT_PHRRATE_STD,    /* PHY header rate. */
-    (1024 + 1 + 8 - 8), /* SFD timeout (preamble length + 1 + SFD length - PAC size). Used in RX only. */
+    (1024 + 1 + 8 - 32), /* SFD timeout (preamble length + 1 + SFD length - PAC size). Used in RX only. */
     DWT_STS_MODE_OFF,     /* Mode 1 STS enabled */
     DWT_STS_LEN_64,     /* STS length*/
     DWT_PDOA_M0         /* PDOA mode off */
