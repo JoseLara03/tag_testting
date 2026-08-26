@@ -4,26 +4,37 @@
 /* Design §6.1 defaults. Runtime-settable so the constants can be tuned on
  * hardware (against a measured LFCLK tolerance, see design §4.3) rather than
  * by reflashing. Indexed by uwb_tier_t: IDLE = 0, SLOW = 1, FAST = 2. */
-/* FAST is 1, not the design's 25. Measured on the bench: at a listen_skip of
- * 25 the tag spends its participations on seat maintenance and emits nothing
- * else -- keepalives on the air and no position fixes. UWB_NET_LEASE_SF is 50
- * superframes renewed at half that, i.e. exactly 25, so a skip of 25 puts every
- * renewal precisely on its own deadline: any jitter or single missed re-sync
- * costs the seat, and the next participations go to JOIN/GRANT/keepalive rather
- * than to ranging. FAST is the moving-and-active tier, where the fix rate is
- * the whole point and the power saving is not; it re-syncs every superframe.
- * SLOW and IDLE keep the design's values -- they are where the power is, and
- * they are already clamped to UWB_LISTEN_SKIP_CAP on read. */
+/* The default listen_skip of every tier IS that tier's period -- not a separate
+ * number that happens to be near it. See the long comment on
+ * UWB_LISTEN_SKIP_CAP in uwb_net.h: under contract v3 the gateway reserves
+ * airtime per tier and schedules the tag once per tier period, so a skip longer
+ * than the period sleeps through slots reserved for that tag and wastes
+ * capacity other tags are now competing for.
+ *
+ * The design's values (300 / 75 / 1) were wrong twice over and the read-clamp
+ * to UWB_LISTEN_SKIP_CAP hid half of it: IDLE's 300 clamped to 25, which
+ * happens to equal the IDLE period, so IDLE looked fine by accident. SLOW's 75
+ * also clamped to 25 -- against a SLOW period of 5, i.e. awake for one in every
+ * five slots the gateway had reserved. A clamp is not agreement; deriving the
+ * value from the period is.
+ *
+ * FAST was already 1 for a bench-measured reason that still holds: at a skip of
+ * 25 the tag spent its participations on seat maintenance and emitted nothing
+ * else. That reason is now the general rule rather than a FAST-only exception.
+ *
+ * `pwr tier` still overwrites these at runtime for experiments; these are the
+ * values a tag boots and `pwr tier reset`s to. tests/uwb_net pins every default
+ * against uwb_net_tier_listen_skip() so the two cannot drift apart. */
 static const struct uwb_tier_params tier_defaults[UWB_TIER_COUNT] = {
-    { 300u, 1u },   /* IDLE: capped to 25 -> 5 s re-sync */
-    {  75u, 1u },   /* SLOW: capped to 25 -> 5 s */
-    {   1u, 1u },   /* FAST: every superframe */
+    { UWB_NET_PERIOD_IDLE, 1u },   /* 25 superframes -> 5 s re-sync */
+    { UWB_NET_PERIOD_SLOW, 1u },   /* 5 superframes -> 1 s */
+    { UWB_NET_PERIOD_FAST, 1u },   /* every superframe */
 };
 
 static struct uwb_tier_params tier_params[UWB_TIER_COUNT] = {
-    { 300u, 1u },
-    {  75u, 1u },
-    {   1u, 1u },
+    { UWB_NET_PERIOD_IDLE, 1u },
+    { UWB_NET_PERIOD_SLOW, 1u },
+    { UWB_NET_PERIOD_FAST, 1u },
 };
 
 uint16_t uwb_net_tier_period(uwb_tier_t tier)

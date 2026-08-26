@@ -27,15 +27,16 @@ static void test_tier_params(void)
 
     uwb_net_reset_tier_params();
 
-    /* Defaults, seen through the cap. FAST is 1, deliberately not the design's
-     * 25: at 25 the tag only maintained its seat and never ranged. */
+    /* Defaults are now each tier's PERIOD, so no default needs the cap at all
+     * -- see test_defaults_are_the_tier_periods below for why that matters. */
     uwb_net_get_tier_params(UWB_TIER_FAST, &p);
-    CHECK(p.listen_skip == 1u && p.range_every == 1u);
+    CHECK(p.listen_skip == UWB_NET_PERIOD_FAST && p.range_every == 1u);
     uwb_net_get_tier_params(UWB_TIER_SLOW, &p);
-    CHECK(p.listen_skip == UWB_LISTEN_SKIP_CAP);   /* stored 75, capped to 25 */
+    CHECK(p.listen_skip == UWB_NET_PERIOD_SLOW);   /* 5, not the capped 25 */
     CHECK(p.range_every == 1u);
     uwb_net_get_tier_params(UWB_TIER_IDLE, &p);
-    CHECK(p.listen_skip == UWB_LISTEN_SKIP_CAP);   /* stored 300, capped to 25 */
+    CHECK(p.listen_skip == UWB_NET_PERIOD_IDLE);   /* 25 == the cap, but by
+                                                    * derivation, not by clamp */
 
     /* The write is not clamped -- the stored value survives the cap. */
     struct uwb_tier_params set = { 300u, 4u };
@@ -894,6 +895,42 @@ static void test_idle_tag_survives_sleeping_its_own_cadence(void)
     }
 }
 
+/* The default listen_skip of every tier must BE that tier's period.
+ *
+ * This is the test that would have caught the live defect the Phase 1 review
+ * found: T5 derived uwb_net_tier_listen_skip() from the tier period and
+ * host-tested it, but nothing called it -- the runner kept reading
+ * tier_params[].listen_skip, whose SLOW default was the design's 75. The
+ * read-clamp to UWB_LISTEN_SKIP_CAP hid half the problem and made the other
+ * half look correct: IDLE's 300 clamped to 25, which happens to equal the IDLE
+ * period, so IDLE passed by accident. SLOW's 75 clamped to 25 as well -- against
+ * a SLOW period of 5, i.e. the tag awake for one in every five slots the
+ * gateway had already reserved and charged against GW_SCHED_CAPACITY for it.
+ *
+ * A clamp is not agreement. Pin the derivation. */
+static void test_defaults_are_the_tier_periods(void)
+{
+    const uwb_tier_t tiers[] = { UWB_TIER_IDLE, UWB_TIER_SLOW, UWB_TIER_FAST };
+
+    uwb_net_reset_tier_params();
+
+    for (unsigned int i = 0; i < 3; i++) {
+        struct uwb_tier_params p;
+
+        uwb_net_get_tier_params(tiers[i], &p);
+        CHECK(p.listen_skip == uwb_net_tier_listen_skip(tiers[i]));
+        CHECK(p.listen_skip == uwb_net_tier_period(tiers[i]));
+    }
+
+    /* And the specific value that was wrong, named so a revert is loud: SLOW
+     * must not read back as the cap. */
+    struct uwb_tier_params slow;
+
+    uwb_net_get_tier_params(UWB_TIER_SLOW, &slow);
+    CHECK(slow.listen_skip == 5u);
+    CHECK(slow.listen_skip != UWB_LISTEN_SKIP_CAP);
+}
+
 int main(void)
 {
     test_proto_ver_matches_frame_module();
@@ -909,6 +946,7 @@ int main(void)
     test_every_tier_period_fits_the_lease();
     test_listen_skip_matches_the_tier_period();
     test_idle_tag_survives_sleeping_its_own_cadence();
+    test_defaults_are_the_tier_periods();
     test_gate_actions();
     test_send_alert();
     test_sweep_gate_recovers_after_short_sweep();
