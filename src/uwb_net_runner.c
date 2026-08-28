@@ -1008,6 +1008,22 @@ static void runner_fn(void *p1, void *p2, void *p3)
             uwb_radio_sleep_until_strict(slot_start);
 
             blink_publish(ctx.short_addr, ev.alert_pending);
+
+            /* A blinking tag solves nothing, so it HAS no recent fix: say so,
+             * rather than leaving the last TWR fix looking current. Without
+             * this, toggling `blink off` after a long session hands
+             * pos_ekf_predict() a dt_s spanning the whole blink period (see
+             * the dt_s computation in the sweep branch below), which is a
+             * meaningless predict step over a gap where the tag was not
+             * tracking at all. Clearing it is not a workaround -- have_last_fix
+             * false is the accurate state here.
+             *
+             * The sweep GATE is deliberately left alone. Nothing calls
+             * uwb_sweep_gate_swept() in this mode, so `last_sweep_n` stays as
+             * the last TWR cycle left it and returning to TWR can spend one
+             * cycle in re-discovery. That is benign and arguably right: after a
+             * long blink session the anchor list really is stale. */
+            have_last_fix = false;
         }
 
         if (act & UWB_ACT_RUN_SWEEP) {
