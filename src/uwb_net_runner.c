@@ -27,6 +27,7 @@
 #include "beacon_sched_core.h"
 #include "scan_backoff_core.h"
 #include "tag_alert.h"
+#include "blink_cfg.h"
 #include <zephyr/kernel.h>
 #include <zephyr/random/random.h>
 #include <string.h>
@@ -841,6 +842,11 @@ static void runner_fn(void *p1, void *p2, void *p3)
          * state actually earns UWB_ACT_SEND_ALERT. */
         ev.alert_pending = tag_alert_active();
 
+        /* TDoA transmit mode, refreshed every superframe from the persisted
+         * setting so `blink on|off` takes effect on the next cadence slot
+         * without a reboot. Default false = today's TWR sweep, bit for bit. */
+        ctx.blink_mode = blink_cfg_enabled();
+
         /* Coverage ladder. The alert pin goes on first so the failure below is
          * a no-op while a HELP stands -- an emergency is exactly when the tag
          * should be trying hardest to find a network. A beacon in *any* state
@@ -973,6 +979,35 @@ static void runner_fn(void *p1, void *p2, void *p3)
                 .n_anchors = (uint8_t)(n > 0 ? n : 0),
             };
             uwb_net_handle(&ctx, &dev);
+        }
+
+        /* TDoA BLINK. Emitted in place of the sweep, in the same CFP slot and
+         * under the same slot-start deadline -- uwb_net.c raises exactly one
+         * of the two bits, never both, so this block and the sweep below are
+         * mutually exclusive by construction.
+         *
+         * Placed before UWB_ACT_RUN_SWEEP and before UWB_ACT_SLEEP for the
+         * reason the alert block states: the action word is a bitmask
+         * evaluated top to bottom and position in this function IS the
+         * priority.
+         *
+         * No sweep-gate / re-discovery branch here: a blinking tag does not
+         * need an anchor list at all -- it neither polls nor solves. It stays
+         * in UWB_ST_RANGING because nothing emits UWB_EV_SWEPT, which is the
+         * only path back to DISCOVER; that is correct for TDoA, and the seat
+         * protocol (JOIN/GRANT/KEEPALIVE) is untouched either way. */
+        if (act & UWB_ACT_SEND_BLINK) {
+            uint32_t slot_start = t0_ms
+                + T_BEACON_MS + T_GUARD_MS
+                + (uint32_t)N_CAP * T_MINISLOT_MS + T_GUARD_MS
+                + (uint32_t)ctx.tx_slot * (T_SLOT_MS + T_GUARD_MS);
+
+            /* Strict, exactly as the sweep is: the BLINK goes out inside this
+             * tag's own TDMA slot, which is also what keeps it clear of the
+             * beacon guard -- the CFP starts after T_BEACON_MS + T_GUARD_MS. */
+            uwb_radio_sleep_until_strict(slot_start);
+
+            blink_publish(ctx.short_addr, ev.alert_pending);
         }
 
         if (act & UWB_ACT_RUN_SWEEP) {

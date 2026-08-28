@@ -37,6 +37,12 @@ bool do_one_range_anchor(uint8_t aid, float *range_m, float *ax, float *ay);
 void position_publish(const struct pos_result *pos, uint8_t n_anchors,
                       uint16_t src_addr);
 
+/* Transmit one TDoA BLINK (0xF0) with the tag's granted short address -- the
+ * same address its POS frames use, which is how the gateway resolves a stable
+ * Tid from its seat table. Same call contract as position_publish(): runner
+ * thread only, inside its own CFP slot, no uwb_radio_owner claim. */
+void blink_publish(uint16_t src_addr, bool alert_pending);
+
 /* Last position cached by position_publish(), for the alert frame's last_x/
  * last_y. Returns false (leaving the pointed-to x and y untouched) when there
  * has never been a fix -- the caller sends NaN in that case. */

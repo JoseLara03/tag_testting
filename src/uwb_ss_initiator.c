@@ -22,6 +22,7 @@
 #include "uwb_radio_owner.h"
 #include "uwb_frame_802_15_4z.h"
 #include "batt.h"
+#include "blink_frame.h"
 
 #include <zephyr/kernel.h>
 #include <string.h>
@@ -363,6 +364,64 @@ void position_publish(const struct pos_result *pos, uint8_t n_anchors,
      * ~1.3 ms of airtime; 30 iterations at 100 us each is ~3 ms, leaving
      * headroom against T_SLOT_MS=24 while still catching a stuck radio well
      * short of the next tag's slot. */
+    for (int i = 0; i < 30; i++) {
+        if (dwt_readsysstatuslo() & DWT_INT_TXFRS_BIT_MASK) {
+            dwt_writesysstatuslo(DWT_INT_TXFRS_BIT_MASK);
+            return;
+        }
+        k_busy_wait(100);
+    }
+    dwt_forcetrxoff();
+    dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+}
+
+/*
+ * Transmit one TDoA BLINK (0xF0). Same transmit sequence as
+ * position_publish() above -- deliberately, so the two share the forced-IDLE
+ * entry, the shared frame_seq_nb, and the bounded TXFRS poll rather than
+ * growing a second, subtly different TX path. Call from the runner thread
+ * only, inside its own CFP slot: no uwb_radio_owner claim, exactly like
+ * position_publish().
+ *
+ * blink_seq is a plain per-tag counter that wraps at 256. The gateway's
+ * collector keys groups on (tag_addr, blink_seq) with a 150 ms window, far
+ * shorter than the ~51 s a value takes to recur at 5 Hz, so no extra
+ * disambiguator is needed -- see the anchor repo's src/tdoa_collect.c.
+ */
+static uint8_t blink_seq_nb;
+
+void blink_publish(uint16_t src_addr, bool alert_pending)
+{
+    struct blink_frame bf = {
+        .src_addr = src_addr,
+        .seq      = blink_seq_nb++,
+        /* The same source and the same "no reading" sentinel the 0xEA POS
+         * frame uses (UWB_FRAME_POS_SOC_UNKNOWN, 0xFF) -- batt_soc_cached()
+         * already returns it when the charger has no valid reading. */
+        .batt_soc = batt_soc_cached(),
+        .flags    = alert_pending ? BLINK_FLAG_ALERT : 0u,
+    };
+
+    uint8_t buf[BLINK_FRAME_LEN];
+    int len = blink_frame_build(buf, sizeof(buf), src_addr, frame_seq_nb++, &bf);
+
+    if (len < 0) {
+        return;
+    }
+
+    /* Force IDLE before this TX, for the reason position_publish() states:
+     * an immediate-TX command is not honoured from a non-IDLE PHY. */
+    dwt_forcetrxoff();
+
+    dwt_writetxdata((uint16_t)len, buf, 0);
+    dwt_writetxfctrl((uint16_t)(len + FCS_LEN), 0, 0);
+
+    if (dwt_starttx(DWT_START_TX_IMMEDIATE) != DWT_SUCCESS) {
+        dwt_forcetrxoff();
+        dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+        return;
+    }
+
     for (int i = 0; i < 30; i++) {
         if (dwt_readsysstatuslo() & DWT_INT_TXFRS_BIT_MASK) {
             dwt_writesysstatuslo(DWT_INT_TXFRS_BIT_MASK);
