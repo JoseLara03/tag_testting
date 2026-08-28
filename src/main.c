@@ -19,6 +19,7 @@
 #include "storage.h"
 #include "nfc_tag.h"
 #include "pos_cfg.h"
+#include "blink_cfg.h"
 #ifdef CONFIG_TAG_CAL_MODE
 #include "uwb_radio_owner.h"
 #include "cal_diag.h"
@@ -81,6 +82,7 @@ int main(void)
          * anything sent here is dropped (no central is connected at boot).
          * Production image only -- the cal image never starts the runner. */
         pos_cfg_init();
+        blink_cfg_init();
 
         if (nfc_tag_init() != 0) {
             ble_log_send("NFC fail\n");

@@ -20,6 +20,7 @@ target_sources(app PRIVATE
     src/pos_residual.c
     src/pos_ekf.c
     src/pos_cfg.c
+    src/blink_cfg.c
     src/blink_frame.c
     # TEMPORARY: raw-range capture for EKF tuning. Delete this line with the
     # module -- see spec/2026-08-22-position-filtering-design.md.

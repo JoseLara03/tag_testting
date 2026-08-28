@@ -10,6 +10,7 @@
 #include "rx_stats.h"
 #include "wdt.h"
 #include "pos_cfg.h"
+#include "blink_cfg.h"
 #include "pos_dbg.h"   /* TEMPORARY -- remove with the raw-range debug log */
 #ifdef CONFIG_TAG_CAL_MODE
 #include "cal_diag.h"
@@ -219,6 +220,16 @@ static void tag_cmd_on_rx(const uint8_t *data, uint16_t len)
 	if (strncmp(buf, "pos", 3) == 0 && (buf[3] == '\0' || buf[3] == ' ')) {
 		if (!pos_cfg_on_cmd(buf)) {
 			ble_log_send("POS ?\n");
+		}
+		return;
+	}
+
+	/* TDoA transmit mode: `blink [on|off]`. Chooses what the tag emits in
+	 * the ranging cadence slot -- the TWR sweep (default) or a 0xF0 BLINK
+	 * for the gateway to solve. Persisted; takes effect on the next slot. */
+	if (strncmp(buf, "blink", 5) == 0 && (buf[5] == '\0' || buf[5] == ' ')) {
+		if (!blink_cfg_on_cmd(buf)) {
+			ble_log_send("BLINK ?\n");
 		}
 		return;
 	}
