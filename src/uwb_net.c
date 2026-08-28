@@ -391,7 +391,10 @@ static uint32_t uwb_net_handle_core(struct uwb_net_ctx *c, const struct uwb_net_
             c->part_count++;
             if (c->part_count >= tp.range_every) {
                 c->part_count = 0;
-                act |= UWB_ACT_RUN_SWEEP;
+                /* One cadence slot, two possible emissions -- never both.
+                 * TWR sweep by default; a BLINK when the tag has been put in
+                 * TDoA mode. */
+                act |= c->blink_mode ? UWB_ACT_SEND_BLINK : UWB_ACT_RUN_SWEEP;
             } else {
                 act |= UWB_ACT_SLEEP;
             }

@@ -242,6 +242,17 @@ struct uwb_net_event {
  * outside UWB_ACT_RANGING_MASK -- an uncalibrated tag must still call for
  * help. */
 #define UWB_ACT_SEND_ALERT      (1u << 6)
+/* TDoA BLINK (0xF0). Emitted INSTEAD OF UWB_ACT_RUN_SWEEP, in the exact same
+ * cadence slot, when ctx.blink_mode is set -- never alongside it. The default
+ * is false, so a tag that is not told otherwise behaves bit for bit as before
+ * (TWR sweep + 0xEA POS).
+ *
+ * Deliberately outside UWB_ACT_RANGING_MASK: a BLINK is a one-way transmission
+ * the tag does no arithmetic on. The tag's own TX antenna delay shifts every
+ * anchor's reception by the same amount and therefore cancels in the range
+ * DIFFERENCES the gateway solves, so an uncalibrated tag's BLINK is still
+ * usable -- unlike its TWR sweep, whose absolute range is meaningless. */
+#define UWB_ACT_SEND_BLINK      (1u << 7)
 
 /* Actions whose result depends on the antenna delay. Cleared when the tag has
  * no valid antenna calibration -- see uwb_net_gate_actions().
@@ -264,6 +275,13 @@ uint32_t uwb_net_gate_actions(uint32_t act, bool cal_valid);
 
 struct uwb_net_ctx {
     uwb_net_state_t state;
+    /* TDoA transmit mode. When true the RANGING cadence emits
+     * UWB_ACT_SEND_BLINK where it would otherwise emit UWB_ACT_RUN_SWEEP;
+     * nothing else about the FSM changes and the seat protocol is untouched.
+     * Set by the caller (the runner, from the persisted blink_cfg) before
+     * each uwb_net_handle() call. Defaults to false via the zero-initialised
+     * context, which is today's TWR behaviour. */
+    bool      blink_mode;
     uint8_t   eui[8];
     uint16_t  short_addr;
     /* Seat identity, from the GRANT. Stable for the life of the seat, echoed

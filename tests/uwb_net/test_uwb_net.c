@@ -931,6 +931,64 @@ static void test_defaults_are_the_tier_periods(void)
     CHECK(slow.listen_skip != UWB_LISTEN_SKIP_CAP);
 }
 
+/* TDoA blink mode: same cadence slot, different emission, and never both.
+ * Also pins the default -- a zero-initialised context must still sweep. */
+static void test_blink_mode(void)
+{
+    /* Default (blink_mode false) is unchanged TWR behaviour. */
+    struct uwb_net_ctx c; to_ranging(&c, UWB_TIER_FAST);
+    CHECK(c.blink_mode == false);
+    struct uwb_net_event b = ev_beacon(2, true, 3);
+    uint32_t a = uwb_net_handle(&c, &b);
+    CHECK(a & UWB_ACT_RUN_SWEEP);
+    CHECK(!(a & UWB_ACT_SEND_BLINK));
+
+    /* Blink mode: BLINK instead of SWEEP, on exactly the same superframes. */
+    struct uwb_net_ctx cb; to_ranging(&cb, UWB_TIER_FAST);
+    cb.blink_mode = true;
+    struct uwb_net_event bb = ev_beacon(2, true, 3);
+    uint32_t ab = uwb_net_handle(&cb, &bb);
+    CHECK(ab & UWB_ACT_SEND_BLINK);
+    CHECK(!(ab & UWB_ACT_RUN_SWEEP));
+    CHECK(cb.tx_slot == 3);                       /* seat protocol untouched */
+
+    /* The cadence itself is unchanged: drive range_every = 3 in both modes
+     * and require the two action words to differ ONLY in which of the two
+     * bits is set. */
+    uwb_net_reset_tier_params();
+    struct uwb_tier_params every3 = { 75u, 3u };
+    uwb_net_set_tier_params(UWB_TIER_SLOW, &every3);
+
+    struct uwb_net_ctx cs;  to_ranging(&cs,  UWB_TIER_SLOW);
+    struct uwb_net_ctx csb; to_ranging(&csb, UWB_TIER_SLOW);
+    csb.blink_mode = true;
+    static const uint32_t fcs2[] = { 7, 400, 401, 9000, 9025, 9050, 12345 };
+    unsigned n_blinks = 0;
+    for (unsigned i = 0; i < sizeof(fcs2) / sizeof(fcs2[0]); i++) {
+        struct uwb_net_event e1 = ev_beacon(fcs2[i], true, 3);
+        struct uwb_net_event e2 = ev_beacon(fcs2[i], true, 3);
+        uint32_t a1 = uwb_net_handle(&cs,  &e1);
+        uint32_t a2 = uwb_net_handle(&csb, &e2);
+        bool due = ((i + 1) % 3u) == 0u;
+        CHECK(((a1 & UWB_ACT_RUN_SWEEP)  != 0) == due);
+        CHECK(((a2 & UWB_ACT_SEND_BLINK) != 0) == due);
+        CHECK(!(a2 & UWB_ACT_RUN_SWEEP));
+        /* Everything else -- keepalive, sleep, to-scan -- identical. */
+        CHECK((a1 & ~(UWB_ACT_RUN_SWEEP | UWB_ACT_SEND_BLINK)) ==
+              (a2 & ~(UWB_ACT_RUN_SWEEP | UWB_ACT_SEND_BLINK)));
+        if (due) { n_blinks++; }
+    }
+    /* Negative-control guard: the loop must actually have exercised the due
+     * branch, so a future change that skips every iteration cannot pass. */
+    CHECK(n_blinks == 2u);
+    uwb_net_reset_tier_params();
+
+    /* BLINK is not gated on calibration -- see UWB_ACT_SEND_BLINK's comment:
+     * the tag's TX antenna delay is common-mode and cancels in the range
+     * differences the gateway solves. */
+    CHECK(uwb_net_gate_actions(UWB_ACT_SEND_BLINK, false) & UWB_ACT_SEND_BLINK);
+}
+
 int main(void)
 {
     test_proto_ver_matches_frame_module();
@@ -949,6 +1007,7 @@ int main(void)
     test_defaults_are_the_tier_periods();
     test_gate_actions();
     test_send_alert();
+    test_blink_mode();
     test_sweep_gate_recovers_after_short_sweep();
     test_sweep_gate_interval();
     test_absent_from_map_sleeps_and_keeps_seat();
