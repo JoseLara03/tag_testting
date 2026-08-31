@@ -1,5 +1,6 @@
 board:
   name: nRF52833_tag
+  full_name: Innovaforce nRF52833 Tag
   vendor: Innovaforce
   socs:
     - name: nrf52833
