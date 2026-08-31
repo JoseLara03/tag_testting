@@ -16,7 +16,6 @@
 #include "pos_solver.h"
 #include "pos_ekf.h"
 #include "pos_cfg.h"
-#include "pos_dbg.h"   /* TEMPORARY -- remove with the raw-range debug log */
 #include "uwb_radio_owner.h"
 #include "port.h"
 #include "deca_device_api.h"
@@ -73,6 +72,15 @@
 /* ---- Anchor-pool / CIR selection ---- */
 #define ANCHOR_POOL_MAX           6
 #define ANCHOR_SELECT_MAX         4
+/* A dead anchor's score only ever decayed (EMA_DECAY per missed discovery
+ * round) with no floor and no eviction, so with fewer than ANCHOR_SELECT_MAX
+ * live competitors a silent anchor's ever-shrinking-but-nonzero score could
+ * still place in the top N forever -- selected[] kept naming it and
+ * anchor_sweep() kept polling a dead board every single sweep. Evict after
+ * this many CONSECUTIVE missed discovery rounds instead of trusting relative
+ * score alone. Counted in discovery rounds, not sweeps: anchor_pool_update()/
+ * _decay_missed() are only ever called from run_discovery(). */
+#define ANCHOR_POOL_EVICT_MISSES  2
 /* The minimum that makes a round "enough" is UWB_NET_MIN_ANCHORS (uwb_net.h),
  * the same symbol the FSM compares n_anchors against. A private copy here is
  * what let this file's sweep gate and the FSM disagree about whether the tag
@@ -85,7 +93,8 @@ typedef struct {
     uint8_t id;
     float   ema_score;
     bool    valid;
-    bool    seen;   /* transient: set during discovery, cleared before each round */
+    bool    seen;         /* transient: set during discovery, cleared before each round */
+    uint8_t miss_count;   /* consecutive discovery rounds not seen; see ANCHOR_POOL_EVICT_MISSES */
 } anchor_entry_t;
 
 static anchor_entry_t anchor_pool[ANCHOR_POOL_MAX];
@@ -96,19 +105,6 @@ static uint8_t        n_selected;
  * inline condition here, and in that shape it latched the tag out of ranging
  * for good after a single short sweep. See struct uwb_sweep_gate. */
 static struct uwb_sweep_gate sweep_gate;
-
-/* The debug log indexes by SELECTED slot, not by the compacted pos_meas array,
- * because a slot's identity does not stop existing when its anchor misses one
- * sweep -- see the caller contract on pos_dbg_sweep(). Coordinates persist per
- * slot and are cleared only when the slot is reassigned to a different anchor.
- * TEMPORARY, with the debug log. */
-BUILD_ASSERT(ANCHOR_SELECT_MAX == POS_MAX_ANCHORS,
-             "the per-slot debug arrays are sized by POS_MAX_ANCHORS");
-static uint8_t  sweep_aid[POS_MAX_ANCHORS];
-static int16_t  sweep_ax_cm[POS_MAX_ANCHORS];
-static int16_t  sweep_ay_cm[POS_MAX_ANCHORS];
-static int16_t  sweep_r_cm[POS_MAX_ANCHORS];
-static uint8_t  sweep_mask;
 
 /* ---- Position filter ------------------------------------------------------
  * Tightly-coupled EKF over the raw ranges. Owned by the runner thread and
@@ -188,17 +184,19 @@ static void anchor_pool_update(uint8_t id, int32_t cir_power, uint16_t cir_quali
         if (anchor_pool[i].valid && anchor_pool[i].id == id) {
             anchor_pool[i].ema_score = EMA_ALPHA * score +
                                        (1.0f - EMA_ALPHA) * anchor_pool[i].ema_score;
-            anchor_pool[i].seen = true;
+            anchor_pool[i].seen       = true;
+            anchor_pool[i].miss_count = 0;
             return;
         }
     }
     /* New anchor: find empty slot */
     for (int i = 0; i < ANCHOR_POOL_MAX; i++) {
         if (!anchor_pool[i].valid) {
-            anchor_pool[i].id        = id;
-            anchor_pool[i].ema_score = score;
-            anchor_pool[i].valid     = true;
-            anchor_pool[i].seen      = true;
+            anchor_pool[i].id         = id;
+            anchor_pool[i].ema_score  = score;
+            anchor_pool[i].valid      = true;
+            anchor_pool[i].seen       = true;
+            anchor_pool[i].miss_count = 0;
             return;
         }
     }
@@ -209,9 +207,10 @@ static void anchor_pool_update(uint8_t id, int32_t cir_power, uint16_t cir_quali
             worst = i;
         }
     }
-    anchor_pool[worst].id        = id;
-    anchor_pool[worst].ema_score = score;
-    anchor_pool[worst].seen      = true;
+    anchor_pool[worst].id         = id;
+    anchor_pool[worst].ema_score  = score;
+    anchor_pool[worst].seen       = true;
+    anchor_pool[worst].miss_count = 0;
 }
 
 static void anchor_pool_decay_missed(void)
@@ -219,6 +218,15 @@ static void anchor_pool_decay_missed(void)
     for (int i = 0; i < ANCHOR_POOL_MAX; i++) {
         if (anchor_pool[i].valid && !anchor_pool[i].seen) {
             anchor_pool[i].ema_score *= EMA_DECAY;
+            anchor_pool[i].miss_count++;
+            if (anchor_pool[i].miss_count >= ANCHOR_POOL_EVICT_MISSES) {
+                /* Free the slot outright rather than let a shrinking-but-
+                 * nonzero score keep winning a spot in selected[] against
+                 * too few live competitors. */
+                anchor_pool[i].valid      = false;
+                anchor_pool[i].ema_score  = 0.0f;
+                anchor_pool[i].miss_count = 0;
+            }
         }
     }
 }
@@ -444,22 +452,6 @@ static int anchor_sweep(struct pos_meas *out, size_t max)
      * fix built from two different dz values would be incoherent. */
     const float dz = pos_cfg_dz_m();
 
-    /* Reset the per-slot debug snapshot. Coordinates survive a missed sweep
-     * but not a slot reassignment. */
-    for (size_t i = 0; i < POS_MAX_ANCHORS; i++) {
-        if (i >= n_selected) {
-            sweep_aid[i]   = POS_DBG_AID_NONE;
-            sweep_ax_cm[i] = 0;
-            sweep_ay_cm[i] = 0;
-        } else if (sweep_aid[i] != selected[i]) {
-            sweep_aid[i]   = selected[i];
-            sweep_ax_cm[i] = 0;
-            sweep_ay_cm[i] = 0;
-        }
-        sweep_r_cm[i] = 0;
-    }
-    sweep_mask = 0;
-
     for (size_t i = 0; i < n_selected && n < max; i++) {
         if (i > 0) {
             k_sleep(K_USEC(INTER_ANCHOR_DELAY_US));
@@ -474,11 +466,6 @@ static int anchor_sweep(struct pos_meas *out, size_t max)
             out[n].dz      = dz;
             out[n].range_m = r;
             n++;
-
-            sweep_ax_cm[i] = pos_dbg_m_to_cm(ax);
-            sweep_ay_cm[i] = pos_dbg_m_to_cm(ay);
-            sweep_r_cm[i]  = pos_dbg_m_to_cm(r);
-            sweep_mask    |= (uint8_t)(1u << i);
         }
     }
 
@@ -1140,17 +1127,6 @@ static void runner_fn(void *p1, void *p2, void *p3)
                     position_publish(&pos, (uint8_t)n, ctx.short_addr);
                 }
 
-                /* TEMPORARY: raw-range capture for EKF tuning -- remove with
-                 * the module. Quality is passed NULL: the per-range
-                 * dwt_readdiagnostics() read is design step 6 and is not
-                 * implemented, so `dbg q on` currently gates nothing and the
-                 * quality bytes are always zero. */
-                pos_dbg_sweep(now, sweep_aid, sweep_ax_cm, sweep_ay_cm,
-                              sweep_r_cm, NULL, sweep_mask,
-                              (uint8_t)ctx.tier, motion_moving, solved,
-                              solved
-                                ? (uint16_t)pos_dbg_m_to_cm(pos.residual_m)
-                                : POS_DBG_RES_NONE);
 
                 struct uwb_net_event sev = {
                     .kind      = UWB_EV_SWEPT,
