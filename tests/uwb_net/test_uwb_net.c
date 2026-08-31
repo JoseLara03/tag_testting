@@ -190,6 +190,46 @@ static void test_grant_discover(void)
     CHECK(c2.state == UWB_ST_DISCOVER);
 }
 
+/* TDoA has no tag<->anchor binding at all (design spec §7): a blinking tag
+ * must reach RANGING without ever needing UWB_NET_MIN_ANCHORS discovered,
+ * since it neither polls nor solves anything. Before this fix the tag was
+ * stuck in DISCOVER forever whenever discovery could not reach 3 anchors,
+ * regardless of blink_mode -- exactly the binding dependency TDoA exists to
+ * remove. */
+static void test_blink_skips_discover(void)
+{
+    struct uwb_net_ctx c; uwb_net_init(&c, EUI);
+    c.blink_mode = true;
+    struct uwb_net_event b = ev_beacon(0, false, 0);
+    uwb_net_handle(&c, &b);                             /* -> JOINING */
+
+    struct uwb_net_event g = ev_grant(0x0007, 3, UWB_TIER_FAST, 50);
+    CHECK(uwb_net_handle(&c, &g) == UWB_ACT_RUN_DISCOVER);
+    CHECK(c.state == UWB_ST_DISCOVER);
+
+    /* No UWB_EV_DISCOVERED at all -- an ordinary BEACON is enough to escape
+     * straight to RANGING, with zero anchors ever reported. */
+    struct uwb_net_event b2 = ev_beacon(1, true, 3);
+    CHECK(uwb_net_handle(&c, &b2) == UWB_ACT_NONE);
+    CHECK(c.state == UWB_ST_RANGING);
+
+    /* And once there, it actually blinks rather than sweeping -- FAST's
+     * default range_every is 1, so the very next participation qualifies. */
+    struct uwb_net_event b3 = ev_beacon(2, true, 3);
+    uint32_t a3 = uwb_net_handle(&c, &b3);
+    CHECK(a3 & UWB_ACT_SEND_BLINK);
+    CHECK(!(a3 & UWB_ACT_RUN_SWEEP));
+
+    /* Non-blink tags are unaffected: same setup with blink_mode false still
+     * needs real discovery. */
+    struct uwb_net_ctx c2; uwb_net_init(&c2, EUI);
+    uwb_net_handle(&c2, &b);
+    uwb_net_handle(&c2, &g);
+    CHECK(c2.state == UWB_ST_DISCOVER);
+    CHECK(uwb_net_handle(&c2, &b2) == UWB_ACT_RUN_DISCOVER);
+    CHECK(c2.state == UWB_ST_DISCOVER);   /* still stuck without a real DISCOVERED */
+}
+
 /* Regression: a tag stuck in DISCOVER must keep renewing its lease, otherwise
  * the gateway reclaims its seat after UWB_NET_LEASE_SF superframes and the tag
  * is bounced back to SCAN (the ~10 s re-join cycle observed on hardware). */
@@ -998,6 +1038,7 @@ int main(void)
     test_scan_sleeps();
     test_scan_join();
     test_grant_discover();
+    test_blink_skips_discover();
     test_discover_keeps_lease();
     test_ranging();
     test_lease_ages_by_elapsed();

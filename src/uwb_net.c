@@ -294,6 +294,17 @@ static uint32_t uwb_net_handle_core(struct uwb_net_ctx *c, const struct uwb_net_
         return UWB_ACT_NONE;
 
     case UWB_ST_DISCOVER:
+        /* TDoA has no tag<->anchor binding at all (design spec §7): a
+         * blinking tag needs no anchor list, so it must not sit behind the
+         * TWR-only >= UWB_NET_MIN_ANCHORS discovery gate that exists solely
+         * to build selected[] for a sweep this mode never runs. Skip straight
+         * to RANGING on the very next event, whatever it is -- one event's
+         * worth of deferred lease renewal here is harmless; UWB_ST_RANGING's
+         * own BEACON handling renews it on the very next beacon. */
+        if (c->blink_mode) {
+            c->state = UWB_ST_RANGING;
+            return UWB_ACT_NONE;
+        }
         if (ev->kind == UWB_EV_DISCOVERED) {
             c->n_anchors = ev->n_anchors;
             if (ev->n_anchors >= UWB_NET_MIN_ANCHORS) {
