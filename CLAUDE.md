@@ -62,6 +62,14 @@ position, so accuracy (product target ~45 cm, itself a re-derivation after
 the Phase 2 sync gate measured worse than its original 1 ns target — see
 ANCLA's CLAUDE.md) is still a target, not a verified number.
 
+**Still open, in this file specifically:** `pos_solver.c`/`pos_residual.c`
+were ported verbatim to `ANCLA_ESP32S3` for the gateway's own TDoA solve
+(that repo's Task 2). This repo's Source Layout entries for those two files
+still read as if this repo owns them going forward — it does, while a tag
+can still run TWR (`blink off`), but ownership was meant to move to ANCLA
+once the gateway takes over solving. That transfer has not happened in
+either `CLAUDE.md` yet.
+
 ## Build & Flash
 
 `west build -b nRF52833_tag` (board root is this repo). **The user builds and flashes the firmware themselves** and reports errors and BLE output back — do not assume a build or flash can be run here.
