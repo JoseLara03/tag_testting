@@ -411,14 +411,25 @@ Order matters: filtering a biased estimator produces a smooth wrong answer.
    anchor-spread degeneracy test above.
 3. ~~**Outlier rejection**~~ — done, as the studentized test above rather than
    the RMS-ratio sketch.
-4. ~~**Temporary raw-range log**~~ — done (`pos_dbg.c`). **The capture campaign
-   itself has not been run**, and that is the next real step.
-5. ~~**`pos_ekf.c` + host tests**~~ — written, host-tested and wired into the
-   runner, with every constant still at its assumed value. Tuning against
-   captured data is pending and is the point of step 4.
+4. ~~**Temporary raw-range log**~~ — built (`pos_dbg.c`), but **the capture
+   campaign it existed for was never run**, and it was removed 2026-08-30
+   (Task 8 of `docs/superpowers/plans/2026-08-25-fase3-tdoa.md`) per its own
+   removal checklist below, without ever collecting a trace. Not superseded by
+   running it — superseded by the project moving position-solving off the tag
+   entirely (Fase 3, TDoA): the tag now emits a BLINK and the gateway solves,
+   so there is no longer a tag-side EKF whose tuning this log was for. Steps 5
+   and 6 below inherit the same status, for the same reason, not because they
+   ran.
+5. ~~**`pos_ekf.c` + host tests**~~ — written, host-tested, and **left wired
+   into the runner's TWR fallback path** (`blink off`) — it was never tuned
+   against captured data (step 4 never ran) and is not expected to be, now
+   that TDoA is the primary path. `pos_solver`/`pos_residual` were ported
+   verbatim to the gateway for TDoA's own solve (Fase 3 Task 2); `pos_ekf.c`
+   was not, since TDoA's measurement model isn't range-based (see the "EKF
+   queda fuera" note in `docs/superpowers/plans/2026-08-25-fase3-tdoa.md`).
 6. **Per-range R from DW3000 diagnostics + RX-level bias correction** — not
-   started. The `dbg q` quality bytes are plumbed but always zero: the
-   per-range `dwt_readdiagnostics()` read *is* this step.
+   started, and now unlikely to be: it tunes the same TWR/EKF path step 4/5
+   describe, which TDoA has replaced as the product direction.
 7. **Re-tune FAST `listen_skip`** and publish `vx, vy` — not started;
    `listen_skip` deliberately left alone at the maintainer's direction.
 
@@ -554,15 +565,20 @@ permanent regression fixture.
 
 ### Removal checklist
 
-- [ ] Delete `src/pos_dbg.c/h` and its `target_sources` line in `CMakeLists.txt`
-- [ ] Remove `dbg` commands from `tag_cmd.c`
-- [ ] Revert `struct twr_msg` `len` field and `twr_log_raw()` in
-      `uwb_ss_initiator.c`
-- [ ] Revert `ss_twr_msgq` depth 16 → 8
-- [ ] Restore the `P:` line if it was suppressed
-- [ ] Keep or remove `ble_log_send_raw()` on its own merits — it is harmless and
-      may be wanted by the telemetry path that replaces NUS
-- [ ] Remove the Open Work entry and the Key Patterns note from CLAUDE.md
+- [x] Delete `src/pos_dbg.c/h` and its `target_sources` line in `CMakeLists.txt`
+      (2026-08-30)
+- [x] Remove `dbg` commands from `tag_cmd.c` (2026-08-30)
+- [x] Revert `struct twr_msg` `len` field and `twr_log_raw()` in
+      `uwb_ss_initiator.c` (2026-08-30)
+- [x] Revert `ss_twr_msgq` depth 16 → 8 (2026-08-30)
+- [x] Restore the `P:` line if it was suppressed — checked: it never was (no
+      call site gated it on `pos_dbg_enabled()`), so there was nothing to
+      restore (2026-08-30)
+- [x] Keep `ble_log_send_raw()` on its own merits — kept, per this checklist's
+      own note (2026-08-30)
+- [ ] Remove the Open Work entry and the Key Patterns note from CLAUDE.md —
+      **not done**. Deferred: this session's operator instructed that no
+      `CLAUDE.md` be edited from this machine ("not the main developer unit").
 
 This must be done **before** Open Work item 7 (dropping NUS output for battery
 life), since that work removes the channel the log depends on.

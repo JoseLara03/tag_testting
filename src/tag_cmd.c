@@ -11,7 +11,6 @@
 #include "wdt.h"
 #include "pos_cfg.h"
 #include "blink_cfg.h"
-#include "pos_dbg.h"   /* TEMPORARY -- remove with the raw-range debug log */
 #ifdef CONFIG_TAG_CAL_MODE
 #include "cal_diag.h"
 #include "cal_run.h"
@@ -230,16 +229,6 @@ static void tag_cmd_on_rx(const uint8_t *data, uint16_t len)
 	if (strncmp(buf, "blink", 5) == 0 && (buf[5] == '\0' || buf[5] == ' ')) {
 		if (!blink_cfg_on_cmd(buf)) {
 			ble_log_send("BLINK ?\n");
-		}
-		return;
-	}
-
-	/* TEMPORARY: raw-range capture for EKF tuning (`dbg on|off`, `dbg q
-	 * on|off`, `dbg mark`). Delete this block with the module -- see the
-	 * removal checklist in the design. */
-	if (strncmp(buf, "dbg", 3) == 0 && (buf[3] == '\0' || buf[3] == ' ')) {
-		if (!pos_dbg_on_cmd(buf)) {
-			ble_log_send("DBG ?\n");
 		}
 		return;
 	}
