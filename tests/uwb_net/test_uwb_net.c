@@ -990,7 +990,13 @@ static void test_blink_mode(void)
     uint32_t ab = uwb_net_handle(&cb, &bb);
     CHECK(ab & UWB_ACT_SEND_BLINK);
     CHECK(!(ab & UWB_ACT_RUN_SWEEP));
-    CHECK(cb.tx_slot == 3);                       /* seat protocol untouched */
+    /* tx_slot is NOT latched in blink mode -- Task 4B (blink-slotted MAC)
+     * moved the tag's transmit slot from the beacon's per-superframe
+     * rotation (tx_slot) to its own seat_id (blink_slot_for_seat() in
+     * uwb_net_runner.c). Asserting tx_slot == 3 here was this test's own
+     * pre-Task-4B assumption that a blinking tag still occupies a TWR
+     * rotation slot, which is now stale. */
+    CHECK(cb.tx_slot == 0);
 
     /* The cadence itself is unchanged: drive range_every = 3 in both modes
      * and require the two action words to differ ONLY in which of the two
@@ -1002,7 +1008,15 @@ static void test_blink_mode(void)
     struct uwb_net_ctx cs;  to_ranging(&cs,  UWB_TIER_SLOW);
     struct uwb_net_ctx csb; to_ranging(&csb, UWB_TIER_SLOW);
     csb.blink_mode = true;
-    static const uint32_t fcs2[] = { 7, 400, 401, 9000, 9025, 9050, 12345 };
+    /* Small sequential deltas, deliberately NOT the big skips this array
+     * used before Task 4B's forced-rejoin safety net
+     * (UWB_NET_BLINK_KA_CYCLES_MAX): those jumps aged lease_remaining past
+     * the KEEPALIVE threshold on nearly every iteration, which now forces
+     * blink mode into TO_SCAN partway through -- correctly, since that is
+     * exactly the mechanism test_blink_mode_forces_rejoin_after_stale_ka()
+     * below tests on purpose. This section's own job is cadence-bit parity
+     * between TWR and blink, which does not need a lease renewal at all. */
+    static const uint32_t fcs2[] = { 1, 2, 3, 4, 5, 6, 7 };
     unsigned n_blinks = 0;
     for (unsigned i = 0; i < sizeof(fcs2) / sizeof(fcs2[0]); i++) {
         struct uwb_net_event e1 = ev_beacon(fcs2[i], true, 3);
@@ -1029,6 +1043,78 @@ static void test_blink_mode(void)
     CHECK(uwb_net_gate_actions(UWB_ACT_SEND_BLINK, false) & UWB_ACT_SEND_BLINK);
 }
 
+/* Regression for the bug this project actually hit on the bench (2026-08-31):
+ * a Task 4B gateway in BLINK mode transmits sched[] reserved/zero (design
+ * section 1.3), so `in_map` is never true for ANY blinking tag, ever. Before
+ * this fix, uwb_net_handle() treated that exactly like a TWR tag that lost
+ * its rotation turn: SLEEP every superframe, then TO_SCAN once
+ * UWB_NET_SCHED_GAP_MAX superframes elapsed with no in_map beacon -- forcing
+ * every blinking tag into an infinite SCAN -> JOIN -> DISCOVER -> RANGING ->
+ * (silently sleep for 15 s) -> TO_SCAN loop that never once emits
+ * UWB_ACT_SEND_BLINK. Observed on hardware as E2/E4 discovery traffic
+ * recurring every ~15 s with no BLINK on the air. */
+static void test_blink_mode_ignores_in_map(void)
+{
+    struct uwb_net_ctx c;
+
+    to_ranging(&c, UWB_TIER_FAST);
+    c.blink_mode = true;
+
+    /* More superframes than UWB_NET_SCHED_GAP_MAX, all with in_map == false
+     * -- exactly what a real BLINK-mode gateway's beacon looks like to
+     * every tag it has admitted. Every single one must still emit
+     * UWB_ACT_SEND_BLINK (FAST tier: every participation) and NEVER
+     * UWB_ACT_TO_SCAN or UWB_ACT_SLEEP. */
+    for (uint32_t fc = 1; fc <= (uint32_t)UWB_NET_SCHED_GAP_MAX + 20u; fc++) {
+        struct uwb_net_event ev = ev_beacon(fc, false, 0);
+        uint32_t act = uwb_net_handle(&c, &ev);
+
+        CHECK(act & UWB_ACT_SEND_BLINK);
+        CHECK(!(act & UWB_ACT_RUN_SWEEP));
+        CHECK(!(act & UWB_ACT_TO_SCAN));
+        CHECK(!(act & UWB_ACT_SLEEP));
+        CHECK(c.state == UWB_ST_RANGING);
+    }
+}
+
+/* Regression for the bug found on the bench 2026-08-31 running 5 tags: a
+ * blink-mode tag whose seat was silently reclaimed (KEEPALIVE has no ack,
+ * "the contract has no such frame") kept blinking on its stale seat_id
+ * forever, with zero warning -- and gw_core_join() hands that exact seat_id
+ * to the next fresh joiner, so two tags end up transmitting in the same
+ * blink_sched slot indefinitely. See UWB_NET_BLINK_KA_CYCLES_MAX's comment
+ * in uwb_net.h for the full mechanism. This proves the stopgap: after
+ * UWB_NET_BLINK_KA_CYCLES_MAX optimistic renewals with no intervening JOIN,
+ * the tag forces itself back to SCAN instead of renewing forever. */
+static void test_blink_mode_forces_rejoin_after_stale_ka(void)
+{
+    struct uwb_net_ctx c;
+
+    to_ranging(&c, UWB_TIER_FAST);
+    c.blink_mode = true;
+
+    uint32_t fc = 0;
+    bool     saw_to_scan = false;
+
+    /* Each step ages the lease past its half-life so every beacon triggers
+     * an "optimistic" KEEPALIVE renewal -- exactly the silently-failing-
+     * forever case this stopgap exists for, since there is no ack to tell
+     * the tag any of them actually landed. */
+    for (unsigned i = 0; i < UWB_NET_BLINK_KA_CYCLES_MAX + 2u; i++) {
+        fc += (UWB_NET_LEASE_SF / 2u) + 1u;
+        struct uwb_net_event ev = ev_beacon(fc, false, 0);
+        uint32_t act = uwb_net_handle(&c, &ev);
+
+        if (act & UWB_ACT_TO_SCAN) {
+            saw_to_scan = true;
+            CHECK(c.state == UWB_ST_SCAN);
+            break;
+        }
+    }
+
+    CHECK(saw_to_scan);
+}
+
 int main(void)
 {
     test_proto_ver_matches_frame_module();
@@ -1039,6 +1125,8 @@ int main(void)
     test_scan_join();
     test_grant_discover();
     test_blink_skips_discover();
+    test_blink_mode_ignores_in_map();
+    test_blink_mode_forces_rejoin_after_stale_ka();
     test_discover_keeps_lease();
     test_ranging();
     test_lease_ages_by_elapsed();

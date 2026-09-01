@@ -275,6 +275,9 @@ static uint32_t uwb_net_handle_core(struct uwb_net_ctx *c, const struct uwb_net_
              * look like a 4-billion-superframe gap against any live gateway
              * counter and drop the tag straight back to SCAN. */
             c->last_sched_fc   = c->frame_counter;
+            /* Fresh, gateway-confirmed seat -- reset blink mode's forced-
+             * rejoin counter too (UWB_NET_BLINK_KA_CYCLES_MAX). */
+            c->blink_ka_cycles = 0;
             c->state           = UWB_ST_DISCOVER;
             return UWB_ACT_RUN_DISCOVER;
         }
@@ -374,24 +377,67 @@ static uint32_t uwb_net_handle_core(struct uwb_net_ctx *c, const struct uwb_net_
             c->miss_count = 0;
             lease_age(c, ev);
             c->frame_counter = ev->frame_counter;
-            if (ev->in_map) {
-                c->tx_slot       = ev->map_slot;
-                c->last_sched_fc = ev->frame_counter;
-            } else if ((uint32_t)(ev->frame_counter - c->last_sched_fc) >
-                       UWB_NET_SCHED_GAP_MAX) {
-                c->state = UWB_ST_SCAN;
-                return UWB_ACT_TO_SCAN;
+
+            /* BLINK mode: the beacon's slot map is reserved/zero (Task 4B,
+             * docs/superpowers/specs/2026-08-30-blink-slotted-mac-design.md
+             * section 1.3), so `in_map` is never true here -- there is no
+             * per-superframe rotation to read any more. That is BY DESIGN,
+             * not a gap to patch around: with BLINK_N_SLOTS (134) exceeding
+             * GW_MAX_SEATS (128), every admitted tag has its OWN permanent
+             * slot (Task 5, blink_slot_for_seat(seat_id)) and never needs to
+             * take turns for one of only N_CFP=11 shared slots the way a TWR
+             * tag does. So "am I due" here is governed purely by the tier
+             * cadence below, exactly as the design states it ("sf_counter
+             * sigue gobernando SI... pero no DONDE", section 1.1) -- WHERE
+             * a blinking tag transmits no longer depends on WHEN the
+             * gateway's rotation last saw it.
+             *
+             * Skipping the TWR turn-taking below (tx_slot latch, and the
+             * schedule-gap -> SCAN fallback) is required, not optional: an
+             * earlier version of this function ran that TWR-only gate
+             * unconditionally, and since `in_map` can never be true again
+             * once a cell switches to BLINK mode, every blinking tag would
+             * silently SLEEP forever, then get force-reset to SCAN once
+             * UWB_NET_SCHED_GAP_MAX superframes elapsed since its last (JOIN-
+             * time) in_map reading, re-JOIN, re-run discovery, reach RANGING,
+             * and repeat -- a ~15 s DISCOVER/RANGING loop that never once
+             * reaches UWB_ACT_SEND_BLINK. Caught on the bench, not in review:
+             * the symptom was E2/E4 discovery traffic recurring every ~15 s
+             * with no BLINK ever going out. */
+            if (!c->blink_mode) {
+                if (ev->in_map) {
+                    c->tx_slot       = ev->map_slot;
+                    c->last_sched_fc = ev->frame_counter;
+                } else if ((uint32_t)(ev->frame_counter - c->last_sched_fc) >
+                           UWB_NET_SCHED_GAP_MAX) {
+                    c->state = UWB_ST_SCAN;
+                    return UWB_ACT_TO_SCAN;
+                }
             }
 
             uint32_t act = 0;
             if (c->lease_remaining <= (UWB_NET_LEASE_SF / 2)) {
+                /* BLINK mode: this renewal is about to be optimistic (reset
+                 * below with no ack to confirm it actually landed) -- see
+                 * UWB_NET_BLINK_KA_CYCLES_MAX's comment for why that can
+                 * otherwise cycle forever on a seat the gateway already
+                 * reclaimed. Force a rejoin instead of yet another blind
+                 * renewal once too many of these have gone by unconfirmed. */
+                if (c->blink_mode &&
+                    ++c->blink_ka_cycles >= UWB_NET_BLINK_KA_CYCLES_MAX) {
+                    c->state = UWB_ST_SCAN;
+                    return UWB_ACT_TO_SCAN;
+                }
                 act |= UWB_ACT_SEND_KEEPALIVE;
                 c->lease_remaining = UWB_NET_LEASE_SF;   /* optimistic renew */
             }
             /* Not our turn this superframe: sleep rather than sweep. Under
-             * contract v3 this is the ordinary case for every tier but FAST,
-             * and it is what lets 11 slots serve 100 tags. */
-            if (!ev->in_map) {
+             * contract v3 this is the ordinary case for every TWR tier but
+             * FAST, and it is what lets 11 slots serve 100 tags. Does not
+             * apply in BLINK mode -- see above, every admitted tag has a
+             * slot every superframe and only the tier cadence below decides
+             * whether it uses it. */
+            if (!c->blink_mode && !ev->in_map) {
                 return act | UWB_ACT_SLEEP;
             }
             /* Count participations, not frame counters -- see part_count in

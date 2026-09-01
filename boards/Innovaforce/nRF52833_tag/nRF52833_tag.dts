@@ -93,8 +93,12 @@
 	pinctrl-names = "default", "sleep";
 	/* Suspend TWIM0 between transactions (battery sampler, accelerometer
 	 * register writes). The driver already brackets every transfer with
-	 * pm_device_runtime_get/put; this is what enables it. */
-	zephyr,pm-device-runtime-auto;
+	 * pm_device_runtime_get/put; this is what enables it.
+	 * Disabled 2026-09-01 alongside CONFIG_PM_DEVICE_RUNTIME in prj.conf --
+	 * see that comment. This is the nPM1304 bus (batt_soc_cached() reads
+	 * it), and multi-second runner-loop stalls landed exactly where BLINK
+	 * frames pull battery SOC. */
+	/* zephyr,pm-device-runtime-auto; */
 
 	/* nPM1304 PMIC. No GPIO lines are wired between the nPM1304 and the
 	 * nRF52833, so no host-int-gpios / pmic-int-pin properties are set;
@@ -186,8 +190,10 @@
 	/* Suspend SPIM3 except during a WS2812 write. The LED is dark in normal
 	 * operation, so this bus is idle essentially all the time.
 	 * Deliberately NOT applied to &spi1 -- the DW3000 path runs from the
-	 * GPIO ISR and must not take suspend/resume there. */
-	zephyr,pm-device-runtime-auto;
+	 * GPIO ISR and must not take suspend/resume there.
+	 * Disabled 2026-09-01 alongside &i2c0 and CONFIG_PM_DEVICE_RUNTIME in
+	 * prj.conf -- see that comment. */
+	/* zephyr,pm-device-runtime-auto; */
 
 	ws2812: ws2812@0 {
 		compatible = "worldsemi,ws2812-spi";

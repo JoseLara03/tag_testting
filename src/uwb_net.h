@@ -38,11 +38,47 @@
  * seat, and deleting it without this counter would leave the tag sleeping and
  * self-renewing forever against a gateway that had long since forgotten it. */
 #define UWB_NET_SCHED_GAP_MAX   UWB_NET_LEASE_SF
+
+/* BLINK mode's substitute for the schedule-gap check above. A blink-mode
+ * tag is never `in_map` (Task 4B design section 1.3: sched[] is reserved/
+ * zero in a BLINK cell), so it has no data-driven way to notice its seat
+ * was reclaimed -- KEEPALIVE has no ack on the wire ("the contract has no
+ * such frame", uwb_gateway.c) in EITHER mode, and TWR's detector works only
+ * because presence in the beacon's rotation was an indirect confirmation
+ * that a live seat still exists. Without a wire-protocol ack to replace
+ * that, a blink-mode tag cannot tell "my last N keepalives silently failed
+ * and the gateway reclaimed my seat" from "everything is fine" -- so this
+ * bounds the exposure instead of trying to detect it: after this many
+ * consecutive OPTIMISTIC keepalive renewals (uwb_net.c resets
+ * lease_remaining to full on every SEND, not on confirmation, so it can
+ * cycle forever without ever really reaching zero) with no intervening
+ * JOIN, force a rejoin anyway. Caught on the bench 2026-08-31: a tag whose
+ * seat had been silently reclaimed kept blinking on its stale seat_id
+ * forever with zero warning, and gw_core_join() hands that same seat_id to
+ * the next fresh joiner -- two tags transmitting in the identical
+ * blink_sched slot, indefinitely, with nothing to end it.
+ *
+ * 3 cycles * (UWB_NET_LEASE_SF / 2) is the same order of magnitude as
+ * UWB_NET_SCHED_GAP_MAX (75 SF ~= 15 s) that TWR relies on, so a blink tag
+ * loses at most ~22 s of position reporting during the forced rejoin
+ * instead of colliding forever. This is a stopgap, not a fix: the real fix
+ * is a wire-level KEEPALIVE ack so lease renewal has ground truth, which is
+ * out of scope for Task 4B and left for later. */
+#define UWB_NET_BLINK_KA_CYCLES_MAX  3u
 /* Must equal UWB_PROTO_VER in uwb_frame_802_15_4z.h -- the gateway stamps beacon
  * byte 10 with that one and the tag drops any beacon that does not match this
  * one. Bumping only the frame module leaves the tag deaf in SCAN with no
- * diagnostic. Pinned by tests/uwb_net/test_proto_ver_matches_frame_module. */
-#define UWB_NET_PROTO_VER       3
+ * diagnostic. Pinned by tests/uwb_net/test_proto_ver_matches_frame_module.
+ *
+ * Bumped 3 -> 4 for Task 4B, the BLINK slotted MAC (see the anchor repo's
+ * docs/superpowers/specs/2026-08-30-blink-slotted-mac-design.md section 1.3
+ * and CLAUDE.md entry on UWB_PROTO_VER). The beacon's wire format does not
+ * change; a v4 gateway running BLINK mode transmits sched[] reserved/zero and
+ * assigns airtime by seat_id identity instead, and a v3 tag would otherwise
+ * have no way to notice that reinterpretation. Same flag-day consequence as
+ * the 2 -> 3 bump: this firmware is deaf in SCAN against a v3 (pre-Task-4B)
+ * gateway from this point on, and both firmwares must be reflashed together. */
+#define UWB_NET_PROTO_VER       4
 
 typedef enum { UWB_TIER_IDLE = 0, UWB_TIER_SLOW = 1, UWB_TIER_FAST = 2 } uwb_tier_t;
 #define UWB_TIER_COUNT  3
@@ -297,6 +333,10 @@ struct uwb_net_ctx {
      * UWB_NET_SCHED_GAP_MAX. Compared with unsigned difference, so it is safe
      * across the gateway counter's 2^32 wrap. */
     uint32_t  last_sched_fc;
+    /* BLINK mode only: consecutive optimistic KEEPALIVE renewals since the
+     * last JOIN, for UWB_NET_BLINK_KA_CYCLES_MAX. Reset on every fresh
+     * GRANT; TWR mode never touches this (it has last_sched_fc instead). */
+    uint8_t   blink_ka_cycles;
     uwb_tier_t tier;            /* granted tier */
     uwb_tier_t req_tier;        /* motion-driven request */
     uint16_t  lease_remaining;  /* superframes until expiry */

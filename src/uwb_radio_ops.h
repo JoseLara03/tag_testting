@@ -8,6 +8,14 @@
 
 /* Blocking RX of one beacon; returns frame length or <0 on timeout. */
 int  uwb_radio_rx_beacon(uint8_t *buf, size_t buf_len, uint32_t timeout_ms);
+/* The full 40-bit DW3000 RX timestamp of the last frame uwb_radio_rx_beacon()
+ * successfully received (dwt_readrxtimestamp(), raw ticks). Stashed at RX
+ * time because the hardware register is overwritten by the NEXT RX -- a
+ * caller that wants a specific frame's timestamp (the beacon's, to schedule a
+ * DTU-deferred TX against) must read this immediately after the call that
+ * received it and before any other uwb_radio_rx_beacon() call. Returns 0
+ * before the first successful RX. */
+uint64_t uwb_radio_last_rx_ts40(void);
 /* TX one frame in a CAP mini-slot (caller applies Aloha backoff via slot arg). */
 int  uwb_radio_tx_cap(const uint8_t *buf, size_t len, uint8_t minislot);
 /* Run discovery; fill anchor coords/ids; return anchor count. */

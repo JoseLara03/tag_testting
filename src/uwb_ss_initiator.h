@@ -40,8 +40,17 @@ void position_publish(const struct pos_result *pos, uint8_t n_anchors,
 /* Transmit one TDoA BLINK (0xF0) with the tag's granted short address -- the
  * same address its POS frames use, which is how the gateway resolves a stable
  * Tid from its seat table. Same call contract as position_publish(): runner
- * thread only, inside its own CFP slot, no uwb_radio_owner claim. */
-void blink_publish(uint16_t src_addr, bool alert_pending);
+ * thread only, inside its own CFP slot, no uwb_radio_owner claim.
+ *
+ * tx_at: 0 sends immediately (DWT_START_TX_IMMEDIATE); nonzero arms a
+ * delayed TX at that DX_TIME register value (bits [39:8] of the 40-bit
+ * device time -- the format dwt_setdelayedtrxtime() takes, and what
+ * `(rx_ts40 + offset_ticks) >> 8` produces). See
+ * docs/superpowers/plans/2026-08-30-blink-slotted-mac.md Task 1: the caller
+ * computes tx_at from the beacon's own RX timestamp so the BLINK's RMARKER
+ * lands at a fixed DTU offset from the beacon's, instead of a variable
+ * ms-clock delay after software finished processing it. */
+void blink_publish(uint16_t src_addr, bool alert_pending, uint32_t tx_at);
 
 /* Last position cached by position_publish(), for the alert frame's last_x/
  * last_y. Returns false (leaving the pointed-to x and y untouched) when there

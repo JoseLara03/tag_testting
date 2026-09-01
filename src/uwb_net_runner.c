@@ -59,6 +59,73 @@
 #define RESP_RX_TIMEOUT_UUS          2000U
 #define PRE_TIMEOUT                   128U
 
+/* Raw DW3000 ticks per UUS. Same value uwb_ss_initiator.c uses (65536 = 512
+ * chip periods / 128, exact -- see CLAUDE.md (ANCLA) "UUS_TO_DWT_TIME is
+ * 65536 here"). A private copy rather than a shared include: this file has
+ * no other dependency on uwb_ss_initiator.h's internals. */
+#define UUS_TO_DWT_TIME              65536ULL
+
+/* Milliseconds to UUS, exact: 1 UUS = 512/499.2 MHz, so 1 ms = 1000 *
+ * 499.2/512 = 975 UUS on the nose -- no rounding, no float. This is what lets
+ * the BLINK's DTU-deferred TX offset (Task 1 of
+ * docs/superpowers/plans/2026-08-30-blink-slotted-mac.md) be computed from
+ * the SAME millisecond slot arithmetic the ms-clock sleep used, rather than
+ * a separately-derived UUS budget that could disagree with it. */
+#define MS_TO_UUS(ms)                ((uint32_t)(ms) * 975u)
+
+/* ---- BLINK slot pitch (Task 5, blink-slotted MAC) -------------------------
+ * Mirrors ANCLA's src/blink_sched.h blink_sched_slot_ns() -- one BLINK's
+ * airtime plus its slot guard -- without pulling mac_budget.h onto this
+ * build (see blink_slot_for_seat()'s comment below for why). Deliberately
+ * NOT T_SLOT_MS + T_GUARD_MS: those are the TWR sweep's ~24 ms slot pitch,
+ * sized for a full 4-anchor ranging exchange, and reusing them here by
+ * mistake would place blink slot k at k * 25 ms instead of k * ~1.43 ms --
+ * for any seat_id past the first few, an offset outside the superframe
+ * entirely. The design doc calls this exact mistake out by name (section
+ * "El offset en tiempo... no reusar los nombres de constante de TWR").
+ *
+ * BLINK_FRAME_AIRTIME_NS: SHR (1032 symbols * 1017.63 ns) + PHR (19 bits) +
+ * (BLINK_FRAME_LEN=14 + 2 FCS) * 8 bits, all at 850 kbps -- the same
+ * mac_frame_ns(&frozen_phy, 14) ANCLA's blink_sched.c calls, evaluated by
+ * hand since this file has no mac_budget.h to call it from. Matches
+ * CLAUDE.md's own measured "~1.223 ms" BLINK airtime and
+ * tests/mac_budget/test_mac_budget.c's CHECK_NEAR(..., 1223135, ...) on the
+ * anchor side exactly -- re-derive by hand (or read that test's output) if
+ * BLINK_FRAME_LEN or the PHY contract ever changes.
+ *
+ * BLINK_SLOT_GUARD_UUS: the SAME provisional value ANCLA's blink_sched.h
+ * carries (200 UUS, PROVISIONAL -- see that header's own comment and
+ * docs/superpowers/specs/2026-08-30-blink-slotted-mac-design.md section
+ * 1.2). Kept in lockstep by inspection until Task 2's hardware jitter
+ * measurement replaces both copies with a derived number.
+ *
+ * BLINK_SLOT_PITCH_UUS folds both into UUS (ns * 1000 / 1025641, the same
+ * ns<->UUS conversion MAC_UUS_PS encodes on the anchor side) so it can join
+ * the existing MS_TO_UUS() / UUS_TO_DWT_TIME pipeline below rather than
+ * inventing a second unit system. All of this is compile-time constant
+ * arithmetic; only the multiplication by a runtime seat_id happens at
+ * runtime. */
+#define BLINK_FRAME_AIRTIME_NS   1223135u
+#define BLINK_SLOT_GUARD_UUS      200u
+#define BLINK_SLOT_PITCH_UUS                                                \
+    (((BLINK_FRAME_AIRTIME_NS + (BLINK_SLOT_GUARD_UUS * 1000000u / 975u))   \
+      * 1000u) / 1025641u)
+
+/* The BLINK slot for a given seat_id: the identity, valid because
+ * BLINK_N_SLOTS (134 on the gateway's current geometry) exceeds
+ * GW_MAX_SEATS (128) -- see
+ * docs/superpowers/specs/2026-08-30-blink-slotted-mac-design.md section 1.1.
+ * Mirrors ANCLA's src/blink_sched.h blink_sched_slot_index() body exactly,
+ * inlined here rather than copied as a header: the rest of blink_sched.h
+ * pulls in mac_budget.h's whole airtime model, which this tag build has no
+ * other use for and no host-test harness to keep honest. If
+ * blink_sched_slot_index() ever stops being the identity, this must change
+ * with it -- diff the two functions, not just their names. */
+static inline uint8_t blink_slot_for_seat(uint8_t seat_id)
+{
+    return seat_id;
+}
+
 /* Settle time between consecutive anchor polls in a sweep. */
 #define INTER_ANCHOR_DELAY_US        10U
 
@@ -293,6 +360,17 @@ void uwb_radio_sleep_until_strict(uint32_t wake_ms)
     }
 }
 
+/* See uwb_radio_ops.h. Set only on a successful RX below, never cleared on a
+ * timeout/error -- a stale value from an earlier frame is safer than an
+ * invented one, and every caller that cares reads it immediately after the
+ * RX that set it (see the BLINK TX site in runner_fn()). */
+static uint64_t last_rx_ts40;
+
+uint64_t uwb_radio_last_rx_ts40(void)
+{
+    return last_rx_ts40;
+}
+
 /*
  * Enable DW3000 RX and wait up to timeout_ms for a frame.
  * Returns frame length on success, -ETIMEDOUT on timeout, -EIO on RX error.
@@ -312,6 +390,21 @@ int uwb_radio_rx_beacon(uint8_t *buf, size_t buf_len, uint32_t timeout_ms)
     if (evt != EVT_RXFCG) {
         dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
         return -ETIMEDOUT;
+    }
+
+    /* Read before dwt_readrxdata()/status clear: this is the RX timestamp
+     * register, not the data FIFO, so ordering against those two does not
+     * matter here -- what matters is capturing it before any OTHER RX event
+     * (the very next uwb_radio_rx_beacon() call, from anywhere) overwrites
+     * it. */
+    {
+        uint8_t ts[5];
+
+        dwt_readrxtimestamp(ts);
+        last_rx_ts40 = 0;
+        for (int i = 4; i >= 0; i--) {
+            last_rx_ts40 = (last_rx_ts40 << 8) | ts[i];
+        }
     }
 
     uint16_t flen = dwt_getframelength();   /* includes 2-byte FCS */
@@ -750,6 +843,15 @@ static void runner_fn(void *p1, void *p2, void *p3)
             : (uwb_radio_now_ms() + T_SUPERFRAME_MS + T_BEACON_MS);
 
         uint32_t bcn_rx_ms = 0;
+        /* The beacon's own 40-bit RX timestamp, for the BLINK's DTU-deferred
+         * TX (Task 1 of docs/superpowers/plans/2026-08-30-blink-slotted-mac.md).
+         * Captured immediately on the frame that matched -- see
+         * uwb_radio_last_rx_ts40()'s contract: the hardware register is
+         * overwritten by the next RX, and there IS another RX between here
+         * and the BLINK TX site below whenever UWB_ACT_SEND_JOIN also fires
+         * this superframe (it listens for a GRANT), so this must be read now,
+         * not lazily where it is used. */
+        uint64_t beacon_rx_ts40 = 0;
 
         rx_stats_arm();
         for (;;) {
@@ -763,6 +865,7 @@ static void runner_fn(void *p1, void *p2, void *p3)
                 uwb_frame_is_beacon(beacon_buf, (size_t)len)) {
                 beacon_len = len;
                 bcn_rx_ms = uwb_radio_now_ms();
+                beacon_rx_ts40 = uwb_radio_last_rx_ts40();
                 break;
             }
             /* non-beacon frame or rx timeout/error: keep waiting for the beacon */
@@ -984,17 +1087,50 @@ static void runner_fn(void *p1, void *p2, void *p3)
          * only path back to DISCOVER; that is correct for TDoA, and the seat
          * protocol (JOIN/GRANT/KEEPALIVE) is untouched either way. */
         if (act & UWB_ACT_SEND_BLINK) {
-            uint32_t slot_start = t0_ms
-                + T_BEACON_MS + T_GUARD_MS
-                + (uint32_t)N_CAP * T_MINISLOT_MS + T_GUARD_MS
-                + (uint32_t)ctx.tx_slot * (T_SLOT_MS + T_GUARD_MS);
+            /* DTU-deferred TX from the beacon's own RMARKER, not a ms-clock
+             * sleep to it -- Task 1 of
+             * docs/superpowers/plans/2026-08-30-blink-slotted-mac.md.
+             * Deliberately the SAME slot arithmetic slot_start used (still
+             * ctx.tx_slot, not seat_id -- that is Task 5), only expressed in
+             * UUS/DTU against the radio's own clock instead of milliseconds
+             * against the kernel's: this task changes HOW the TX is timed,
+             * not WHERE the slot falls. */
+            /* Fixed part (beacon + its guard + the whole CAP) stays in
+             * whole milliseconds, exactly like the sweep's slot_start below.
+             * The per-seat part uses the BLINK slot pitch, NOT tx_slot's
+             * TWR pitch -- see the BLINK_SLOT_PITCH_UUS block above for why
+             * conflating the two would place the TX outside the superframe.
+             * seat_id, not tx_slot: a BLINK cell assigns airtime by seat
+             * identity (Task 5 of
+             * docs/superpowers/plans/2026-08-30-blink-slotted-mac.md). */
+            uint32_t fixed_offset_ms = T_BEACON_MS + T_GUARD_MS
+                + (uint32_t)N_CAP * T_MINISLOT_MS + T_GUARD_MS;
+            uint32_t offset_uus = MS_TO_UUS(fixed_offset_ms)
+                + (uint32_t)blink_slot_for_seat(ctx.seat_id) * BLINK_SLOT_PITCH_UUS;
+            uint64_t offset_ticks = (uint64_t)offset_uus * UUS_TO_DWT_TIME;
 
-            /* Strict, exactly as the sweep is: the BLINK goes out inside this
-             * tag's own TDMA slot, which is also what keeps it clear of the
-             * beacon guard -- the CFP starts after T_BEACON_MS + T_GUARD_MS. */
-            uwb_radio_sleep_until_strict(slot_start);
+            /* KNOWN GAP, not fixed here: T_BEACON_MS/T_GUARD_MS/T_MINISLOT_MS
+             * are rounded UP to whole milliseconds (a TWR-era choice, ~12 ms
+             * of charged overhead against ANCLA's precise ~8.16 ms model),
+             * which was harmless against a 24 ms TWR slot pitch and is NOT
+             * harmless against a ~1.39 ms BLINK pitch: ANCLA's own
+             * BLINK_N_SLOTS=134 already leaves under 0.5 ms of superframe
+             * slack (191.35 ms of blink slots in a 191.84 ms usable CFP), so
+             * this ~3.8 ms of extra rounding pushes the top few seat ids
+             * (roughly 132-133) past the 200 ms superframe boundary before
+             * their own TX. Left as a known limit rather than re-deriving
+             * these three TWR constants here, which would also move the
+             * sweep and beacon-prediction paths that share them. Revisit
+             * once Task 2's hardware jitter measurement is in and
+             * BLINK_SLOT_GUARD_UUS is no longer provisional -- either
+             * tighten these constants or accept a slightly-lower admissible
+             * seat ceiling on the tag side than gw_core enforces. */
+            /* Register format: bits [39:8] of the 40-bit device time, same
+             * >>8 the tag's own DS-TWR example (examples/uwb_ds_initiator.c)
+             * already uses for dwt_setdelayedtrxtime(). */
+            uint32_t tx_at = (uint32_t)((beacon_rx_ts40 + offset_ticks) >> 8);
 
-            blink_publish(ctx.short_addr, ev.alert_pending);
+            blink_publish(ctx.short_addr, ev.alert_pending, tx_at);
 
             /* A blinking tag solves nothing, so it HAS no recent fix: say so,
              * rather than leaving the last TWR fix looking current. Without

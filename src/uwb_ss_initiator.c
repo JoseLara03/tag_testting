@@ -42,6 +42,11 @@
 /* Settle time between anchors within one cycle (radio turnaround margin). */
 #define INTER_ANCHOR_DELAY_MS  10U
 
+/* Margin blink_publish() leaves between the end of its k_sleep() and a
+ * delayed BLINK's tx_at, for the bounded busy-poll after it to actually
+ * catch TXFRS. See blink_publish()'s own comment for the full reasoning. */
+#define BLINK_POLL_MARGIN_MS   5U
+
 /* SPEED_OF_LIGHT is a Qorvo shared_defines macro not present in this project's
  * driver headers; define it locally (m/s, as used by the Qorvo examples). */
 #define SPEED_OF_LIGHT  299702547.0
@@ -364,10 +369,26 @@ void position_publish(const struct pos_result *pos, uint8_t n_anchors,
  * collector keys groups on (tag_addr, blink_seq) with a 150 ms window, far
  * shorter than the ~51 s a value takes to recur at 5 Hz, so no extra
  * disambiguator is needed -- see the anchor repo's src/tdoa_collect.c.
+ *
+ * tx_at != 0 is this firmware's FIRST-EVER use of DWT_START_TX_DELAYED --
+ * every other TX in this tree (this function included, until Task 1 of
+ * docs/superpowers/plans/2026-08-30-blink-slotted-mac.md) is
+ * DWT_START_TX_IMMEDIATE. Treated as a genuine hardware risk, not a
+ * mechanical copy of the ANCLA side's delayed-TX sites: see CLAUDE.md
+ * (ANCLA) on "A delayed TX's arm deadline is DX_TIME - SHR, not DX_TIME" and
+ * "A delayed TX armed immediately after another TX fails dwt_starttx()
+ * deterministically" -- both cost that project two bench cycles the first
+ * time this exact class of call was written. The dwt_forcetrxoff() just
+ * below is this port's dose of the second lesson, applied conservatively
+ * (the preceding operation here is always an RX, the beacon, which per that
+ * same entry should already leave the TSE idle on its own -- but this port
+ * has never exercised delayed TX at all, so the ANCLA precedent is not
+ * assumed to transfer without a bench check, which is Task 1's own
+ * checklist item, not this comment's job to perform).
  */
 static uint8_t blink_seq_nb;
 
-void blink_publish(uint16_t src_addr, bool alert_pending)
+void blink_publish(uint16_t src_addr, bool alert_pending, uint32_t tx_at)
 {
     struct blink_frame bf = {
         .src_addr = src_addr,
@@ -387,19 +408,75 @@ void blink_publish(uint16_t src_addr, bool alert_pending)
     }
 
     /* Force IDLE before this TX, for the reason position_publish() states:
-     * an immediate-TX command is not honoured from a non-IDLE PHY. */
+     * an immediate-TX command is not honoured from a non-IDLE PHY. Also the
+     * pre-arm step a delayed TX needs -- see the function comment above. */
     dwt_forcetrxoff();
 
     dwt_writetxdata((uint16_t)len, buf, 0);
     dwt_writetxfctrl((uint16_t)(len + FCS_LEN), 0, 0);
 
-    if (dwt_starttx(DWT_START_TX_IMMEDIATE) != DWT_SUCCESS) {
+    int mode = DWT_START_TX_IMMEDIATE;
+
+    if (tx_at != 0) {
+        dwt_setdelayedtrxtime(tx_at);
+        mode = DWT_START_TX_DELAYED;
+    }
+
+    if (dwt_starttx(mode) != DWT_SUCCESS) {
         dwt_forcetrxoff();
         dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
         return;
     }
 
-    for (int i = 0; i < 30; i++) {
+    /* The fixed 30 * 100 us = 3 ms bound below is sized for an IMMEDIATE
+     * TX's own airtime (~1.3 ms) -- position_publish()'s comment on the same
+     * shape explains why a bounded poll is used at all instead of
+     * wait_event(). A delayed BLINK can legitimately not fire for most of a
+     * superframe (up to ~146 ms at the last slot, per
+     * docs/superpowers/plans/2026-08-30-blink-slotted-mac.md's slot
+     * arithmetic): polling only 3 ms would force-abort a transmission the
+     * hardware has correctly armed and is simply waiting to send, on every
+     * tag whose slot is not the very first. So the bulk of a genuine delay
+     * is slept (k_sleep, not busy-wait -- this thread has nothing else to do
+     * until its own frame goes out), and only the last few ms are polled the
+     * same way an immediate TX already is.
+     *
+     * dwt_readsystimestamphi32() and tx_at share the same units -- both are
+     * bits [39:8] of the 40-bit device time, ~4.006 ns per tick (CLAUDE.md,
+     * ANCLA, "dwt_readsystimestamphi32() wraps every ~17.2 s"). The signed
+     * difference is correct across that ~17.2 s wrap for any genuinely
+     * future tx_at, which one superframe (200 ms) always is. */
+    if (tx_at != 0) {
+        int32_t  ticks_left = (int32_t)(tx_at - dwt_readsystimestamphi32());
+        uint32_t sleep_ms   = 0;
+
+        if (ticks_left > 0) {
+            /* ticks_left * 4006 is picoseconds (4.006 ns/tick = 4006
+             * ps/tick); ps -> ms needs /1e9, not /1e6. Fixed 2026-09-01: the
+             * /1e6 version computed microseconds and mislabelled them
+             * milliseconds -- a 1000x factor that turned every BLINK's
+             * intended ~10 ms pre-TX sleep into a ~10 s one, starving the
+             * beacon-RX loop long enough to miss 3 consecutive beacons and
+             * force a SCAN/rejoin every cycle. Confirmed via RTT: ticks_left
+             * was consistently ~2.577e6 (a genuine ~10.3 ms) while the old
+             * formula reported sleep_ms=10330. */
+            sleep_ms = (uint32_t)(((int64_t)ticks_left * 4006) / 1000000000);
+        }
+        /* Leave BLINK_POLL_MARGIN_MS for the busy-poll below to actually
+         * catch TXFRS -- sleeping all the way to tx_at would leave no slack
+         * for scheduling jitter on the WAKE side (this thread's own
+         * k_sleep() has no delayed-TX-grade precision; the DW3000 fires
+         * exactly on time regardless). */
+        if (sleep_ms > BLINK_POLL_MARGIN_MS) {
+            k_sleep(K_MSEC(sleep_ms - BLINK_POLL_MARGIN_MS));
+        }
+    }
+
+    /* ~(BLINK_POLL_MARGIN_MS + this frame's own airtime + slack) at 100 us a
+     * step. Covers the immediate-TX case too: tx_at == 0 skips the sleep
+     * above entirely and this loop behaves exactly as it did before this
+     * task, since BLINK_POLL_MARGIN_MS was never subtracted from anything. */
+    for (int i = 0; i < 80; i++) {
         if (dwt_readsysstatuslo() & DWT_INT_TXFRS_BIT_MASK) {
             dwt_writesysstatuslo(DWT_INT_TXFRS_BIT_MASK);
             return;
