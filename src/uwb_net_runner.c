@@ -1130,7 +1130,8 @@ static void runner_fn(void *p1, void *p2, void *p3)
              * already uses for dwt_setdelayedtrxtime(). */
             uint32_t tx_at = (uint32_t)((beacon_rx_ts40 + offset_ticks) >> 8);
 
-            blink_publish(ctx.short_addr, ev.alert_pending, tx_at);
+            blink_publish(ctx.short_addr, ev.alert_pending, motion_moving,
+                          tx_at);
 
             /* A blinking tag solves nothing, so it HAS no recent fix: say so,
              * rather than leaving the last TWR fix looking current. Without

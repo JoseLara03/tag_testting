@@ -65,7 +65,7 @@
  * MEANING of an unchanged wire format changes, so the version has to move
  * even though nothing byte-visible does. A v3 tag against a v4 gateway
  * stays deaf in SCAN -- same flag day, both firmwares reflashed together. */
-#define UWB_PROTO_VER     4
+#define UWB_PROTO_VER     5
 #define UWB_FRAME_N_CFP   11        /* ranging slots per superframe */
 #define UWB_FRAME_N_CAP   4         /* CAP Aloha mini-slots (v1) */
 
@@ -88,10 +88,18 @@
 #define UWB_FRAME_LEN_RELEASE    10
 #define UWB_FRAME_EUI_LEN        8
 
-/* batt_soc value meaning "no reading" — the charger is connected (terminal
- * voltage says nothing about charge then) or the gauge failed. Distinct from a
- * real 0 % reading. */
-#define UWB_FRAME_POS_SOC_UNKNOWN 0xFFu
+/* batt_soc sentinel: NO PERCENTAGE READING IS AVAILABLE. Distinct from a real
+ * 0 % reading, which is what the value exists to keep separable.
+ *
+ * The name says "connected" because the charger being attached is the case
+ * that produces it in normal use -- terminal voltage says nothing about state
+ * of charge while charging, so the gauge reports nothing. But the value is
+ * ALSO what a failed gauge yields, and the tag does not distinguish the two.
+ * So "connected" is the dominant cause, not a guarantee: do not build logic
+ * that treats this value as proof a charger is present.
+ *
+ * Renamed from UWB_FRAME_POS_SOC_UNKNOWN on 2026-09-03. */
+#define UWB_FRAME_POS_SOC_CONNECTED 0xFFu
 #define UWB_FRAME_LEN_POS        24
 
 /* ---- ALERT (0xEE): HELP/CANCEL, tag/anchor -> gateway --------------------

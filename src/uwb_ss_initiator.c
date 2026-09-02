@@ -388,16 +388,21 @@ void position_publish(const struct pos_result *pos, uint8_t n_anchors,
  */
 static uint8_t blink_seq_nb;
 
-void blink_publish(uint16_t src_addr, bool alert_pending, uint32_t tx_at)
+void blink_publish(uint16_t src_addr, bool alert_pending, bool moving,
+                   uint32_t tx_at)
 {
     struct blink_frame bf = {
         .src_addr = src_addr,
         .seq      = blink_seq_nb++,
         /* The same source and the same "no reading" sentinel the 0xEA POS
-         * frame uses (UWB_FRAME_POS_SOC_UNKNOWN, 0xFF) -- batt_soc_cached()
+         * frame uses (UWB_FRAME_POS_SOC_CONNECTED, 0xFF) -- batt_soc_cached()
          * already returns it when the charger has no valid reading. */
         .batt_soc = batt_soc_cached(),
-        .flags    = alert_pending ? BLINK_FLAG_ALERT : 0u,
+        /* Both flags in one byte. BLINK_FLAG_MOVING is proto 5: a proto-4
+         * receiver rejects the frame outright on the reserved-bit check
+         * rather than misreading it, which is what that check is for. */
+        .flags    = (uint8_t)((alert_pending ? BLINK_FLAG_ALERT : 0u) |
+                              (moving ? BLINK_FLAG_MOVING : 0u)),
     };
 
     uint8_t buf[BLINK_FRAME_LEN];

@@ -50,7 +50,15 @@ void position_publish(const struct pos_result *pos, uint8_t n_anchors,
  * computes tx_at from the beacon's own RX timestamp so the BLINK's RMARKER
  * lands at a fixed DTU offset from the beacon's, instead of a variable
  * ms-clock delay after software finished processing it. */
-void blink_publish(uint16_t src_addr, bool alert_pending, uint32_t tx_at);
+/* `moving` is the LIS2HH12's activity verdict (motion_moving in
+ * uwb_net_runner.c, set from the interrupt by motion.c). It rides out on
+ * BLINK_FLAG_MOVING so the gateway's TDoA filter can apply a zero-velocity
+ * update to a stationary tag -- the largest visual improvement available to
+ * it, per pos_ekf.h. Passed in rather than read here for the same reason
+ * alert_pending is: the runner owns that state, and this file owns the
+ * radio. */
+void blink_publish(uint16_t src_addr, bool alert_pending, bool moving,
+                   uint32_t tx_at);
 
 /* Last position cached by position_publish(), for the alert frame's last_x/
  * last_y. Returns false (leaving the pointed-to x and y untouched) when there

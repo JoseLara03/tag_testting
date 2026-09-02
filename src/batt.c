@@ -110,7 +110,7 @@ static volatile bool      batt_connected;
  * sample is harmless — the value is a percentage that moves over minutes.
  *
  * 0xFF is the "no reading" value. It is written as a literal rather than as
- * UWB_FRAME_POS_SOC_UNKNOWN on purpose: the battery module must not depend on
+ * UWB_FRAME_POS_SOC_CONNECTED on purpose: the battery module must not depend on
  * the UWB wire format. The two definitions must agree, and the POS frame's
  * choice of sentinel was made to match this one — if either changes, change
  * both. */

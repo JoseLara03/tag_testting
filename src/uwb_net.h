@@ -78,7 +78,7 @@
  * have no way to notice that reinterpretation. Same flag-day consequence as
  * the 2 -> 3 bump: this firmware is deaf in SCAN against a v3 (pre-Task-4B)
  * gateway from this point on, and both firmwares must be reflashed together. */
-#define UWB_NET_PROTO_VER       4
+#define UWB_NET_PROTO_VER       5
 
 typedef enum { UWB_TIER_IDLE = 0, UWB_TIER_SLOW = 1, UWB_TIER_FAST = 2 } uwb_tier_t;
 #define UWB_TIER_COUNT  3
