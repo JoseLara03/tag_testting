@@ -4,6 +4,8 @@
                                  * its use in tag_alert.c for precedent on
                                  * reusing it outside cal.c itself. */
 #include "ble_log.h"
+#include "uwb_net_runner.h"    /* uwb_net_runner_sweep_real_z_count() for `pos z` */
+#include "anchor_pool_core.h"  /* ANCHOR_SELECT_MAX */
 
 #include <errno.h>
 #include <stdio.h>
@@ -228,6 +230,14 @@ bool pos_cfg_on_cmd(const char *cmd)
 
         snprintf(msg, sizeof(msg), "Z a%u t%u\n", a, t);
         ble_log_send(msg);
+
+        /* Separate line (Task 10): how many of the last sweep's anchors
+         * reported a real z rather than falling back to this pair. */
+        char zmsg[20];
+        snprintf(zmsg, sizeof(zmsg), "Zreal %u/%u\n",
+                (unsigned)uwb_net_runner_sweep_real_z_count(),
+                (unsigned)ANCHOR_SELECT_MAX);
+        ble_log_send(zmsg);
         return true;
     }
 

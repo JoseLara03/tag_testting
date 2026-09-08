@@ -1,7 +1,15 @@
 # UWB TDMA MAC — Protocol Contract (v1)
 
 **Date:** 2026-06-17
-**Status:** Design approved, pre-implementation
+**Status:** SUPERSEDED by `spec/2026-09-07-network-scaling-design.md` (protocol v3) for
+every node count / capacity / GRANT-format claim below. `proto_ver` is now 3
+(`UWB_PROTO_VER`/`UWB_NET_PROTO_VER`), not the v1/v2 this document describes; GRANT
+grew from 24 to 26 bytes (`phase_mask`); a grant is `(slot, phase_mask)` over a
+16-superframe cycle, not a permanent every-superframe seat; DISCOVERY gained
+`group`/`n_groups`; two new frame types (`0xEC` ANNOUNCE, `0xED` MPOL_RESP) exist.
+Kept for historical context (the v1 TDMA mechanics — beacon/JOIN/GRANT/KEEPALIVE
+handshake, CFP/CAP layout, lease semantics — are still the *shape* v3 builds on); do
+not implement anything below without cross-checking it against the v3 design first.
 **Scope:** The on-air contract shared by *all* nodes (gateway, anchors, tags) in the
 RTLS network. This document is intentionally implementation-agnostic so it can be
 imported verbatim into the anchor/gateway firmware later. The tag-side behaviour

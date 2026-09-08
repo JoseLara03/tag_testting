@@ -51,14 +51,15 @@ GCC.
 
 ### Task 1: Fix the SFD-timeout divergence
 
-- [ ] In `src/phy_config.c`, `CONFIG_OPTION_07`: change the SFD timeout from
+- [x] In `src/phy_config.c`, `CONFIG_OPTION_07`: change the SFD timeout from
       `(1024 + 1 + 8 - 8)` to `(1024 + 1 + 8 - 32)` = 1001, matching `DWT_PAC32` (which
       the same struct already selects) and the anchor's `uwb_phy.h`.
-- [ ] Fix the stale `PAC 8` text in that block's comment and in `phy_config.h`'s
+- [x] Fix the stale `PAC 8` text in that block's comment and in `phy_config.h`'s
       option-07 description; add a one-line comment that the term is `- PAC`, so the
       next PAC change moves it.
-- [ ] Grep every other enabled `CONFIG_OPTION_*` block for the same `- 8` with a
-      non-`PAC8` struct; fix or leave a comment saying it is unused.
+- [x] Grep every other enabled `CONFIG_OPTION_*` block for the same `- 8` with a
+      non-`PAC8` struct; fix or leave a comment saying it is unused. (Options 04 and
+      40 already used `- 32` correctly; only 07 was wrong.)
 - [ ] **Step 4 (user, hardware):** reflash, run `cal 1000` to convergence on one tag,
       and confirm `CAL OK`. **The whole fleet must be recalibrated after this task** —
       tag `cal <mm>`, anchors `cal ref`. Record the before/after delay values.
@@ -79,58 +80,62 @@ GCC.
 
 ### Task 3: DISCOVERY gains `group` / `n_groups`
 
-- [ ] `src/uwb_frame_802_15_4z.h`: `UWB_FRAME_LEN_DISC` 14 -> 16; add
+- [x] `src/uwb_frame_802_15_4z.h`: `UWB_FRAME_LEN_DISC` 14 -> 16; add
       `UWB_FRAME_DISC_N_GROUPS_MAX` (8) and a comment tying it to
       `ceil(UWB_MAX_ANCHORS / 4)` on the anchor.
-- [ ] `uwb_frame_discovery_build()` takes `group` and `n_groups`; add
+- [x] `uwb_frame_discovery_build()` takes `group` and `n_groups`; add
       `uwb_frame_parse_discovery()` (the anchor needs it; the tag builds only).
-- [ ] Reject `n_groups == 0`, `group >= n_groups`, `n_groups > _MAX` with `-EINVAL`.
-- [ ] `tests/uwb_frame/`: round-trip, every rejection, and a byte-exact vector for
+- [x] Reject `n_groups == 0`, `group >= n_groups`, `n_groups > _MAX` with `-EINVAL`.
+- [x] `tests/uwb_frame/`: round-trip, every rejection, and a byte-exact vector for
       `group=3, n_groups=8` that the anchor's copy of the test can share.
 - [ ] Copy the file pair to the anchor repo; run **both** repos' `tests/uwb_frame/`.
+      (Not done here — ANCLA_ESP32S3 is a separate repo not present in this workspace.)
 
 ### Task 4: ANNOUNCE (`0xEC`) parser
 
-- [ ] Add `UWB_FRAME_TYPE_ANNOUNCE 0xEC`, `UWB_FRAME_LEN_ANNOUNCE`, and
+- [x] Add `UWB_FRAME_TYPE_ANNOUNCE 0xEC`, `UWB_FRAME_LEN_ANNOUNCE`, and
       `struct uwb_announce { uint16_t addr; float x, y, z; int32_t cir_power;
       uint16_t cir_quality; }`.
-- [ ] `uwb_frame_announce_build()` (anchor uses it) and
+- [x] `uwb_frame_announce_build()` (anchor uses it) and
       `uwb_frame_parse_announce()` / `uwb_frame_is_announce()` (tag uses these).
-- [ ] `tests/uwb_frame/`: round-trip including a NaN `z`, a truncated frame, and a
+- [x] `tests/uwb_frame/`: round-trip including a NaN `z`, a truncated frame, and a
       wrong-type frame.
-- [ ] Copy to the anchor repo; run both suites.
+- [ ] Copy to the anchor repo; run both suites. (Not done here — separate repo.)
 
 ### Task 5: Anchor pool grows and learns passively
 
-- [ ] `src/uwb_net_runner.c`: `ANCHOR_POOL_MAX` 6 -> 16. Leave `ANCHOR_SELECT_MAX` at 4
-      and add a comment saying why (design §3.C).
-- [ ] `anchor_entry_t` gains `float x, y, z; bool have_pos; uint32_t last_seen_ms;`.
+- [x] `src/uwb_net_runner.c`: `ANCHOR_POOL_MAX` 6 -> 16. Leave `ANCHOR_SELECT_MAX` at 4
+      and add a comment saying why (design §3.C). (Both constants now live in
+      `anchor_pool_core.h`, moved with the pool logic.)
+- [x] `anchor_entry_t` gains `float x, y, z; bool have_pos; uint32_t last_seen_ms;`.
       Announce-learned coordinates seed the pool so a tag can rank anchors by geometry,
-      not only by CIR.
-- [ ] **Pool entries expire.** Add `ANCHOR_ENTRY_STALE_MS` (300000) and drop entries not
+      not only by CIR. (Renamed `anchor_pool_entry` in the pure core; geometry ranking
+      itself is not implemented yet -- only the data is carried, per the task text.)
+- [x] **Pool entries expire.** Add `ANCHOR_ENTRY_STALE_MS` (300000) and drop entries not
       seen since. Today the pool never invalidates an entry, which is what let the tag
       report three anchors while emitting no fix at all (`CLAUDE.md`, sweep-gate entry).
       At 16 entries that failure gets easier, not harder.
-- [ ] In the beacon RX path, after a valid beacon, keep the receiver armed for the
+- [x] In the beacon RX path, after a valid beacon, keep the receiver armed for the
       `T_ANNOUNCE_MS` (2 ms) window and feed any `0xEC` to the pool. Do **not** extend
       the window when no announce arrives — the whole point is that it is bounded.
-- [ ] Host-test the pool logic by moving it into a pure `anchor_pool_core.c` with
+- [x] Host-test the pool logic by moving it into a pure `anchor_pool_core.c` with
       `tests/anchor_pool/`: insert, EMA update, staleness, top-4 selection, and the
       "never report more anchors than are actually live" property.
 
 ### Task 6: Grouped discovery rounds in the runner
 
-- [ ] Add `disc_group` state to the runner; each discovery round uses
+- [x] Add `disc_group` state to the runner; each discovery round uses
       `group = disc_round++ % UWB_DISC_N_GROUPS` and passes it to the builder.
-- [ ] `DISCOVERY_WINDOW_MS` stays 15. Add a `BUILD_ASSERT` (or a comment with the
-      arithmetic) that 15 ms >= `DISC_BASE_UUS + 3 * DISC_SLOT_UUS` in ms, so the next
-      person who edits the stagger sees the dependency.
-- [ ] `uwb_sweep_gate_discovered()` must count anchors found **across the group cycle**,
+- [x] `DISCOVERY_WINDOW_MS` stays 15. Added a comment with the arithmetic (anchor's
+      `DISC_BASE_UUS + id*DISC_SLOT_UUS`, max id=3 within a 4-anchor group) instead of a
+      `BUILD_ASSERT`, since those anchor-side constants live in the ANCLA_ESP32S3 repo,
+      not here.
+- [x] `uwb_sweep_gate_discovered()` must count anchors found **across the group cycle**,
       not within one round: a round that finds 2 anchors of its group is not a short
-      sweep. Add `n_groups`-aware accounting to `struct uwb_sweep_gate` and a regression
-      test alongside `test_sweep_gate_recovers_after_short_sweep()` — the latching
-      failure this gate exists to prevent is exactly the shape grouping could reintroduce.
-- [ ] `tests/uwb_net/`: group cycling covers every group; a full cycle with 32 anchors
+      sweep. Added `n_groups`-aware accounting to `struct uwb_sweep_gate` (per-group
+      last-known count, summed) and a regression test alongside
+      `test_sweep_gate_recovers_after_short_sweep()`.
+- [x] `tests/uwb_net/`: group cycling covers every group; a full cycle with 32 anchors
       spread over 8 groups reaches `UWB_NET_MIN_ANCHORS` and does not latch.
 - [ ] **Step 4 (user, hardware, needs anchor Phase 1):** with 5+ anchors on air, confirm
       the tag discovers all of them within `n_groups` rounds, and that `P:` output
@@ -142,30 +147,35 @@ GCC.
 
 ### Task 7: MPOL_RESP (`0xED`) with anchor `z`
 
-- [ ] Add `UWB_FRAME_TYPE_MPOL_RESP 0xED`, `UWB_FRAME_LEN_MPOL_RESP` (31), builder,
+- [x] Add `UWB_FRAME_TYPE_MPOL_RESP 0xED`, `UWB_FRAME_LEN_MPOL_RESP` (31), builder,
       parser, validator, per design §3.D's byte layout.
-- [ ] `z` is a float and **may be NaN**, meaning "anchor did not report a height";
+- [x] `z` is a float and **may be NaN**, meaning "anchor did not report a height";
       the parser must pass NaN through rather than rejecting it.
-- [ ] `tests/uwb_frame/`: round-trip, NaN `z`, wrong dest address, short frame.
-- [ ] Copy to the anchor repo; run both suites.
+- [x] `tests/uwb_frame/`: round-trip, NaN `z`, wrong dest address, short frame.
+- [ ] Copy to the anchor repo; run both suites. (Not done here — separate repo.)
 
 ### Task 8: Multi-poll sweep on the tag
 
-- [ ] New `uwb_multipoll_sweep(struct pos_meas *out, size_t max)` in
-      `src/uwb_ss_initiator.c`: build `0xE3` naming `selected[0..n-1]` with
-      `delay_us = MPOL_BASE_UUS + k * MPOL_SLOT_UUS`, transmit once, then keep the
-      receiver armed for the whole response window, matching frames by `src_addr` and
-      `anchor_id`.
-- [ ] **Arm the receiver for the full remaining window, never in fixed slices.** This is
+- [x] New `uwb_multipoll_sweep()` in `src/uwb_ss_initiator.c`: build `0xE3` naming the
+      selected anchors with `delay_us = MPOL_BASE_UUS + k * MPOL_SLOT_UUS`, transmit
+      once, then keep the receiver armed for the whole response window, matching frames
+      by `src_addr` and `anchor_id`. (Signature ended up
+      `uwb_multipoll_sweep(struct pos_meas *out_by_slot, bool *ok_out, const uint8_t
+      *anchor_ids, uint8_t n_anchors, uint16_t src_addr, float dz)` — by-slot output,
+      not a compacted array, so the runner's per-slot `pos_dbg` bookkeeping stays keyed
+      by `selected[]` index the way its header comment requires.)
+- [x] **Arm the receiver for the full remaining window, never in fixed slices.** This is
       the same bug that made anchor id 2 invisible in `run_discovery()`
       (`CLAUDE.md`, discovery-slice entry); a multi-poll response window sliced at a
       fixed period will lose whichever anchor's stagger lands on a boundary.
-- [ ] Compute distance per response with the existing clock-offset correction; a missing
+- [x] Compute distance per response with the existing clock-offset correction; a missing
       response is a missing `pos_meas`, not a failure.
-- [ ] Keep `do_one_range_anchor()` compiled — it is the fallback for a single-anchor
+- [x] Keep `do_one_range_anchor()` compiled — it is the fallback for a single-anchor
       bench check and the `cal` path's structural sibling — but the runner no longer
-      calls it in the sweep.
-- [ ] `MPOL_BASE_UUS` / `MPOL_SLOT_UUS` live next to each other with the airtime
+      calls it in the sweep. (`anchor_sweep()` in `uwb_net_runner.c` now calls
+      `uwb_multipoll_sweep()`; confirmed with the user before cutover since it breaks
+      ranging against any anchor fleet that hasn't landed its own Phase 2.)
+- [x] `MPOL_BASE_UUS` / `MPOL_SLOT_UUS` live next to each other with the airtime
       arithmetic in a comment (design §3.B), because the anchor derives its own TX
       deadline from the same numbers.
 - [ ] **Step 4 (user, hardware, needs anchor Phase 2):** sniffer-confirm one poll and up
@@ -186,13 +196,20 @@ GCC.
 
 ### Task 10: Anchor `z` reaches the solver
 
-- [ ] `struct pos_meas` gains `float z` (already 3D-modelled internally via `pos_cfg`'s
-      `dz`); `pos_solver.c` / `pos_residual.c` / `pos_ekf.c` use the per-anchor `z` when
-      it is finite and fall back to `pos_cfg`'s single `dz` when it is NaN.
-- [ ] `pos z` NUS command keeps setting the fallback; add one line to its reply saying
-      how many of the last sweep's anchors reported a real `z`.
-- [ ] Extend `tests/pos_solver/`, `tests/pos_residual/`, `tests/pos_ekf/` with a mixed
-      case: two anchors reporting `z`, two NaN. Mutation-test as the existing suites are.
+- [x] Per-anchor `z` handling: `struct pos_meas` already carries a per-measurement `dz`
+      (the 3D range model has always been per-anchor-capable), so no struct change was
+      needed. `uwb_multipoll_sweep()` (Task 8) resolves MPOL_RESP's `z` into that `dz` --
+      `z - tag_h_m` when `z` is finite, `pos_cfg`'s fallback `dz` when NaN. `pos_solver.c`
+      / `pos_residual.c` / `pos_ekf.c` needed no changes: heterogeneous per-measurement
+      `dz` was already their contract.
+- [x] `pos z` NUS command keeps setting the fallback; added a second reply line
+      (`"Zreal N/4\n"`, new `uwb_net_runner_sweep_real_z_count()` getter) saying how many
+      of the last sweep's anchors reported a real `z`.
+- [x] Extended `tests/pos_solver/`, `tests/pos_residual/`, `tests/pos_ekf/` with a mixed
+      case: two anchors at a real per-anchor dz, two at the fallback dz (the NaN
+      resolution itself happens in non-host-testable Zephyr code, so these test the
+      solver-side contract that resolution depends on -- heterogeneous dz within one
+      measurement set). Not separately mutation-tested this session.
 
 ---
 
@@ -200,38 +217,49 @@ GCC.
 
 ### Task 11: Phase-aware participation in `uwb_net.c`
 
-- [ ] `UWB_NET_CYCLE_C` = 16 in `uwb_net.h`, with the §5 budget arithmetic in the
+- [x] `UWB_NET_CYCLE_C` = 16 in `uwb_net.h`, with the §5 budget arithmetic in the
       comment.
-- [ ] `struct uwb_net_ctx` gains `uint16_t phase_mask`. `UWB_EV_BEACON` carries
+- [x] `struct uwb_net_ctx` gains `uint16_t phase_mask`. `UWB_EV_BEACON` carries
       `frame_counter`; participation requires `phase_mask & (1u << (frame_counter % C))`
       **and** `in_map`. Both, not either: the mask is what the gateway granted, the map
-      is what it is publishing right now, and a disagreement means re-JOIN.
-- [ ] GRANT parse: length 24 -> 26, new `phase_mask` field. `uwb_frame_grant_build()`
-      gains the parameter (the gateway builds it).
+      is what it is publishing right now, and a disagreement means re-JOIN. New pure
+      `uwb_net_phase_active()` helper, host-tested directly.
+- [x] GRANT parse: length 24 -> 26, new `phase_mask` field. `uwb_frame_grant_build()`
+      gains the parameter (the gateway builds it). A v2-length (24 B) GRANT is now
+      rejected outright by `uwb_frame_is_grant()`, not silently defaulted.
 - [ ] `listen_skip` becomes derived: the runner sleeps to the next set bit in the mask
       instead of reading the tier table. Keep `pwr tier` as an override for bench work,
-      clamped to the mask.
-- [ ] `lease_age()` already subtracts elapsed superframes — verify it still holds when a
-      tag is awake only 1 superframe in 16, and extend
-      `test_lease_ages_by_elapsed()` accordingly. This is the change most likely to
-      produce `RESCAN seat`.
-- [ ] `tests/uwb_net/`: single-phase tag participates exactly once per 16; 4-phase mover
+      clamped to the mask. (Task 12 -- runner wake planning.)
+- [x] `lease_age()` already subtracts elapsed superframes — verified it still holds when
+      a tag is awake only 1 superframe in 16, extended `test_lease_ages_by_elapsed()`
+      accordingly.
+- [x] `tests/uwb_net/`: single-phase tag participates exactly once per 16; 4-phase mover
       participates 4 times; a mask that disagrees with the map forces re-JOIN; wrap of
       `frame_counter` across `2^32` does not skip a phase.
+- [x] Confirmed with the user before implementing: this breaks JOIN against any v2
+      gateway (GRANT frame is now unparseable), a bigger break than Task 8's multipoll
+      cutover, since no anchor-side v3 exists yet in this workspace.
 
 ### Task 12: Runner wake planning, keepalive suppression, `proto_ver` 3
 
-- [ ] `beacon_sched_core` plans the wake for the **next set phase bit**, not for a fixed
+- [x] `beacon_sched_core` plans the wake for the **next set phase bit**, not for a fixed
       skip. Its long-baseline estimator already takes an arbitrary superframe delta; the
-      change is in what the runner asks for.
-- [ ] KEEPALIVE is sent only after `KEEPALIVE_AFTER_N` (default 4) participations that
+      change is in what the runner asks for. (New pure `uwb_net_phase_skip_to_next()` in
+      `uwb_net.c`, host-tested; `beacon_sched_core.c` itself needed no change. `pwr tier`
+      still clamps, but only downward -- it can force a shorter skip for bench work,
+      never longer than the mask allows.)
+- [x] KEEPALIVE is sent only after `KEEPALIVE_AFTER_N` (default 4) participations that
       produced no `0xEA` POS frame. With POS renewing the lease (anchor Task 20), a
-      healthy tag never enters CAP after JOIN.
-- [ ] `UWB_NET_PROTO_VER` and `UWB_PROTO_VER` -> **3**, in the same commit, on both
-      repos. Re-run `test_proto_ver_matches_frame_module`.
-- [ ] `pwr sched` reports the phase mask and the derived skip; `pwr tier` prints the mask
-      it is clamped by. Keep every line <= 19 chars — split across lines rather than
-      widening.
+      healthy tag never enters CAP after JOIN. New `ctx.part_since_pos` +
+      `ev.pos_sent` (set from the runner's own `solved` flag), host-tested. **Confirmed
+      with the user first**: this is tag-side prep only -- until anchor Task 20 ships,
+      nothing renews the lease between POS frames and a tag will eventually lose its
+      seat regardless.
+- [x] `UWB_NET_PROTO_VER` and `UWB_PROTO_VER` -> **3**, in the same commit. (Anchor repo
+      not touched here -- separate repo.) `test_proto_ver_matches_frame_module` re-run,
+      passes (it compares the two symbols, not a hardcoded literal).
+- [x] `pwr sched` reports the phase mask and the derived skip; `pwr tier` prints the mask
+      it is clamped by. Every new line <= 19 chars (`"PH %04x\n"`, 8 bytes).
 - [ ] **Step 4 (user, hardware):** one tag joins, receives a 1-phase grant, and holds it
       for 30 minutes with no `RESCAN`; `pwr rx` shows RX-on falling by roughly the
       cycle factor against the Task 2 baseline.
@@ -252,9 +280,15 @@ GCC.
 
 ### Task 14: Documentation
 
-- [ ] Update `CLAUDE.md`: the capacity numbers, the anchor cap, `proto_ver` 3, the new
+- [x] Update `CLAUDE.md`: the capacity numbers, the anchor cap, `proto_ver` 3, the new
       frames, the grouped-discovery invariant (the two derived timeouts), the phase
       mask, and the fact that `UWB_LISTEN_SKIP_CAP` is now superseded by the grant.
-- [ ] Update `spec/2026-06-17-uwb-mac-protocol-contract.md` to v3, or mark it superseded
-      by the scaling design — one of the two, not neither.
+      Added one consolidated "Network scaling v3" bullet plus forward-pointers from the
+      old multi-tag-capacity and `UWB_LISTEN_SKIP_CAP` bullets, updated the
+      `uwb_frame_802_15_4z.c` frame list, the dynamic-anchor-selection bullet (now
+      `anchor_pool_core.c`, 16 entries), the source-layout table, and the host-test table.
+- [x] Update `spec/2026-06-17-uwb-mac-protocol-contract.md` to v3, or mark it superseded
+      by the scaling design — one of the two, not neither. Marked superseded with a
+      status-line pointer to the v3 design and a summary of what changed.
 - [ ] Fold the measured numbers from Tasks 2, 8 and 13 back into the design's §5 and §11.
+      (Not done -- no hardware measurements exist yet; nothing to fold in.)

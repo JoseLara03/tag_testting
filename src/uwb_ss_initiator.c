@@ -27,6 +27,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <math.h>
 
 /* Antenna delay (TX_ANT_DLY / RX_ANT_DLY) comes from phy_config.h — the
  * calibration knob. Edit it there and rebuild to re-calibrate. */
@@ -273,6 +274,173 @@ bool do_one_range_anchor(uint8_t aid, float *range_m, float *ax, float *ay)
     memcpy(ax, &rx_buf[UWB_WAVE_POS_ANCHOR_X_IDX], sizeof(float));
     memcpy(ay, &rx_buf[UWB_WAVE_POS_ANCHOR_Y_IDX], sizeof(float));
     return true;
+}
+
+/* ---- MULTI-POLL sweep (network-scaling v3, Phase 2 Task 8) ----------------
+ * One 0xE3 poll names every anchor with a staggered response delay; the
+ * anchors' 0xED MPOL_RESP replies are collected in one open window instead of
+ * one poll->response exchange per anchor. Design §3.B airtime arithmetic:
+ *
+ *   single-poll x4 (v2)  4 x (1.2 poll + 2.05 turnaround + 1.35 resp) ~ 22 ms
+ *   multi-poll     (v3)  1.4 poll + 2.05 + 4 x 1.7 stagger            ~ 10.2 ms
+ *
+ * MPOL_BASE_UUS / MPOL_SLOT_UUS are the numbers written into each slot's
+ * delay_us -- the anchor derives its own delayed-TX deadline from exactly
+ * these values (its own RX timestamp of this poll, plus its slot's delay_us),
+ * so the two constants must stay matched to that arithmetic, not just to each
+ * other. */
+#define MPOL_BASE_UUS   2200U   /* first response: ~2050 uus anchor turnaround + margin */
+#define MPOL_SLOT_UUS   1700U   /* stagger step: ~1.35 ms response airtime + margin */
+/* Provisional: covers MPOL_BASE_UUS + 3*MPOL_SLOT_UUS + one response's airtime
+ * + margin for 4 anchors (~9.15 ms). Task 9 re-derives T_SLOT_MS from a
+ * hardware measurement of the real occupancy (Step 4 below) -- re-check this
+ * window against that measurement before relying on it beyond the bench. */
+#define MPOL_WINDOW_MS    12U
+
+int uwb_multipoll_sweep(struct pos_meas *out_by_slot, bool *ok_out,
+                        const uint8_t *anchor_ids, uint8_t n_anchors,
+                        uint16_t src_addr, float dz_fallback, float tag_h_m,
+                        uint8_t *real_z_count_out)
+{
+    if (!out_by_slot || !ok_out || !anchor_ids || n_anchors == 0 ||
+        n_anchors > UWB_FRAME_MAX_ANCHORS) {
+        return 0;
+    }
+    for (uint8_t i = 0; i < n_anchors; i++) {
+        ok_out[i] = false;
+    }
+    if (real_z_count_out) {
+        *real_z_count_out = 0;
+    }
+
+    /* The previous exchange in this slot may have timed out at the kernel
+     * level with no DW3000 event, leaving the PHY in an unknown state (see
+     * the same guard in position_publish()). Nothing has been transmitted or
+     * received yet here, so there is no new abort for the status clear below
+     * to lose. */
+    dwt_forcetrxoff();
+
+    struct uwb_anchor_slot slots[UWB_FRAME_MAX_ANCHORS];
+    for (uint8_t i = 0; i < n_anchors; i++) {
+        /* Anchor short address == its 8-bit pool id, zero-extended -- the
+         * same convention the discovery response and the legacy WAVE
+         * positioning frame's anchor_id byte already use in this deployment's
+         * address space. */
+        slots[i].addr     = anchor_ids[i];
+        slots[i].delay_us = (uint16_t)(MPOL_BASE_UUS + (uint32_t)i * MPOL_SLOT_UUS);
+    }
+
+    uint8_t mbuf[UWB_FRAME_LEN_MPOL(UWB_FRAME_MAX_ANCHORS)];
+    int mlen = uwb_frame_multipoll_build(mbuf, sizeof(mbuf), src_addr,
+                                        slots, n_anchors, 0u);
+    if (mlen <= 0) {
+        return 0;
+    }
+    uwb_frame_set_seq_num(mbuf, frame_seq_nb++);
+
+    dwt_setinterrupt(DWT_INT_TXFRS_BIT_MASK, 0, DWT_ENABLE_INT_ONLY);
+    dwt_writetxdata((uint16_t)mlen, mbuf, 0);
+    dwt_writetxfctrl((uint16_t)(mlen + FCS_LEN), 0, 0);
+    if (dwt_starttx(DWT_START_TX_IMMEDIATE) != DWT_SUCCESS) {
+        dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+        return 0;
+    }
+
+    irq_evt_t tx_evt = wait_event(K_MSEC(10));
+    dwt_writesysstatuslo(DWT_INT_TXFRS_BIT_MASK |
+                         SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+    if (tx_evt != EVT_TXFRS) {
+        return 0;
+    }
+    uint32_t poll_tx_ts = dwt_readtxtimestamplo32();
+
+    /* Collect responses for the FULL remaining window each iteration, never a
+     * fixed slice -- slicing re-arms the receiver on a fixed timer regardless
+     * of whether a frame arrived, and each re-arm leaves a brief gap where
+     * the receiver is not listening. This is the exact bug that made
+     * discovery lose one specific anchor whose response landed on a slice
+     * boundary (CLAUDE.md, discovery-slice entry); a multi-poll window sliced
+     * the same way would lose whichever anchor's stagger lands on it. */
+    size_t n = 0;
+    uint32_t t_end = k_uptime_get_32() + MPOL_WINDOW_MS;
+
+    while (n < (size_t)n_anchors) {
+        int32_t rem = (int32_t)(t_end - k_uptime_get_32());
+        if (rem <= 0) {
+            break;
+        }
+
+        dwt_setrxtimeout(0);
+        dwt_setpreambledetecttimeout(0);
+        dwt_setinterrupt(INT_RX_PHASE, 0, DWT_ENABLE_INT_ONLY);
+        dwt_rxenable(DWT_START_RX_IMMEDIATE);
+
+        irq_evt_t evt = wait_event(K_MSEC((uint32_t)rem));
+        if (evt != EVT_RXFCG) {
+            dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+            continue;
+        }
+
+        uint16_t flen = dwt_getframelength();   /* includes 2-byte FCS */
+        if (flen <= FCS_LEN ||
+            (flen - FCS_LEN) != UWB_FRAME_LEN_MPOL_RESP) {
+            dwt_writesysstatuslo(DWT_INT_RXFCG_BIT_MASK);
+            continue;
+        }
+
+        uint8_t rbuf[UWB_FRAME_LEN_MPOL_RESP];
+        dwt_readrxdata(rbuf, UWB_FRAME_LEN_MPOL_RESP, 0);
+        uint32_t resp_rx_ts = dwt_readrxtimestamplo32();
+        double clock_offset_ratio =
+            ((double)dwt_readclockoffset()) / (uint32_t)(1 << 26);
+        dwt_writesysstatuslo(DWT_INT_RXFCG_BIT_MASK);
+
+        uint16_t src = 0; uint8_t aid = 0;
+        uint32_t poll_rx_ts = 0, resp_tx_ts = 0;
+        float ax = 0.0f, ay = 0.0f, az = 0.0f;
+        if (uwb_frame_parse_mpol_resp(rbuf, UWB_FRAME_LEN_MPOL_RESP, src_addr,
+                                      &src, &aid, &poll_rx_ts, &resp_tx_ts,
+                                      &ax, &ay, &az) != 0) {
+            continue;
+        }
+
+        /* Match against a named, not-yet-answered anchor only -- a stray or
+         * duplicate response must not be double-counted or attributed to the
+         * wrong slot. */
+        int slot = -1;
+        for (uint8_t i = 0; i < n_anchors; i++) {
+            if (!ok_out[i] && slots[i].addr == src && (uint8_t)src == aid) {
+                slot = i;
+                break;
+            }
+        }
+        if (slot < 0) {
+            continue;
+        }
+
+        /* Same clock-offset-corrected ToF formula as do_one_range_anchor(),
+         * with poll_tx_ts shared across every anchor's calculation since the
+         * poll was transmitted once; resp_rx_ts and clock_offset_ratio are
+         * per-response, read immediately after that response's own RXFCG. */
+        int32_t rtd_init = (int32_t)(resp_rx_ts - poll_tx_ts);
+        int32_t rtd_resp = (int32_t)(resp_tx_ts - poll_rx_ts);
+        double tof = ((rtd_init - rtd_resp * (1 - clock_offset_ratio)) / 2.0)
+                     * DWT_TIME_UNITS;
+
+        bool real_z = !isnan(az);
+
+        out_by_slot[slot].x       = ax;
+        out_by_slot[slot].y       = ay;
+        out_by_slot[slot].dz      = real_z ? (az - tag_h_m) : dz_fallback;
+        out_by_slot[slot].range_m = (float)(tof * SPEED_OF_LIGHT);
+        ok_out[slot] = true;
+        n++;
+        if (real_z && real_z_count_out) {
+            (*real_z_count_out)++;
+        }
+    }
+
+    return (int)n;
 }
 
 /* Format a metre value as a signed "x.xx" string (centimetre resolution),

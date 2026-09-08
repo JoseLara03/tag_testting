@@ -125,6 +125,10 @@ static struct uwb_net_event ev_grant(uint16_t sa, uint8_t slot, uint8_t tier, ui
     struct uwb_net_event e; memset(&e, 0, sizeof(e));
     e.kind = UWB_EV_GRANT; e.g_short_addr = sa; e.g_slot = slot;
     e.g_tier = tier; e.g_lease = lease;
+    /* All phases granted, unless a test overrides it -- the pre-Phase-3
+     * behaviour of "every superframe is a participation", so tests not
+     * specifically exercising phase gating are unaffected by its addition. */
+    e.g_phase_mask = 0xFFFFu;
     return e;
 }
 
@@ -219,6 +223,174 @@ static void to_ranging(struct uwb_net_ctx *c, uwb_tier_t tier)
     struct uwb_net_event g = ev_grant(0x0007, 3, tier, UWB_NET_LEASE_SF); uwb_net_handle(c, &g);
     struct uwb_net_event d; memset(&d, 0, sizeof(d)); d.kind = UWB_EV_DISCOVERED; d.n_anchors = 4;
     uwb_net_handle(c, &d);   /* -> RANGING */
+
+    /* Existing keepalive-on-low-lease tests predate part_since_pos gating
+     * (Task 12) and assert on the lease threshold alone; preset the count
+     * past UWB_NET_KEEPALIVE_AFTER_N so they see the same behaviour as
+     * before. Tests of the suppression itself reset this explicitly. */
+    c->part_since_pos = UWB_NET_KEEPALIVE_AFTER_N;
+}
+
+/* Helpers for phase-mask (Phase 3, Task 11) tests. */
+static struct uwb_net_event ev_grant_phase(uint16_t sa, uint8_t slot, uint8_t tier,
+                                           uint16_t lease, uint16_t phase_mask)
+{
+    struct uwb_net_event e = ev_grant(sa, slot, tier, lease);
+    e.g_phase_mask = phase_mask;
+    return e;
+}
+
+static void to_ranging_phase(struct uwb_net_ctx *c, uwb_tier_t tier, uint16_t phase_mask)
+{
+    uwb_net_init(c, EUI);
+    struct uwb_net_event b = ev_beacon(0, false, 0); uwb_net_handle(c, &b);
+    struct uwb_net_event g = ev_grant_phase(0x0007, 3, tier, UWB_NET_LEASE_SF, phase_mask);
+    uwb_net_handle(c, &g);
+    struct uwb_net_event d; memset(&d, 0, sizeof(d)); d.kind = UWB_EV_DISCOVERED; d.n_anchors = 4;
+    uwb_net_handle(c, &d);   /* -> RANGING */
+    c->part_since_pos = UWB_NET_KEEPALIVE_AFTER_N;   /* see to_ranging()'s comment */
+}
+
+/* A single granted phase participates exactly once per UWB_NET_CYCLE_C (16)
+ * superframes -- fed only the beacons that phase would actually wake the tag
+ * for (the runner's job, Task 12, is to never generate the others), the FSM
+ * must never bounce to SCAN and must age the lease by the real elapsed gap
+ * each time. */
+static void test_single_phase_participates_once_per_cycle(void)
+{
+    const uint16_t mask = (uint16_t)(1u << 5);   /* phase 5 only */
+    struct uwb_net_ctx c;
+    to_ranging_phase(&c, UWB_TIER_FAST, mask);
+
+    uint16_t lease_before = c.lease_remaining;
+    for (int cycle = 0; cycle < 5; cycle++) {
+        uint32_t fc = (uint32_t)cycle * UWB_NET_CYCLE_C + 5u;
+        struct uwb_net_event b = ev_beacon(fc, true, 3);
+        uint32_t a = uwb_net_handle(&c, &b);
+
+        CHECK(!(a & UWB_ACT_TO_SCAN));
+        CHECK(c.state == UWB_ST_RANGING);
+        if (cycle > 0) {
+            /* Elapsed is exactly one cycle between consecutive participations. */
+            CHECK((uint16_t)(lease_before - c.lease_remaining) == UWB_NET_CYCLE_C ||
+                 (a & UWB_ACT_SEND_KEEPALIVE));   /* unless a renewal landed */
+        }
+        lease_before = c.lease_remaining;
+    }
+}
+
+/* A mover granted 4 phases participates 4 times per 16-superframe cycle. */
+static void test_multi_phase_mover_participates_n_times_per_cycle(void)
+{
+    const uint16_t mask = (uint16_t)((1u << 0) | (1u << 4) | (1u << 8) | (1u << 12));
+    struct uwb_net_ctx c;
+    to_ranging_phase(&c, UWB_TIER_FAST, mask);
+
+    static const uint32_t fcs[] = { 4, 8, 12, 16, 20, 24, 28, 32 };  /* two cycles */
+    int participations = 0;
+
+    for (unsigned i = 0; i < sizeof(fcs) / sizeof(fcs[0]); i++) {
+        struct uwb_net_event b = ev_beacon(fcs[i], true, 3);
+        uint32_t a = uwb_net_handle(&c, &b);
+
+        CHECK(!(a & UWB_ACT_TO_SCAN));
+        CHECK(c.state == UWB_ST_RANGING);
+        participations++;
+    }
+    CHECK(participations == 8);   /* 4 phases x 2 cycles */
+}
+
+/* The mask is what the gateway granted; the map is what it is publishing
+ * right now. A beacon landing on a superframe this grant never authorized --
+ * even though the tag is still (per this stale/buggy beacon) IN the slot
+ * map -- is a disagreement, and must force re-JOIN rather than being
+ * silently accepted or silently ignored. */
+static void test_phase_mask_disagreement_forces_rejoin(void)
+{
+    const uint16_t mask = (uint16_t)(1u << 5);   /* phase 5 only */
+    struct uwb_net_ctx c;
+    to_ranging_phase(&c, UWB_TIER_FAST, mask);
+
+    struct uwb_net_event b = ev_beacon(6u, true, 3);   /* phase 6: not granted */
+    uint32_t a = uwb_net_handle(&c, &b);
+
+    CHECK(a & UWB_ACT_TO_SCAN);
+    CHECK(c.state == UWB_ST_SCAN);
+}
+
+/* KEEPALIVE fires only after UWB_NET_KEEPALIVE_AFTER_N participations with no
+ * POS frame sent, once the lease is low -- a real POS transmission (stronger
+ * liveness proof, Task 12) resets the count and suppresses it again. */
+static void test_keepalive_suppressed_until_n_participations_without_pos(void)
+{
+    struct uwb_net_ctx c;
+    to_ranging(&c, UWB_TIER_FAST);
+    c.part_since_pos = 0;               /* undo to_ranging()'s test-fixture preset */
+    c.lease_remaining = UWB_NET_LEASE_SF / 2;   /* already at the renewal threshold */
+
+    uint32_t fc = c.frame_counter;
+    for (uint16_t i = 1; i < UWB_NET_KEEPALIVE_AFTER_N; i++) {
+        struct uwb_net_event b = ev_beacon(++fc, true, 3);
+        uint32_t a = uwb_net_handle(&c, &b);
+        CHECK(!(a & UWB_ACT_SEND_KEEPALIVE));   /* suppressed: too few participations */
+    }
+
+    /* The Nth participation with still no POS: keepalive fires. */
+    struct uwb_net_event bn = ev_beacon(++fc, true, 3);
+    CHECK(uwb_net_handle(&c, &bn) & UWB_ACT_SEND_KEEPALIVE);
+
+    /* A real POS transmission resets the count, so the very next low-lease
+     * participation is suppressed again. */
+    c.lease_remaining = UWB_NET_LEASE_SF / 2;
+    struct uwb_net_event sw; memset(&sw, 0, sizeof(sw));
+    sw.kind = UWB_EV_SWEPT; sw.n_anchors = 4; sw.pos_sent = true;
+    uwb_net_handle(&c, &sw);
+
+    struct uwb_net_event b2 = ev_beacon(++fc, true, 3);
+    CHECK(!(uwb_net_handle(&c, &b2) & UWB_ACT_SEND_KEEPALIVE));
+}
+
+/* uwb_net_phase_skip_to_next() drives the runner's wake planning (Task 12):
+ * it must land exactly on the next granted phase, wrapping the cycle when
+ * needed, and never loop forever on an empty mask. */
+static void test_phase_skip_to_next(void)
+{
+    /* Single phase: from just before it, just after it (wraps a full cycle),
+     * and from exactly on it (must return the FULL cycle, not 0 -- the next
+     * occurrence, not this one). */
+    const uint16_t one = (uint16_t)(1u << 5);
+    CHECK(uwb_net_phase_skip_to_next(one, 0u) == 5u);
+    CHECK(uwb_net_phase_skip_to_next(one, 5u) == UWB_NET_CYCLE_C);
+    CHECK(uwb_net_phase_skip_to_next(one, 6u) == 15u);   /* wraps to phase 5 of next cycle */
+
+    /* Multiple phases: the nearest one wins. */
+    const uint16_t four = (uint16_t)((1u << 0) | (1u << 4) | (1u << 8) | (1u << 12));
+    CHECK(uwb_net_phase_skip_to_next(four, 1u) == 3u);    /* -> phase 4 */
+    CHECK(uwb_net_phase_skip_to_next(four, 12u) == 4u);   /* -> phase 0 of the next cycle, 4 away */
+
+    /* Empty mask: bounded, returns the full cycle rather than looping forever. */
+    CHECK(uwb_net_phase_skip_to_next(0u, 0u) == UWB_NET_CYCLE_C);
+
+    /* Wrap-safe: works the same right at the frame_counter wrap boundary. */
+    CHECK(uwb_net_phase_skip_to_next(one, 0xFFFFFFFFu) == 6u);   /* fc%16==15 -> next is 5 (of the next cycle) */
+}
+
+/* UWB_NET_CYCLE_C (16) is a power of two dividing 2^32 evenly, so
+ * frame_counter % UWB_NET_CYCLE_C must be continuous across the uint32_t
+ * wrap -- no phase skipped or repeated at the boundary. */
+static void test_phase_active_wrap_does_not_skip_phase(void)
+{
+    const uint16_t mask_hi = (uint16_t)(1u << 15);
+    const uint16_t mask_lo = (uint16_t)(1u << 0);
+
+    uint32_t fc = 0xFFFFFFFFu;   /* fc % 16 == 15 */
+    CHECK(uwb_net_phase_active(mask_hi, fc));
+    CHECK(!uwb_net_phase_active(mask_lo, fc));
+
+    fc++;   /* wraps to 0; fc % 16 == 0, the very next phase after 15 */
+    CHECK(fc == 0u);
+    CHECK(uwb_net_phase_active(mask_lo, fc));
+    CHECK(!uwb_net_phase_active(mask_hi, fc));
 }
 
 static void test_ranging(void)
@@ -343,6 +515,20 @@ static void test_lease_ages_by_elapsed(void)
         uwb_net_handle(&c, &bi);
         CHECK(c.state == UWB_ST_RANGING);
         CHECK(c.lease_remaining > 0);
+    }
+
+    /* Phase 3: still holds when the tag is awake only 1 superframe in 16 (a
+     * single granted phase), not just at the pre-v3 skip-25 cadence above. */
+    struct uwb_net_ctx cp;
+    to_ranging_phase(&cp, UWB_TIER_FAST, (uint16_t)(1u << 0));
+    uint32_t fcp = 16u;
+    for (int i = 0; i < 20; i++) {
+        struct uwb_net_event bi = ev_beacon(fcp, true, 3);
+        uint32_t ai = uwb_net_handle(&cp, &bi);
+        CHECK(!(ai & UWB_ACT_TO_SCAN));
+        CHECK(cp.state == UWB_ST_RANGING);
+        CHECK(cp.lease_remaining > 0);
+        fcp += UWB_NET_CYCLE_C;
     }
 
     /* Every superframe: still exactly one decrement per beacon, so nothing
@@ -534,7 +720,7 @@ static void test_sweep_gate_recovers_after_short_sweep(void)
     CHECK(uwb_sweep_gate_rediscover_due(&g, now));
 
     /* Discovery finds enough anchors, so the next participation sweeps. */
-    uwb_sweep_gate_discovered(&g, now, UWB_NET_MIN_ANCHORS);
+    uwb_sweep_gate_discovered(&g, now, 0, 1, UWB_NET_MIN_ANCHORS);
     CHECK(!uwb_sweep_gate_rediscover_due(&g, now));
 
     /* The anchors are power-cycled and the sweep ranges nobody. */
@@ -546,15 +732,84 @@ static void test_sweep_gate_recovers_after_short_sweep(void)
      * rediscover branch refreshed neither the count it was gated on nor any
      * path back to it. */
     now += 200u;
-    uwb_sweep_gate_discovered(&g, now, UWB_NET_MIN_ANCHORS);
+    uwb_sweep_gate_discovered(&g, now, 0, 1, UWB_NET_MIN_ANCHORS);
     CHECK(!uwb_sweep_gate_rediscover_due(&g, now));
 
     /* ...and a round that still finds too few must keep re-discovering, so the
      * fix is not simply "always sweep after a discovery". */
     uwb_sweep_gate_swept(&g, 0u);
     now += 200u;
-    uwb_sweep_gate_discovered(&g, now, UWB_NET_MIN_ANCHORS - 1u);
+    uwb_sweep_gate_discovered(&g, now, 0, 1, UWB_NET_MIN_ANCHORS - 1u);
     CHECK(uwb_sweep_gate_rediscover_due(&g, now));
+}
+
+/* Grouped discovery (Task 6): a round that finds only 2 of ITS group's
+ * anchors is not a short sweep once other groups already have known-good
+ * anchors -- last_sweep_n must be the sum across the whole cycle. This is
+ * exactly the latching shape test_sweep_gate_recovers_after_short_sweep()
+ * guards against, reintroduced at the per-group level if the sum were
+ * dropped in favour of the single most recent round's count. */
+static void test_sweep_gate_group_cycle_sums_across_groups(void)
+{
+    struct uwb_sweep_gate g;
+    uint32_t now = 1000u;
+
+    uwb_sweep_gate_init(&g);
+
+    /* 32 anchors over 8 groups of 4: each round finds all 4 of its group. A
+     * full cycle must reach UWB_NET_MIN_ANCHORS well before the last group,
+     * and never falsely latch mid-cycle just because any ONE round's own
+     * count is below the threshold on its own (it isn't here, but the point
+     * is the gate must not require every group answer before sweeping). */
+    for (uint8_t grp = 0; grp < 8; grp++) {
+        now += 200u;
+        uwb_sweep_gate_discovered(&g, now, grp, 8, 4u);
+        if (grp == 0) {
+            /* First group alone already clears MIN_ANCHORS (4 >= 3). */
+            CHECK(!uwb_sweep_gate_rediscover_due(&g, now));
+        }
+    }
+    /* A full cycle: last_sweep_n must be 32 (4 anchors x 8 groups), not 4
+     * (just the most recent round). */
+    CHECK(g.last_sweep_n == 32u);
+
+    /* Now one specific group's anchors go dark (power-cycled), reporting 0.
+     * The other 7 groups' anchors are still known-good from their last visit,
+     * so the tag must still consider the sweep healthy -- it must NOT
+     * rediscover forever just because ITS most recent round was short. */
+    now += 200u;
+    uwb_sweep_gate_discovered(&g, now, 3, 8, 0u);
+    CHECK(g.last_sweep_n == 28u);              /* 32 - the 4 lost anchors */
+    CHECK(!uwb_sweep_gate_rediscover_due(&g, now));
+
+    /* If EVERY group goes dark, the cycle sum eventually drops below
+     * MIN_ANCHORS and the gate correctly asks to keep rediscovering. */
+    for (uint8_t grp = 0; grp < 8; grp++) {
+        now += 200u;
+        uwb_sweep_gate_discovered(&g, now, grp, 8, 0u);
+    }
+    CHECK(g.last_sweep_n == 0u);
+    CHECK(uwb_sweep_gate_rediscover_due(&g, now));
+
+    /* A cycle-size change (e.g. anchor count re-provisioned) resets the
+     * per-group accounting rather than mixing counts from the old cycle
+     * shape into the new one. */
+    uwb_sweep_gate_init(&g);
+    uwb_sweep_gate_discovered(&g, now, 0, 8, 4u);
+    CHECK(g.last_sweep_n == 4u);
+    uwb_sweep_gate_discovered(&g, now, 0, 4, 4u);   /* n_groups shrank */
+    CHECK(g.last_sweep_n == 4u);   /* old 8-group counts discarded, not summed in */
+
+    /* Malformed group/n_groups falls back to a single-group round instead of
+     * indexing off the end or corrupting the accounting. */
+    uwb_sweep_gate_init(&g);
+    uwb_sweep_gate_discovered(&g, now, 5, 3, 7u);   /* group >= n_groups */
+    CHECK(g.last_sweep_n == 7u);
+    uwb_sweep_gate_discovered(&g, now, 0, 0, 9u);   /* n_groups == 0 */
+    CHECK(g.last_sweep_n == 9u);
+    uwb_sweep_gate_discovered(&g, now, 0,
+                              UWB_SWEEP_GATE_N_GROUPS_MAX + 1, 5u);  /* n_groups too big */
+    CHECK(g.last_sweep_n == 5u);
 }
 
 /* The periodic refresh, and that its arithmetic survives the ms-clock wrap. */
@@ -563,14 +818,14 @@ static void test_sweep_gate_interval(void)
     struct uwb_sweep_gate g;
 
     uwb_sweep_gate_init(&g);
-    uwb_sweep_gate_discovered(&g, 0u, UWB_NET_MIN_ANCHORS);
+    uwb_sweep_gate_discovered(&g, 0u, 0, 1, UWB_NET_MIN_ANCHORS);
     uwb_sweep_gate_swept(&g, UWB_NET_MIN_ANCHORS);
     CHECK(!uwb_sweep_gate_rediscover_due(&g, UWB_NET_REDISCOVER_INTERVAL_MS - 1u));
     CHECK(uwb_sweep_gate_rediscover_due(&g, UWB_NET_REDISCOVER_INTERVAL_MS));
 
     /* Signed difference: 0xFFFFFF00 + 512 wraps to 0x100. */
     uwb_sweep_gate_init(&g);
-    uwb_sweep_gate_discovered(&g, 0xFFFFFF00u, UWB_NET_MIN_ANCHORS);
+    uwb_sweep_gate_discovered(&g, 0xFFFFFF00u, 0, 1, UWB_NET_MIN_ANCHORS);
     uwb_sweep_gate_swept(&g, UWB_NET_MIN_ANCHORS);
     CHECK(!uwb_sweep_gate_rediscover_due(&g, 0x00000100u));
     CHECK(uwb_sweep_gate_rediscover_due(&g,
@@ -588,10 +843,17 @@ int main(void)
     test_grant_discover();
     test_discover_keeps_lease();
     test_ranging();
+    test_single_phase_participates_once_per_cycle();
+    test_multi_phase_mover_participates_n_times_per_cycle();
+    test_phase_mask_disagreement_forces_rejoin();
+    test_phase_skip_to_next();
+    test_keepalive_suppressed_until_n_participations_without_pos();
+    test_phase_active_wrap_does_not_skip_phase();
     test_lease_ages_by_elapsed();
     test_gate_actions();
     test_send_alert();
     test_sweep_gate_recovers_after_short_sweep();
+    test_sweep_gate_group_cycle_sums_across_groups();
     test_sweep_gate_interval();
     printf(g_fail ? "FAILED %d\n" : "OK\n", g_fail);
     return g_fail ? 1 : 0;

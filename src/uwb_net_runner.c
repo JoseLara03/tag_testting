@@ -26,6 +26,7 @@
 #include "beacon_track_core.h"
 #include "beacon_sched_core.h"
 #include "scan_backoff_core.h"
+#include "anchor_pool_core.h"
 #include "tag_alert.h"
 #include <zephyr/kernel.h>
 #include <zephyr/random/random.h>
@@ -62,34 +63,48 @@
 /* Settle time between consecutive anchor polls in a sweep. */
 #define INTER_ANCHOR_DELAY_US        10U
 
-#define DISCOVERY_WINDOW_MS      15U   /* total RX collection window; covers anchor_id=3 (12.5 ms slot) */
+/* Total RX collection window; covers anchor_id=3 (12.5 ms slot) -- the anchor
+ * delays its E4 response by DISC_BASE_UUS + id*DISC_SLOT_UUS (2000 + id*3500 uus
+ * on the anchor side), max id=3 within a 4-anchor group. Grouping (Task 6)
+ * does not change this: each round still queries at most UWB_FRAME_MAX_ANCHORS
+ * (4) anchors, so the per-round worst case stagger is unchanged -- only the
+ * number of ROUNDS needed to cover the whole population grows. If the anchor
+ * ever answers with an id outside 0..3 within a group, this window must grow
+ * with it. */
+#define DISCOVERY_WINDOW_MS      15U
+
+/* Passive ANNOUNCE window: after a valid beacon, keep the receiver armed this
+ * long for a following 0xEC. Bounded and never extended -- a tag that hears
+ * nothing here simply learns nothing this superframe. */
+#define T_ANNOUNCE_MS             2U
 
 /* Rung of the coverage ladder at and above which discovery is suppressed
  * entirely (design §5.3): run_discovery() broadcasts and then holds a 15 ms
  * window open for anchors that are, by definition, not there. */
 #define SCAN_QUIET_RUNG           2U
 
-/* ---- Anchor-pool / CIR selection ---- */
-#define ANCHOR_POOL_MAX           6
-#define ANCHOR_SELECT_MAX         4
-/* The minimum that makes a round "enough" is UWB_NET_MIN_ANCHORS (uwb_net.h),
+/* ---- Anchor-pool / CIR selection ----
+ * Pool bookkeeping (insert, EMA, decay, staleness, top-N select) is pure and
+ * host-tested in src/anchor_pool_core.c / tests/anchor_pool/. ANCHOR_POOL_MAX
+ * (16) and ANCHOR_SELECT_MAX (4, unchanged -- see anchor_pool_core.h) live
+ * there now.
+ * The minimum that makes a round "enough" is UWB_NET_MIN_ANCHORS (uwb_net.h),
  * the same symbol the FSM compares n_anchors against. A private copy here is
  * what let this file's sweep gate and the FSM disagree about whether the tag
  * was making progress. */
-#define EMA_ALPHA              0.3f
-#define EMA_DECAY              0.5f
 #define CIR_QUALITY_WEIGHT     1.0f
 
-typedef struct {
-    uint8_t id;
-    float   ema_score;
-    bool    valid;
-    bool    seen;   /* transient: set during discovery, cleared before each round */
-} anchor_entry_t;
+static struct anchor_pool anchor_pool_state;
+static uint8_t            selected[ANCHOR_SELECT_MAX];
+static uint8_t            n_selected;
 
-static anchor_entry_t anchor_pool[ANCHOR_POOL_MAX];
-static uint8_t        selected[ANCHOR_SELECT_MAX];
-static uint8_t        n_selected;
+/* Grouped discovery rounds (Task 6): each call to run_discovery() covers one
+ * group of the anchor population; disc_round advances every call so
+ * consecutive rounds cycle through every group. UWB_DISC_N_GROUPS is the
+ * conservative max (UWB_FRAME_DISC_N_GROUPS_MAX = 8, i.e. 32 anchors / 4 per
+ * group) rather than a measured anchor count the tag has no way to know. */
+#define UWB_DISC_N_GROUPS  UWB_FRAME_DISC_N_GROUPS_MAX
+static uint8_t disc_round;
 /* Discover-vs-sweep decision and its state. Pure and host-tested in
  * uwb_net.c/tests/uwb_net -- it used to be three file-scope variables and an
  * inline condition here, and in that shape it latched the tag out of ranging
@@ -108,6 +123,15 @@ static int16_t  sweep_ax_cm[POS_MAX_ANCHORS];
 static int16_t  sweep_ay_cm[POS_MAX_ANCHORS];
 static int16_t  sweep_r_cm[POS_MAX_ANCHORS];
 static uint8_t  sweep_mask;
+
+/* How many of the last sweep's anchors reported a real (non-NaN) z, for the
+ * `pos z` diagnostic (Phase 2 Task 10). */
+static uint8_t sweep_last_real_z_count;
+
+uint8_t uwb_net_runner_sweep_real_z_count(void)
+{
+    return sweep_last_real_z_count;
+}
 
 /* ---- Position filter ------------------------------------------------------
  * Tightly-coupled EKF over the raw ranges. Owned by the runner thread and
@@ -146,6 +170,21 @@ static struct scan_backoff  backoff;
 /* ---- EUI stored at start ---- */
 static uint8_t runner_eui[UWB_FRAME_EUI_LEN];
 
+/* This tag's current short address, mirrored from ctx.short_addr at the top
+ * of each superframe -- anchor_sweep() needs it to address its MULTI-POLL but
+ * is called through the uwb_radio_ops interface, which takes no ctx. */
+static uint16_t sweep_tag_addr;
+
+/* This tag's currently granted phase mask, mirrored from ctx.phase_mask at
+ * the top of each superframe -- `pwr sched` / `pwr tier` (BT RX thread) need
+ * it and neither has access to the runner's stack-local ctx. */
+static uint16_t g_phase_mask;
+
+uint16_t uwb_net_runner_phase_mask(void)
+{
+    return g_phase_mask;
+}
+
 /* ---- Layer-1 power saving flag ---- */
 static volatile bool dw_sleep_enabled = true;
 
@@ -181,75 +220,26 @@ void uwb_net_runner_wake(void)
 static void anchor_pool_update(uint8_t id, int32_t cir_power, uint16_t cir_quality)
 {
     float score = (float)cir_power + CIR_QUALITY_WEIGHT * (float)cir_quality;
-
-    /* Update existing entry */
-    for (int i = 0; i < ANCHOR_POOL_MAX; i++) {
-        if (anchor_pool[i].valid && anchor_pool[i].id == id) {
-            anchor_pool[i].ema_score = EMA_ALPHA * score +
-                                       (1.0f - EMA_ALPHA) * anchor_pool[i].ema_score;
-            anchor_pool[i].seen = true;
-            return;
-        }
-    }
-    /* New anchor: find empty slot */
-    for (int i = 0; i < ANCHOR_POOL_MAX; i++) {
-        if (!anchor_pool[i].valid) {
-            anchor_pool[i].id        = id;
-            anchor_pool[i].ema_score = score;
-            anchor_pool[i].valid     = true;
-            anchor_pool[i].seen      = true;
-            return;
-        }
-    }
-    /* Pool full: evict lowest-scoring entry */
-    int worst = 0;
-    for (int i = 1; i < ANCHOR_POOL_MAX; i++) {
-        if (anchor_pool[i].ema_score < anchor_pool[worst].ema_score) {
-            worst = i;
-        }
-    }
-    anchor_pool[worst].id        = id;
-    anchor_pool[worst].ema_score = score;
-    anchor_pool[worst].seen      = true;
-}
-
-static void anchor_pool_decay_missed(void)
-{
-    for (int i = 0; i < ANCHOR_POOL_MAX; i++) {
-        if (anchor_pool[i].valid && !anchor_pool[i].seen) {
-            anchor_pool[i].ema_score *= EMA_DECAY;
-        }
-    }
+    anchor_pool_observe_score(&anchor_pool_state, id, score, uwb_radio_now_ms());
 }
 
 static void anchor_pool_rebuild_selected(void)
 {
-    /* Collect valid pool indices */
-    uint8_t order[ANCHOR_POOL_MAX];
-    uint8_t count = 0;
+    anchor_pool_expire_stale(&anchor_pool_state, uwb_radio_now_ms());
+    n_selected = anchor_pool_select(&anchor_pool_state, selected, ANCHOR_SELECT_MAX);
+}
 
-    for (int i = 0; i < ANCHOR_POOL_MAX; i++) {
-        if (anchor_pool[i].valid) {
-            order[count++] = (uint8_t)i;
-        }
+/* Feed a passively-received ANNOUNCE (0xEC) into the pool. Called from the
+ * beacon RX path's short post-beacon window (Task 5); does not affect an
+ * anchor's CIR ranking, only its learned position. */
+static void anchor_pool_learn_announce(const uint8_t *buf, size_t len)
+{
+    struct uwb_announce a;
+    if (uwb_frame_parse_announce(buf, len, &a) != 0) {
+        return;
     }
-
-    /* Insertion sort descending by ema_score (pool ≤ 6, O(n²) is fine) */
-    for (int i = 1; i < count; i++) {
-        uint8_t key = order[i];
-        int j = i - 1;
-        while (j >= 0 &&
-               anchor_pool[order[j]].ema_score < anchor_pool[key].ema_score) {
-            order[j + 1] = order[j];
-            j--;
-        }
-        order[j + 1] = key;
-    }
-
-    n_selected = (count < ANCHOR_SELECT_MAX) ? count : ANCHOR_SELECT_MAX;
-    for (int i = 0; i < n_selected; i++) {
-        selected[i] = anchor_pool[order[i]].id;
-    }
+    anchor_pool_observe_pos(&anchor_pool_state, (uint8_t)a.addr,
+                            a.x, a.y, a.z, uwb_radio_now_ms());
 }
 
 /* =========================================================================
@@ -344,23 +334,31 @@ int uwb_radio_tx_cap(const uint8_t *buf, size_t len, uint8_t minislot)
 }
 
 /*
- * Broadcast a DISCOVERY frame and collect DISCOVERY_RESPONSE frames for
- * DISCOVERY_WINDOW_MS.  Updates anchor_pool EMA scores and rebuilds selected[].
+ * Broadcast a DISCOVERY frame for one group of the UWB_DISC_N_GROUPS cycle and
+ * collect DISCOVERY_RESPONSE frames for DISCOVERY_WINDOW_MS. Updates
+ * anchor_pool EMA scores and rebuilds selected[].
  * src_addr: tag's current short address (UWB_ADDR_UNASSOC before joining).
  * Note: anchor ID is taken from the low byte of src_addr in each response.
+ * *out_round_found, if non-NULL, receives the count of responses actually
+ * seen in THIS round (this group only) -- distinct from the return value,
+ * which is the persistent pool's overall top-N selection count. The sweep
+ * gate needs the former (see uwb_sweep_gate_discovered()'s group accounting);
+ * the FSM event needs the latter.
  * FUTURE WORK: anti-collision — anchors currently respond with Aloha;
  *   planned fix is per-anchor mini-slot (id × T_MINISLOT_MS).
  */
-static int run_discovery(uint16_t src_addr)
+static int run_discovery(uint16_t src_addr, uint8_t group, uint8_t n_groups,
+                         uint8_t *out_round_found)
 {
+    uint8_t round_found = 0u;
+
     /* Reset seen flags for decay tracking */
-    for (int i = 0; i < ANCHOR_POOL_MAX; i++) {
-        anchor_pool[i].seen = false;
-    }
+    anchor_pool_begin_round(&anchor_pool_state);
 
     /* Broadcast DISCOVERY frame */
     uint8_t disc_buf[UWB_FRAME_LEN_DISC];
-    int dlen = uwb_frame_discovery_build(disc_buf, sizeof(disc_buf), src_addr, 0u);
+    int dlen = uwb_frame_discovery_build(disc_buf, sizeof(disc_buf), src_addr, 0u,
+                                         group, n_groups);
 
     if (dlen > 0) {
         dwt_writetxdata((uint16_t)dlen, disc_buf, 0);
@@ -410,14 +408,18 @@ static int run_discovery(uint16_t src_addr)
                 if (uwb_frame_parse_discovery_response(resp_buf, (size_t)rlen,
                                                         &src, &cir_p, &cir_q) == 0) {
                     anchor_pool_update((uint8_t)src, cir_p, cir_q);
+                    round_found++;
                 }
             }
         }
     }
 
 finish:
-    anchor_pool_decay_missed();
+    anchor_pool_decay_missed(&anchor_pool_state);
     anchor_pool_rebuild_selected();
+    if (out_round_found) {
+        *out_round_found = round_found;
+    }
     return n_selected;
 }
 
@@ -436,12 +438,15 @@ static int anchor_sweep(struct pos_meas *out, size_t max)
 
     size_t n = 0;
 
-    /* One dz for every anchor: all anchors are ceiling-mounted at one height,
-     * so v1 carries a single tag-side pair of constants rather than per-anchor
-     * z in the E1 frame (which would need anchor firmware). Read once per
-     * sweep -- it can change under us from the BT RX thread via `pos z`, and a
-     * fix built from two different dz values would be incoherent. */
-    const float dz = pos_cfg_dz_m();
+    /* Fallback dz (pos_cfg's single anchor/tag height pair) for an anchor
+     * whose MPOL_RESP reports z as NaN; tag_h_m combines with a REAL z to give
+     * that anchor its own dz instead (Phase 2 Task 10). Read once per sweep --
+     * it can change under us from the BT RX thread via `pos z`, and a fix
+     * built from heights read at two different times would be incoherent. */
+    struct pos_cfg pcfg;
+    pos_cfg_get(&pcfg);
+    const float dz     = pos_cfg_dz_m();
+    const float tag_h_m = (float)pcfg.tag_h_cm / 100.0f;
 
     /* Reset the per-slot debug snapshot. Coordinates survive a missed sweep
      * but not a slot reassignment. */
@@ -459,26 +464,34 @@ static int anchor_sweep(struct pos_meas *out, size_t max)
     }
     sweep_mask = 0;
 
+    /* One 0xE3 MULTI-POLL names every selected anchor with a staggered
+     * response delay and collects their 0xED replies in one window, instead
+     * of one poll->response exchange per anchor (do_one_range_anchor(), kept
+     * compiled as the single-anchor bench fallback and the cal path's
+     * structural sibling, but no longer called from the production sweep). */
+    struct pos_meas slot_meas[ANCHOR_SELECT_MAX];
+    bool             slot_ok[ANCHOR_SELECT_MAX] = { 0 };
+    uint8_t          real_z = 0;
+
+    if (n_selected > 0) {
+        (void)uwb_multipoll_sweep(slot_meas, slot_ok, selected,
+                                  (uint8_t)n_selected, sweep_tag_addr,
+                                  dz, tag_h_m, &real_z);
+    }
+    sweep_last_real_z_count = real_z;
+
     for (size_t i = 0; i < n_selected && n < max; i++) {
-        if (i > 0) {
-            k_sleep(K_USEC(INTER_ANCHOR_DELAY_US));
+        if (!slot_ok[i]) {
+            continue;
         }
 
-        float r, ax, ay;
-        bool ok = do_one_range_anchor(selected[i], &r, &ax, &ay);
+        out[n] = slot_meas[i];
+        n++;
 
-        if (ok) {
-            out[n].x       = ax;
-            out[n].y       = ay;
-            out[n].dz      = dz;
-            out[n].range_m = r;
-            n++;
-
-            sweep_ax_cm[i] = pos_dbg_m_to_cm(ax);
-            sweep_ay_cm[i] = pos_dbg_m_to_cm(ay);
-            sweep_r_cm[i]  = pos_dbg_m_to_cm(r);
-            sweep_mask    |= (uint8_t)(1u << i);
-        }
+        sweep_ax_cm[i] = pos_dbg_m_to_cm(slot_meas[i].x);
+        sweep_ay_cm[i] = pos_dbg_m_to_cm(slot_meas[i].y);
+        sweep_r_cm[i]  = pos_dbg_m_to_cm(slot_meas[i].range_m);
+        sweep_mask    |= (uint8_t)(1u << i);
     }
 
     return (int)n;
@@ -487,7 +500,9 @@ static int anchor_sweep(struct pos_meas *out, size_t max)
 int uwb_radio_discover(struct pos_meas *out, size_t max)
 {
     ARG_UNUSED(out); ARG_UNUSED(max);
-    return run_discovery(UWB_ADDR_UNASSOC);
+    /* Not part of the per-superframe grouped cycle (Task 6) -- a single-group
+     * round, same as the pre-grouping behaviour. */
+    return run_discovery(UWB_ADDR_UNASSOC, 0, 1, NULL);
 }
 
 int uwb_radio_sweep(struct pos_meas *out, size_t max)
@@ -593,6 +608,12 @@ static void runner_fn(void *p1, void *p2, void *p3)
     dwt_setpreambledetecttimeout(PRE_TIMEOUT);
 
     while (1) {
+        /* Mirrored into a file-static so anchor_sweep() (called through the
+         * uwb_radio_ops interface, with no ctx parameter) can address its
+         * MULTI-POLL to this tag's current short address. */
+        sweep_tag_addr = ctx.short_addr;
+        g_phase_mask   = ctx.phase_mask;
+
         /* Drain any wake given while the previous superframe's exchange was in
          * flight. It could not shorten anything then, and left pending it
          * would abort an unrelated skip an iteration or two later. The intent
@@ -709,10 +730,22 @@ static void runner_fn(void *p1, void *p2, void *p3)
              * always a full superframe and the ladder owns how often it runs. */
             bt_narrow = false;
         } else if (bt_narrow && beacon_sched_have_ref(&sched)) {
+            /* Phase 3: listen_skip is now derived from the granted phase
+             * mask -- sleep to the next superframe the gateway actually
+             * authorized, not a tier setting the tag guesses at.
+             * `pwr tier` remains a bench override, but only downward: it can
+             * force a SHORTER skip (wake more often than the mask requires,
+             * for debugging) but never a longer one, since sleeping past a
+             * granted phase means missing that window entirely. */
+            uint32_t phase_skip = uwb_net_phase_skip_to_next(ctx.phase_mask,
+                                                             ctx.frame_counter);
+            uint32_t skip = (tp.listen_skip < phase_skip) ? tp.listen_skip
+                                                          : phase_skip;
+
             /* Locked. Hand the prediction to the long-baseline scheduler,
              * which may skip whole superframes; beacon_track's single-
              * superframe plan is only used until that reference exists. */
-            beacon_sched_plan(&sched, tp.listen_skip,
+            beacon_sched_plan(&sched, skip,
                               &bt_arm_ms, &bt_window_ms, &eff_skip);
         }
 
@@ -775,6 +808,17 @@ static void runner_fn(void *p1, void *p2, void *p3)
                 uwb_frame_is_beacon(beacon_buf, (size_t)len)) {
                 beacon_len = len;
                 bcn_rx_ms = uwb_radio_now_ms();
+
+                /* Passive ANNOUNCE window (Task 5): a single bounded listen,
+                 * never extended when nothing arrives -- the whole point is
+                 * that this stays cheap every superframe. */
+                uint8_t announce_buf[UWB_FRAME_LEN_ANNOUNCE];
+                int alen = uwb_radio_rx_beacon(announce_buf, sizeof(announce_buf),
+                                               T_ANNOUNCE_MS);
+                if (alen == UWB_FRAME_LEN_ANNOUNCE &&
+                    uwb_frame_is_announce(announce_buf, (size_t)alen)) {
+                    anchor_pool_learn_announce(announce_buf, (size_t)alen);
+                }
                 break;
             }
             /* non-beacon frame or rx timeout/error: keep waiting for the beacon */
@@ -885,11 +929,11 @@ static void runner_fn(void *p1, void *p2, void *p3)
                     uint8_t  geui[UWB_FRAME_EUI_LEN];
                     uint16_t gaddr = 0;
                     uint8_t  gslot = 0, gtier = 0;
-                    uint16_t glease = 0;
+                    uint16_t glease = 0, gphase = 0;
 
                     if (uwb_frame_parse_grant(grant_buf, (size_t)glen,
                                               geui, &gaddr, &gslot,
-                                              &gtier, &glease) == 0 &&
+                                              &gtier, &glease, &gphase) == 0 &&
                         memcmp(geui, runner_eui, UWB_FRAME_EUI_LEN) == 0) {
 
                         gev.kind         = UWB_EV_GRANT;
@@ -897,6 +941,7 @@ static void runner_fn(void *p1, void *p2, void *p3)
                         gev.g_slot       = gslot;
                         gev.g_tier       = gtier;
                         gev.g_lease      = glease;
+                        gev.g_phase_mask = gphase;
                     } else {
                         gev.kind = UWB_EV_GRANT_MISS;
                     }
@@ -960,10 +1005,13 @@ static void runner_fn(void *p1, void *p2, void *p3)
         }
 
         if (act & UWB_ACT_RUN_DISCOVER) {
-            int n = run_discovery(ctx.short_addr);
+            uint8_t this_group = disc_round++ % UWB_DISC_N_GROUPS;
+            uint8_t round_found = 0u;
+            int n = run_discovery(ctx.short_addr, this_group, UWB_DISC_N_GROUPS,
+                                  &round_found);
 
             uwb_sweep_gate_discovered(&sweep_gate, uwb_radio_now_ms(),
-                                      (uint8_t)(n > 0 ? n : 0));
+                                      this_group, UWB_DISC_N_GROUPS, round_found);
 
             struct uwb_net_event dev = {
                 .kind      = UWB_EV_DISCOVERED,
@@ -987,10 +1035,13 @@ static void runner_fn(void *p1, void *p2, void *p3)
                  * count. An earlier version of this comment claimed recovery
                  * came through "the next sweep" returning n_anchors < 3 -- there
                  * was no next sweep; this branch had already taken its place. */
-                int n = run_discovery(ctx.short_addr);
+                uint8_t this_group = disc_round++ % UWB_DISC_N_GROUPS;
+                uint8_t round_found = 0u;
+                run_discovery(ctx.short_addr, this_group, UWB_DISC_N_GROUPS,
+                             &round_found);
 
                 uwb_sweep_gate_discovered(&sweep_gate, uwb_radio_now_ms(),
-                                          (uint8_t)(n > 0 ? n : 0));
+                                         this_group, UWB_DISC_N_GROUPS, round_found);
             } else {
                 /* Sleep until our CFP slot start. */
                 uint32_t slot_start = t0_ms
@@ -1098,6 +1149,7 @@ static void runner_fn(void *p1, void *p2, void *p3)
                 struct uwb_net_event sev = {
                     .kind      = UWB_EV_SWEPT,
                     .n_anchors = (uint8_t)(n > 0 ? n : 0),
+                    .pos_sent  = solved,
                 };
                 uwb_net_handle(&ctx, &sev);
             }
@@ -1147,7 +1199,8 @@ void uwb_net_set_moving(bool moving)
 
 bool uwb_net_runner_sched_get(uint32_t *period_q16, uint32_t *window_ms,
                               uint32_t *eff_skip, uint32_t *misses,
-                              uint32_t *ok_count, uint32_t *miss_count)
+                              uint32_t *ok_count, uint32_t *miss_count,
+                              uint16_t *phase_mask)
 {
     struct uwb_tier_params tp;
     uint32_t win = 0, eff = 0;
@@ -1155,7 +1208,8 @@ bool uwb_net_runner_sched_get(uint32_t *period_q16, uint32_t *window_ms,
     /* The tier here is the parameter set the runner would use next; reading
      * ctx.tier would need the runner's stack frame, so report the FAST row --
      * the diagnostics that matter (period, misses, counters) are tier-free and
-     * the window/skip pair is read back per tier with `pwr tier`. */
+     * the window/skip pair is read back per tier with `pwr tier`. phase_mask
+     * (Phase 3) IS the current grant, read from the mirrored file-static. */
     uwb_net_get_tier_params(UWB_TIER_FAST, &tp);
     beacon_sched_plan(&sched, tp.listen_skip, NULL, &win, &eff);
 
@@ -1165,6 +1219,7 @@ bool uwb_net_runner_sched_get(uint32_t *period_q16, uint32_t *window_ms,
     if (misses)     { *misses     = sched.misses; }
     if (ok_count)   { *ok_count   = sched.ok_count; }
     if (miss_count) { *miss_count = sched.miss_count; }
+    if (phase_mask) { *phase_mask = g_phase_mask; }
     return sched.ok_count != 0u || sched.miss_count != 0u;
 }
 

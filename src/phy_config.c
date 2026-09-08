@@ -155,7 +155,7 @@ dwt_config_t config_options = {
 
 #if CONFIG_OPTION == CONFIG_OPTION_07
 /* Configuration option 07.
- * Channel 5, PRF 64M, Preamble Length 1024, PAC 8, Preamble code 9, Data Rate 850k, STS Length 64
+ * Channel 5, PRF 64M, Preamble Length 1024, PAC 32, Preamble code 9, Data Rate 850k, STS Length 64
  */
 dwt_config_t config_options = {
     5,                  /* Channel number. */
@@ -167,7 +167,7 @@ dwt_config_t config_options = {
     DWT_BR_850K,        /* Data rate. */
     DWT_PHRMODE_STD,    /* PHY header mode. */
     DWT_PHRRATE_STD,    /* PHY header rate. */
-    (1024 + 1 + 8 - 8), /* SFD timeout (preamble length + 1 + SFD length - PAC size). Used in RX only. */
+    (1024 + 1 + 8 - 32), /* SFD timeout (preamble length + 1 + SFD length - PAC). PAC32, not PAC8 -- keep this term matched to the PAC size above. */
     DWT_STS_MODE_OFF,     /* Mode 1 STS enabled */
     DWT_STS_LEN_64,     /* STS length*/
     DWT_PDOA_M0         /* PDOA mode off */

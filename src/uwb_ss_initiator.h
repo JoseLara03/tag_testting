@@ -27,8 +27,35 @@ irq_evt_t wait_event(k_timeout_t timeout);
 
 /* Run a single addressed SS-TWR exchange against anchor `aid`.
  * On a valid response, writes range (m), anchor x/y (m), returns true.
- * Returns false on timeout, RX error, bad frame, or anchor-id mismatch. */
+ * Returns false on timeout, RX error, bad frame, or anchor-id mismatch.
+ * Kept compiled as the structural sibling of the `cal` path and a
+ * single-anchor bench fallback -- production sweeps use
+ * uwb_multipoll_sweep() instead (network-scaling v3, Phase 2). */
 bool do_one_range_anchor(uint8_t aid, float *range_m, float *ax, float *ay);
+
+/* Name up to UWB_FRAME_MAX_ANCHORS anchors in one 0xE3 MULTI-POLL with
+ * staggered response delays and collect their 0xED MPOL_RESP replies within
+ * one window (design §3.B). `out_by_slot` and `ok_out` must each hold
+ * `n_anchors` entries, in the SAME ORDER as `anchor_ids` -- ok_out[i] is true
+ * iff anchor_ids[i] answered, and only then is out_by_slot[i] valid. A
+ * missing response is a missing entry, not a failure. Returns the number of
+ * anchors that answered. anchor_ids are the pool's 8-bit anchor ids,
+ * zero-extended to the frame's 16-bit anchor short address.
+ *
+ * Per-anchor height (Phase 2 Task 10): when a response's own `z` is finite,
+ * out_by_slot[i].dz becomes `z - tag_h_m` (that anchor's real height above
+ * the tag); when it is NaN (anchor has no height configured), `dz_fallback`
+ * is used instead (pos_cfg's single anchor/tag height pair). *real_z_count_out,
+ * if non-NULL, is incremented once per anchor that reported a real z, for the
+ * `pos z` diagnostic.
+ *
+ * The by-slot output (rather than a compacted array) is what lets the caller
+ * keep its own per-slot bookkeeping (e.g. the pos_dbg debug log) aligned with
+ * `selected[]`. */
+int uwb_multipoll_sweep(struct pos_meas *out_by_slot, bool *ok_out,
+                        const uint8_t *anchor_ids, uint8_t n_anchors,
+                        uint16_t src_addr, float dz_fallback, float tag_h_m,
+                        uint8_t *real_z_count_out);
 
 /* Report a solved fix: logs the BLE "P:x,y" line and transmits a 0xEA POS frame
  * to the gateway. Call from the runner thread only, inside its own CFP slot —

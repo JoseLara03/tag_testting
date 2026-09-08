@@ -66,6 +66,12 @@ static void cmd_tier(const char *arg)
 				 (unsigned)p.listen_skip, (unsigned)p.range_every);
 			ble_log_send(msg);
 		}
+		/* Phase 3: the mask the derived skip is actually clamped by --
+		 * listen_skip above is a bench override, not what the runner
+		 * uses day to day. */
+		snprintf(msg, sizeof(msg), "PH %04x\n",
+			 (unsigned)uwb_net_runner_phase_mask());
+		ble_log_send(msg);
 		return;
 	}
 
@@ -298,10 +304,16 @@ static void tag_cmd_on_rx(const uint8_t *data, uint16_t len)
 			cmd_tier(arg);
 		} else if (strcmp(buf, "pwr sched") == 0) {
 			uint32_t pq = 0, win = 0, skip = 0, miss = 0, ok = 0, mc = 0;
+			uint16_t phmask = 0;
 
-			if (uwb_net_runner_sched_get(&pq, &win, &skip, &miss,
-						     &ok, &mc)) {
-				char msg[20];
+			bool have = uwb_net_runner_sched_get(&pq, &win, &skip, &miss,
+							     &ok, &mc, &phmask);
+			/* Phase mask is always meaningful once granted, even
+			 * before the first re-sync stat exists. */
+			char msg[20];
+			snprintf(msg, sizeof(msg), "PH %04x\n", (unsigned)phmask);
+			ble_log_send(msg);
+			if (have) {
 				/* Q16.16 -> "<ms>.<hundredths>" without float:
 				 * the fractional part scaled by 100 and shifted
 				 * back down. */

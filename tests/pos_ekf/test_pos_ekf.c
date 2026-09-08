@@ -627,9 +627,53 @@ static void test_no_nan_inf_long_run(void)
     }
 }
 
+/* Network-scaling v3 Task 10: two anchors' dz comes from a real per-anchor z
+ * (MPOL_RESP), two fall back to pos_cfg's single pair -- resolved upstream in
+ * uwb_ss_initiator.c (not host-testable). By the time a pos_meas array
+ * reaches the EKF every dz is a concrete float, so this pins that the filter
+ * still converges correctly when those floats are not all equal. */
+static void make_mixed_dz_ranges(float x, float y, struct pos_meas *out)
+{
+    static const float dz[4] = { 2.0f, 2.0f, ANCHOR_DZ, ANCHOR_DZ };
+
+    for (int i = 0; i < 4; i++) {
+        float dx = x - ANCHOR_XY[i][0];
+        float dy = y - ANCHOR_XY[i][1];
+
+        out[i].x       = ANCHOR_XY[i][0];
+        out[i].y       = ANCHOR_XY[i][1];
+        out[i].dz      = dz[i];
+        out[i].range_m = sqrtf(dx * dx + dy * dy + dz[i] * dz[i]);
+    }
+}
+
+static void test_converges_with_mixed_real_and_fallback_dz(void)
+{
+    struct pos_ekf_cfg c;
+    struct pos_ekf f;
+    struct pos_meas m[4];
+
+    pos_ekf_cfg_defaults(&c);
+    pos_ekf_reset(&f);
+    pos_ekf_seed(&f, 1.0f, 1.0f);
+
+    for (int i = 0; i < 60; i++) {
+        pos_ekf_predict(&f, &c, 0.2f, false);
+        make_mixed_dz_ranges(4.0f, 3.0f, m);
+        pos_ekf_update_ranges(&f, &c, m, 4);
+    }
+
+    float x, y;
+    CHECK(pos_ekf_get(&f, &x, &y, NULL, NULL));
+    CHECK(fabsf(x - 4.0f) < 0.05f);
+    CHECK(fabsf(y - 3.0f) < 0.05f);
+    CHECK(all_finite_state(&f));
+}
+
 int main(void)
 {
     test_converges_static_from_poor_seed();
+    test_converges_with_mixed_real_and_fallback_dz();
     test_tracks_constant_velocity();
     test_outlier_gated();
     test_zupt_zeroes_velocity();

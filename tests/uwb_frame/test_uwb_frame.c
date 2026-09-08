@@ -16,7 +16,8 @@ static void test_scaffold(void)
     CHECK(UWB_FRAME_TYPE_DISC == 0xE2);
     CHECK(UWB_FRAME_TYPE_MPOL == 0xE3);
     CHECK(UWB_FRAME_TYPE_RESP == 0xE4);
-    CHECK(UWB_FRAME_LEN_DISC == 14);
+    CHECK(UWB_FRAME_LEN_DISC == 16);
+    CHECK(UWB_FRAME_DISC_N_GROUPS_MAX == 8);
     CHECK(UWB_FRAME_LEN_RESP == 20);
 }
 
@@ -38,16 +39,18 @@ static void test_utilities(void)
 static void test_discovery(void)
 {
     uint8_t buf[32];
-    int n = uwb_frame_discovery_build(buf, sizeof(buf), 0x1234, 0xAABBCCDD);
+    int n = uwb_frame_discovery_build(buf, sizeof(buf), 0x1234, 0xAABBCCDD, 3, 8);
     CHECK(n == UWB_FRAME_LEN_DISC);
 
-    /* Exact byte layout. */
+    /* Exact byte layout, group=3, n_groups=8 (shareable with the anchor's copy). */
     uint8_t expect[UWB_FRAME_LEN_DISC] = {
         0x41, 0x88, 0x00, 0xCA, 0xDE,   /* FC, seq, PANID */
         0xFF, 0xFF,                     /* dest = broadcast */
         0x34, 0x12,                     /* src 0x1234 LE */
         UWB_FRAME_TYPE_DISC,            /* type 0xE2 */
-        0xDD, 0xCC, 0xBB, 0xAA          /* tx_ts 0xAABBCCDD LE */
+        0xDD, 0xCC, 0xBB, 0xAA,         /* tx_ts 0xAABBCCDD LE */
+        0x03,                           /* group */
+        0x08                            /* n_groups */
     };
     CHECK(memcmp(buf, expect, UWB_FRAME_LEN_DISC) == 0);
 
@@ -56,10 +59,38 @@ static void test_discovery(void)
     CHECK(uwb_frame_is_discovery(buf, n));
     CHECK(!uwb_frame_is_response(buf, n));   /* type byte differs */
 
+    /* Round-trip parse. */
+    uint16_t src; uint32_t ts; uint8_t group, n_groups;
+    CHECK(uwb_frame_parse_discovery(buf, n, &src, &ts, &group, &n_groups) == 0);
+    CHECK(src == 0x1234);
+    CHECK(ts == 0xAABBCCDD);
+    CHECK(group == 3);
+    CHECK(n_groups == 8);
+
+    /* A single-group round (group=0, n_groups=1) still works. */
+    CHECK(uwb_frame_discovery_build(buf, sizeof(buf), 0x1234, 0, 0, 1) == UWB_FRAME_LEN_DISC);
+    CHECK(uwb_frame_parse_discovery(buf, UWB_FRAME_LEN_DISC, &src, &ts, &group, &n_groups) == 0);
+    CHECK(group == 0 && n_groups == 1);
+
+    /* Builder rejections. */
+    CHECK(uwb_frame_discovery_build(buf, sizeof(buf), 0x1234, 0, 0, 0) == -EINVAL);       /* n_groups == 0 */
+    CHECK(uwb_frame_discovery_build(buf, sizeof(buf), 0x1234, 0, 2, 2) == -EINVAL);       /* group >= n_groups */
+    CHECK(uwb_frame_discovery_build(buf, sizeof(buf), 0x1234, 0, 0,
+                                    UWB_FRAME_DISC_N_GROUPS_MAX + 1) == -EINVAL);         /* n_groups > MAX */
     /* Buffer too small. */
-    CHECK(uwb_frame_discovery_build(buf, 5, 0x1234, 0) == -EMSGSIZE);
+    CHECK(uwb_frame_discovery_build(buf, 5, 0x1234, 0, 0, 1) == -EMSGSIZE);
     /* Null buffer. */
-    CHECK(uwb_frame_discovery_build(NULL, sizeof(buf), 0x1234, 0) == -EINVAL);
+    CHECK(uwb_frame_discovery_build(NULL, sizeof(buf), 0x1234, 0, 0, 1) == -EINVAL);
+
+    /* Parser rejections. */
+    int m = uwb_frame_discovery_build(buf, sizeof(buf), 0x1234, 0, 0, 1);
+    CHECK(uwb_frame_parse_discovery(buf, m, NULL, &ts, &group, &n_groups) == -EINVAL);
+    CHECK(uwb_frame_parse_discovery(NULL, m, &src, &ts, &group, &n_groups) == -EINVAL);
+    {
+        uint8_t bad[UWB_FRAME_LEN_DISC]; memcpy(bad, buf, UWB_FRAME_LEN_DISC);
+        bad[9] = UWB_FRAME_TYPE_RESP;   /* wrong type */
+        CHECK(uwb_frame_parse_discovery(bad, UWB_FRAME_LEN_DISC, &src, &ts, &group, &n_groups) == -EBADMSG);
+    }
 }
 
 static void test_response(void)
@@ -93,7 +124,7 @@ static void test_response(void)
 
     /* Parser rejects a non-response frame. */
     uint8_t disc[32];
-    int dn = uwb_frame_discovery_build(disc, sizeof(disc), 0x1234, 0);
+    int dn = uwb_frame_discovery_build(disc, sizeof(disc), 0x1234, 0, 0, 1);
     CHECK(uwb_frame_parse_discovery_response(disc, dn, &src, &cirp, &cirq) == -EBADMSG);
 
     /* Parser rejects null out-params. */
@@ -195,7 +226,7 @@ static void test_new_constants(void)
     CHECK(UWB_FRAME_N_CFP  == 11);
     CHECK(UWB_FRAME_LEN_BEACON == 15 + 2 * 11);  /* 37 */
     CHECK(UWB_FRAME_LEN_JOIN   == 19);
-    CHECK(UWB_FRAME_LEN_GRANT  == 24);
+    CHECK(UWB_FRAME_LEN_GRANT  == 26);
     CHECK(UWB_FRAME_LEN_KEEPALIVE == 12);
     CHECK(UWB_FRAME_LEN_RELEASE   == 10);
 }
@@ -240,14 +271,26 @@ static void test_join_grant(void)
     uint8_t e2[8], t; CHECK(uwb_frame_parse_join(buf, n, e2, &t) == 0);
     CHECK(memcmp(e2, eui, 8) == 0 && t == 2);
 
-    n = uwb_frame_grant_build(buf, sizeof(buf), eui, 0x0007, 3, 1, 50);
+    n = uwb_frame_grant_build(buf, sizeof(buf), eui, 0x0007, 3, 1, 50, 0x8001);
     CHECK(n == UWB_FRAME_LEN_GRANT);
+    CHECK(UWB_FRAME_LEN_GRANT == 26);
     CHECK(buf[5] == 0xFF && buf[6] == 0xFF);       /* dest broadcast (EUI-matched) */
     CHECK(buf[9] == UWB_FRAME_TYPE_GRANT);
     CHECK(uwb_frame_is_grant(buf, n));
-    uint8_t e3[8]; uint16_t sa, ls; uint8_t si, rt;
-    CHECK(uwb_frame_parse_grant(buf, n, e3, &sa, &si, &rt, &ls) == 0);
-    CHECK(memcmp(e3, eui, 8) == 0 && sa == 0x0007 && si == 3 && rt == 1 && ls == 50);
+    CHECK(buf[24] == 0x01 && buf[25] == 0x80);     /* phase_mask 0x8001 LE */
+    uint8_t e3[8]; uint16_t sa, ls, pm; uint8_t si, rt;
+    CHECK(uwb_frame_parse_grant(buf, n, e3, &sa, &si, &rt, &ls, &pm) == 0);
+    CHECK(memcmp(e3, eui, 8) == 0 && sa == 0x0007 && si == 3 && rt == 1 &&
+         ls == 50 && pm == 0x8001);
+
+    /* Every out-param is optional. */
+    CHECK(uwb_frame_parse_grant(buf, n, NULL, NULL, NULL, NULL, NULL, NULL) == 0);
+
+    /* v2-length GRANT (24 bytes, no phase_mask) is rejected outright rather
+     * than silently defaulting the mask -- a half-migrated peer must be
+     * visible as a parse failure, not a phantom phase_mask=0. */
+    CHECK(!uwb_frame_is_grant(buf, 24));
+    CHECK(uwb_frame_parse_grant(buf, 24, e3, &sa, &si, &rt, &ls, &pm) == -EINVAL);
 }
 
 static void test_keepalive_release(void)
@@ -316,15 +359,13 @@ static void test_pos(void)
     CHECK(uwb_frame_parse_pos(buf, UWB_FRAME_LEN_POS - 1,
                               &sa, &x, &y, &res, &na, &soc) == -EINVAL);
 
-    /* GRANT is also 24 bytes, so length alone cannot separate the two — only
-     * the type byte does. This asserts that the predicates stay disjoint on a
-     * frame whose length matches both. */
+    /* GRANT is 26 bytes (v3) and POS is 24, so length alone now separates
+     * them -- a POS-length buffer is never mistaken for a GRANT regardless of
+     * its type byte. */
     buf[9] = UWB_FRAME_TYPE_GRANT;
-    CHECK(!uwb_frame_is_pos(buf, UWB_FRAME_LEN_POS));
-    CHECK(uwb_frame_is_grant(buf, UWB_FRAME_LEN_GRANT));
+    CHECK(!uwb_frame_is_grant(buf, UWB_FRAME_LEN_POS));
     buf[9] = UWB_FRAME_TYPE_POS;
     CHECK(uwb_frame_is_pos(buf, UWB_FRAME_LEN_POS));
-    CHECK(!uwb_frame_is_grant(buf, UWB_FRAME_LEN_GRANT));
 
     /* A short buffer is refused, not overrun. */
     uint8_t small[UWB_FRAME_LEN_POS - 1];
@@ -420,6 +461,115 @@ static void test_alert(void)
     CHECK(!uwb_frame_is_pos(buf, UWB_FRAME_LEN_POS));
 }
 
+static void test_announce(void)
+{
+    CHECK(UWB_FRAME_TYPE_ANNOUNCE == 0xEC);
+    CHECK(UWB_FRAME_LEN_ANNOUNCE == 30);
+    CHECK(UWB_FRAME_LEN_ANNOUNCE <= UWB_FRAME_MAX_LEN);
+
+    struct uwb_announce a = {
+        .addr = 0x0007, .x = 1.5f, .y = -2.25f, .z = 2.0f,
+        .cir_power = -1234, .cir_quality = 555
+    };
+    uint8_t buf[UWB_FRAME_MAX_LEN];
+    int n = uwb_frame_announce_build(buf, sizeof(buf), 0x0007, &a);
+    CHECK(n == UWB_FRAME_LEN_ANNOUNCE);
+    CHECK(uwb_frame_is_announce(buf, (size_t)n));
+    CHECK(uwb_frame_get_dest_addr(buf) == UWB_FRAME_ADDR_BCAST);
+    CHECK(uwb_frame_get_src_addr(buf) == 0x0007);
+    CHECK(buf[9] == UWB_FRAME_TYPE_ANNOUNCE);
+
+    struct uwb_announce b;
+    memset(&b, 0, sizeof(b));
+    CHECK(uwb_frame_parse_announce(buf, (size_t)n, &b) == 0);
+    CHECK(b.addr == 0x0007);
+    CHECK(b.x == 1.5f && b.y == -2.25f && b.z == 2.0f);
+    CHECK(b.cir_power == -1234);
+    CHECK(b.cir_quality == 555);
+
+    /* z may be NaN (anchor did not report a height); must pass through. */
+    struct uwb_announce anan = a;
+    anan.z = NAN;
+    uint8_t nbuf[UWB_FRAME_MAX_LEN];
+    int nn = uwb_frame_announce_build(nbuf, sizeof(nbuf), 0x0007, &anan);
+    CHECK(nn == UWB_FRAME_LEN_ANNOUNCE);
+    struct uwb_announce bnan;
+    memset(&bnan, 0, sizeof(bnan));
+    CHECK(uwb_frame_parse_announce(nbuf, (size_t)nn, &bnan) == 0);
+    CHECK(isnan(bnan.z));
+    CHECK(bnan.x == a.x && bnan.y == a.y);
+
+    /* Truncated frame is rejected. */
+    CHECK(!uwb_frame_is_announce(buf, UWB_FRAME_LEN_ANNOUNCE - 1));
+    CHECK(uwb_frame_parse_announce(buf, UWB_FRAME_LEN_ANNOUNCE - 1, &b) == -EINVAL);
+
+    /* Wrong-type frame is rejected. */
+    {
+        uint8_t bt[UWB_FRAME_LEN_ANNOUNCE]; memcpy(bt, buf, UWB_FRAME_LEN_ANNOUNCE);
+        bt[9] = UWB_FRAME_TYPE_POS;
+        CHECK(!uwb_frame_is_announce(bt, UWB_FRAME_LEN_ANNOUNCE));
+        CHECK(uwb_frame_parse_announce(bt, UWB_FRAME_LEN_ANNOUNCE, &b) == -EINVAL);
+    }
+
+    /* Builder errors. */
+    CHECK(uwb_frame_announce_build(buf, UWB_FRAME_LEN_ANNOUNCE - 1, 0x0007, &a) == -EMSGSIZE);
+    CHECK(uwb_frame_announce_build(NULL, sizeof(buf), 0x0007, &a) == -EINVAL);
+    CHECK(uwb_frame_announce_build(buf, sizeof(buf), 0x0007, NULL) == -EINVAL);
+}
+
+static void test_mpol_resp(void)
+{
+    CHECK(UWB_FRAME_TYPE_MPOL_RESP == 0xED);
+    CHECK(UWB_FRAME_LEN_MPOL_RESP == 31);
+
+    uint8_t buf[UWB_FRAME_MAX_LEN];
+    /* anchor 0x0007 answering tag 0x1234's poll. */
+    int n = uwb_frame_mpol_resp_build(buf, sizeof(buf), 0x0007, 0x1234, 2,
+                                      0x11112222, 0x33334444, 1.0f, 2.0f, 3.0f);
+    CHECK(n == UWB_FRAME_LEN_MPOL_RESP);
+    CHECK(uwb_frame_is_mpol_resp(buf, (size_t)n));
+    CHECK(uwb_frame_get_dest_addr(buf) == 0x1234);
+    CHECK(uwb_frame_get_src_addr(buf) == 0x0007);
+    CHECK(buf[9] == UWB_FRAME_TYPE_MPOL_RESP);
+
+    uint16_t src = 0; uint8_t aid = 0;
+    uint32_t poll_ts = 0, resp_ts = 0;
+    float x = 0, y = 0, z = 0;
+    CHECK(uwb_frame_parse_mpol_resp(buf, (size_t)n, 0x1234, &src, &aid,
+                                    &poll_ts, &resp_ts, &x, &y, &z) == 0);
+    CHECK(src == 0x0007);
+    CHECK(aid == 2);
+    CHECK(poll_ts == 0x11112222);
+    CHECK(resp_ts == 0x33334444);
+    CHECK(x == 1.0f && y == 2.0f && z == 3.0f);
+
+    /* z may be NaN (anchor did not report a height); must pass through. */
+    uint8_t nbuf[UWB_FRAME_MAX_LEN];
+    int nn = uwb_frame_mpol_resp_build(nbuf, sizeof(nbuf), 0x0007, 0x1234, 2,
+                                       0, 0, 1.0f, 2.0f, NAN);
+    CHECK(nn == UWB_FRAME_LEN_MPOL_RESP);
+    float zz = 0;
+    CHECK(uwb_frame_parse_mpol_resp(nbuf, (size_t)nn, 0x1234, NULL, NULL,
+                                    NULL, NULL, NULL, NULL, &zz) == 0);
+    CHECK(isnan(zz));
+
+    /* Wrong dest address -- addressed to some other tag. */
+    CHECK(uwb_frame_parse_mpol_resp(buf, (size_t)n, 0x9999, &src, &aid,
+                                    &poll_ts, &resp_ts, &x, &y, &z) == -EINVAL);
+
+    /* Short frame is rejected, not overrun. */
+    CHECK(!uwb_frame_is_mpol_resp(buf, UWB_FRAME_LEN_MPOL_RESP - 1));
+    CHECK(uwb_frame_parse_mpol_resp(buf, UWB_FRAME_LEN_MPOL_RESP - 1, 0x1234,
+                                    &src, &aid, &poll_ts, &resp_ts,
+                                    &x, &y, &z) == -EINVAL);
+
+    /* Builder errors. */
+    CHECK(uwb_frame_mpol_resp_build(buf, UWB_FRAME_LEN_MPOL_RESP - 1, 0x0007,
+                                    0x1234, 2, 0, 0, 0, 0, 0) == -EMSGSIZE);
+    CHECK(uwb_frame_mpol_resp_build(NULL, sizeof(buf), 0x0007, 0x1234, 2,
+                                    0, 0, 0, 0, 0) == -EINVAL);
+}
+
 int main(void)
 {
     test_scaffold();
@@ -434,6 +584,8 @@ int main(void)
     test_keepalive_release();
     test_pos();
     test_alert();
+    test_announce();
+    test_mpol_resp();
     if (g_fail) { printf("%d CHECK(s) FAILED\n", g_fail); return 1; }
     printf("ALL TESTS PASSED\n");
     return 0;

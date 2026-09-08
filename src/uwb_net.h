@@ -14,7 +14,24 @@
  * byte 10 with that one and the tag drops any beacon that does not match this
  * one. Bumping only the frame module leaves the tag deaf in SCAN with no
  * diagnostic. Pinned by tests/uwb_net/test_proto_ver_matches_frame_module. */
-#define UWB_NET_PROTO_VER       2
+#define UWB_NET_PROTO_VER       3
+
+/* Superframe cycle length (network-scaling v3, Phase 3): a grant is now
+ * (slot, phase_mask) over a UWB_NET_CYCLE_C-superframe cycle rather than a
+ * permanent every-superframe seat. §5 budget: 14 CFP slots x 16 phases = 224
+ * phase-seats; one phase = 0.31 Hz, a mover at 4 phases = 1.25 Hz, at 8
+ * phases = 2.5 Hz. 100 tags at 1 phase leaves 124 phases free (31 movers at
+ * 4 phases, or 15 at 8). See spec/2026-09-07-network-scaling-design.md §5. */
+#define UWB_NET_CYCLE_C  16u
+
+/* KEEPALIVE is sent only after this many participations with no 0xEA POS
+ * frame sent -- with the gateway renewing the lease from a decoded POS (a
+ * stronger liveness proof than KEEPALIVE, anchor-side Task 20 in the
+ * ANCLA_ESP32S3 plan), a healthy ranging tag never needs to enter the CAP at
+ * all. Tag-side prep only: until Task 20 ships on the gateway, nothing
+ * renews the lease between POS frames, and a tag will eventually lose its
+ * seat regardless of this suppression. */
+#define UWB_NET_KEEPALIVE_AFTER_N  4u
 
 typedef enum { UWB_TIER_IDLE = 0, UWB_TIER_SLOW = 1, UWB_TIER_FAST = 2 } uwb_tier_t;
 #define UWB_TIER_COUNT  3
@@ -78,11 +95,25 @@ struct uwb_tier_params {
  *
  * The threshold is UWB_NET_MIN_ANCHORS, deliberately the same symbol the FSM
  * compares n_anchors against: a private copy of "3" here is what let the gate
- * and the FSM disagree about whether the tag was making progress. */
+ * and the FSM disagree about whether the tag was making progress.
+ *
+ * Grouped discovery (Phase 1 Task 6): a single round only covers one group of
+ * the anchor population (uwb_frame_802_15_4z.h's DISC group/n_groups), so
+ * "found 2 anchors" from one round is not the same thing as "found 2 anchors
+ * total" once there is more than one group. last_sweep_n must reflect the
+ * count across the full group cycle -- each group's last-known count is kept
+ * and summed, so a short individual round does not read as a short sweep
+ * while other groups' anchors are still known-good. Must equal
+ * UWB_FRAME_DISC_N_GROUPS_MAX (uwb_frame_802_15_4z.h); a private copy is the
+ * same kind of divergence the MIN_ANCHORS comment above already warns about. */
+#define UWB_SWEEP_GATE_N_GROUPS_MAX 8
+
 struct uwb_sweep_gate {
     uint32_t last_discover_ms;
     uint8_t  last_sweep_n;
     bool     ever_discovered;
+    uint8_t  n_groups;                                  /* last-known cycle size, >=1 */
+    uint8_t  group_counts[UWB_SWEEP_GATE_N_GROUPS_MAX];  /* last count seen per group */
 };
 
 /* Fresh state: the first participation always discovers. */
@@ -92,11 +123,14 @@ void uwb_sweep_gate_init(struct uwb_sweep_gate *g);
 bool uwb_sweep_gate_rediscover_due(const struct uwb_sweep_gate *g,
                                    uint32_t now_ms);
 
-/* Record a discovery round that found n_found anchors. Refreshing the count
- * here is what keeps the gate from latching: a round that finds enough anchors
- * must let the very next participation sweep again. */
+/* Record a discovery round for one group of an n_groups cycle that found
+ * n_found anchors in that group. last_sweep_n becomes the sum of every
+ * group's last-known count, not just this round's -- see the struct comment.
+ * A single-group caller (n_groups=1) reduces to the old per-round behaviour.
+ * An out-of-range group/n_groups is treated as a single-group round (group=0,
+ * n_groups=1) rather than corrupting the accounting. */
 void uwb_sweep_gate_discovered(struct uwb_sweep_gate *g, uint32_t now_ms,
-                               uint8_t n_found);
+                               uint8_t group, uint8_t n_groups, uint8_t n_found);
 
 /* Record a completed sweep that ranged n_ranged anchors. */
 void uwb_sweep_gate_swept(struct uwb_sweep_gate *g, uint8_t n_ranged);
@@ -141,8 +175,12 @@ struct uwb_net_event {
     uint8_t  g_slot;
     uint8_t  g_tier;
     uint16_t g_lease;
+    uint16_t g_phase_mask;
     /* DISCOVERED / SWEPT */
     uint8_t  n_anchors;
+    /* SWEPT only: true iff this sweep actually transmitted a 0xEA POS frame
+     * (>=3 anchors AND a converged solve) -- see UWB_NET_KEEPALIVE_AFTER_N. */
+    bool     pos_sent;
     /* MOTION */
     uint8_t  req_tier;
     /* Set by the caller every superframe from tag_alert_active()-equivalent
@@ -192,6 +230,7 @@ struct uwb_net_ctx {
     uint8_t   eui[8];
     uint16_t  short_addr;
     uint8_t   slot_index;
+    uint16_t  phase_mask;       /* granted phase bits, see UWB_NET_CYCLE_C */
     uwb_tier_t tier;            /* granted tier */
     uwb_tier_t req_tier;        /* motion-driven request */
     uint16_t  lease_remaining;  /* superframes until expiry */
@@ -205,6 +244,9 @@ struct uwb_net_ctx {
      * tag is asleep, so a modulo test would fire on whichever superframe the
      * tag happened to wake in, or never. */
     uint16_t  part_count;
+    /* Participations since the last actual POS transmission -- see
+     * UWB_NET_KEEPALIVE_AFTER_N. Reset on any SWEPT event with pos_sent. */
+    uint16_t  part_since_pos;
     /* uwb_net_tier_filter() state. Separate from `tier`, which is the tier the
      * gateway granted / the FSM is running; the filter's output is fed back in
      * as UWB_EV_MOTION by the caller. */
@@ -215,6 +257,22 @@ struct uwb_net_ctx {
 
 void     uwb_net_init(struct uwb_net_ctx *c, const uint8_t eui[8]);
 uint32_t uwb_net_handle(struct uwb_net_ctx *c, const struct uwb_net_event *ev);
+
+/* True if frame_counter's superframe falls on one of phase_mask's granted
+ * bits within the UWB_NET_CYCLE_C-superframe cycle. Pure; wrap-safe because
+ * UWB_NET_CYCLE_C (16) is a power of two and evenly divides 2^32, so
+ * frame_counter % UWB_NET_CYCLE_C is continuous across a uint32_t wrap -- no
+ * phase is skipped or repeated at the wrap boundary. See the wrap regression
+ * test in tests/uwb_net/. */
+bool uwb_net_phase_active(uint16_t phase_mask, uint32_t frame_counter);
+
+/* Superframes from frame_counter (exclusive) to the next superframe whose
+ * phase bit is set in phase_mask, in 1..UWB_NET_CYCLE_C. Drives the runner's
+ * wake planning (Phase 3 Task 12): listen_skip becomes this derived quantity
+ * instead of a tier setting the tag guesses at. A phase_mask of 0 (nothing
+ * granted -- should not happen once JOINed, but defensively) returns
+ * UWB_NET_CYCLE_C rather than looping forever. Pure. */
+uint32_t uwb_net_phase_skip_to_next(uint16_t phase_mask, uint32_t frame_counter);
 
 /* Motion state -> the tier the runner should actually use. Call once per
  * superframe with the raw INT1-derived motion state and a monotonic ms clock;

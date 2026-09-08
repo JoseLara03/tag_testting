@@ -70,6 +70,10 @@ void uwb_sweep_gate_init(struct uwb_sweep_gate *g)
     g->last_discover_ms = 0u;
     g->last_sweep_n     = 0u;
     g->ever_discovered  = false;
+    g->n_groups         = 1u;
+    for (uint8_t i = 0; i < UWB_SWEEP_GATE_N_GROUPS_MAX; i++) {
+        g->group_counts[i] = 0u;
+    }
 }
 
 bool uwb_sweep_gate_rediscover_due(const struct uwb_sweep_gate *g,
@@ -86,15 +90,42 @@ bool uwb_sweep_gate_rediscover_due(const struct uwb_sweep_gate *g,
 }
 
 void uwb_sweep_gate_discovered(struct uwb_sweep_gate *g, uint32_t now_ms,
-                               uint8_t n_found)
+                               uint8_t group, uint8_t n_groups, uint8_t n_found)
 {
     if (g == NULL) {
         return;
     }
     g->last_discover_ms = now_ms;
     g->ever_discovered  = true;
-    /* THE FIX. Without this the gate latches: see struct uwb_sweep_gate. */
-    g->last_sweep_n     = n_found;
+
+    if (n_groups == 0u || n_groups > UWB_SWEEP_GATE_N_GROUPS_MAX || group >= n_groups) {
+        /* Malformed group/n_groups: fall back to a single-group round rather
+         * than indexing off the end or mixing counts across a changed cycle
+         * size. */
+        group    = 0u;
+        n_groups = 1u;
+    }
+    if (n_groups != g->n_groups) {
+        /* Cycle size changed: stale per-group counts from a differently-sized
+         * cycle would either under- or over-count. Start the new cycle clean. */
+        for (uint8_t i = 0; i < UWB_SWEEP_GATE_N_GROUPS_MAX; i++) {
+            g->group_counts[i] = 0u;
+        }
+        g->n_groups = n_groups;
+    }
+    g->group_counts[group] = n_found;
+
+    /* THE FIX (grouped form). last_sweep_n is the sum of every group's
+     * last-known count, not just this round's -- see struct uwb_sweep_gate.
+     * Without the group-aware sum, one round short on its own group's
+     * anchors reads as a short sweep even while every other group's anchors
+     * are still known-good, which is exactly the latching shape this gate
+     * exists to prevent. */
+    uint16_t total = 0u;
+    for (uint8_t i = 0; i < n_groups; i++) {
+        total += g->group_counts[i];
+    }
+    g->last_sweep_n = (total > 0xFFu) ? 0xFFu : (uint8_t)total;
 }
 
 void uwb_sweep_gate_swept(struct uwb_sweep_gate *g, uint8_t n_ranged)
@@ -131,6 +162,21 @@ uwb_tier_t uwb_net_tier_filter(struct uwb_net_ctx *c, bool moving, uint32_t now_
         }
     }
     return c->filt_tier;
+}
+
+bool uwb_net_phase_active(uint16_t phase_mask, uint32_t frame_counter)
+{
+    return (phase_mask & (1u << (frame_counter % UWB_NET_CYCLE_C))) != 0u;
+}
+
+uint32_t uwb_net_phase_skip_to_next(uint16_t phase_mask, uint32_t frame_counter)
+{
+    for (uint32_t k = 1; k <= UWB_NET_CYCLE_C; k++) {
+        if (uwb_net_phase_active(phase_mask, frame_counter + k)) {
+            return k;
+        }
+    }
+    return UWB_NET_CYCLE_C;
 }
 
 void uwb_net_init(struct uwb_net_ctx *c, const uint8_t eui[8])
@@ -240,6 +286,7 @@ static uint32_t uwb_net_handle_core(struct uwb_net_ctx *c, const struct uwb_net_
             c->slot_index      = ev->g_slot;
             c->tier            = (uwb_tier_t)ev->g_tier;
             c->lease_remaining = ev->g_lease;
+            c->phase_mask      = ev->g_phase_mask;
             c->miss_count      = 0;
             c->state           = UWB_ST_DISCOVER;
             return UWB_ACT_RUN_DISCOVER;
@@ -279,7 +326,14 @@ static uint32_t uwb_net_handle_core(struct uwb_net_ctx *c, const struct uwb_net_
             c->miss_count = 0;
             lease_age(c, ev);
             c->frame_counter = ev->frame_counter;
-            if (!ev->in_map) {             /* gateway reclaimed our seat */
+            /* Both, not either (Phase 3): the mask is what the gateway
+             * granted, the map is what it is publishing right now, and a
+             * disagreement -- the seat reclaimed (!in_map), or a beacon
+             * landing on a superframe this grant never authorized -- means
+             * re-JOIN rather than silently participating or silently
+             * ignoring a beacon the FSM's bookkeeping already advanced past. */
+            if (!ev->in_map ||
+                !uwb_net_phase_active(c->phase_mask, ev->frame_counter)) {
                 c->state = UWB_ST_SCAN;
                 return UWB_ACT_TO_SCAN;
             }
@@ -307,6 +361,11 @@ static uint32_t uwb_net_handle_core(struct uwb_net_ctx *c, const struct uwb_net_
             return UWB_ACT_NONE;            /* never TX on a missed beacon */
         }
         if (ev->kind == UWB_EV_SWEPT) {
+            if (ev->pos_sent) {
+                /* A real liveness proof stronger than KEEPALIVE reached the
+                 * gateway -- see UWB_NET_KEEPALIVE_AFTER_N. */
+                c->part_since_pos = 0;
+            }
             if (ev->n_anchors < UWB_NET_MIN_ANCHORS) {
                 c->state = UWB_ST_DISCOVER;
                 return UWB_ACT_RUN_DISCOVER;
@@ -317,14 +376,26 @@ static uint32_t uwb_net_handle_core(struct uwb_net_ctx *c, const struct uwb_net_
             c->miss_count = 0;
             lease_age(c, ev);
             c->frame_counter = ev->frame_counter;
-            if (!ev->in_map) {              /* lease reclaimed */
+            /* Both, not either -- see the identical check and comment in
+             * UWB_ST_DISCOVER above. */
+            if (!ev->in_map ||
+                !uwb_net_phase_active(c->phase_mask, ev->frame_counter)) {
                 c->state = UWB_ST_SCAN;
                 return UWB_ACT_TO_SCAN;
             }
             c->slot_index = ev->map_slot;
 
+            /* Participations since the last POS transmission -- saturate
+             * rather than wrap; only ever compared against a small threshold,
+             * and stopping the count high is a decision (keep sending
+             * keepalives) rather than a bug (silently stop). */
+            if (c->part_since_pos < 0xFFFFu) {
+                c->part_since_pos++;
+            }
+
             uint32_t act = 0;
-            if (c->lease_remaining <= (UWB_NET_LEASE_SF / 2)) {
+            if (c->lease_remaining <= (UWB_NET_LEASE_SF / 2) &&
+                c->part_since_pos >= UWB_NET_KEEPALIVE_AFTER_N) {
                 act |= UWB_ACT_SEND_KEEPALIVE;
                 c->lease_remaining = UWB_NET_LEASE_SF;   /* optimistic renew */
             }

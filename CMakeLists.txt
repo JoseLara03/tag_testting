@@ -33,6 +33,7 @@ target_sources(app PRIVATE
     src/tag_alert_core.c
     src/uwb_net.c
     src/uwb_net_runner.c
+    src/anchor_pool_core.c
     src/uwb_radio_owner.c
     src/tag_cmd.c
     src/rx_stats_core.c

@@ -608,6 +608,40 @@ static void test_leverage_correction_is_load_bearing(void)
     CHECK(dropped * 100 > solved * 85);   /* >85 % caught */
 }
 
+/* Network-scaling v3 Task 10: MPOL_RESP can carry a per-anchor z, resolved
+ * upstream (uwb_ss_initiator.c, not host-testable Zephyr/DW3000 code) into
+ * either a real per-anchor dz or pos_cfg's fallback dz when z was NaN. The
+ * solver itself never sees NaN -- by the time a pos_meas array reaches it,
+ * every dz is a concrete float -- so this is exactly the scenario that
+ * resolution produces: two anchors carrying a REAL surveyed height (taller
+ * mount, dz=2.0) and two falling back to the single configured pair
+ * (ROOM_DZ=1.6). A correct 3D fix from heterogeneous-but-legitimate dz values
+ * is the property this test pins. */
+static void test_mixed_real_and_fallback_dz(void)
+{
+    struct pos_meas m[4];
+    const float dz[4] = { 2.0f, 2.0f, ROOM_DZ, ROOM_DZ };
+    const float tx = 2.5f, ty = 1.5f;
+
+    for (int i = 0; i < 4; i++) {
+        float dx = tx - AX[i];
+        float dy = ty - AY[i];
+        m[i].x  = AX[i];
+        m[i].y  = AY[i];
+        m[i].dz = dz[i];
+        m[i].range_m = sqrtf(dx * dx + dy * dy + dz[i] * dz[i]);
+    }
+
+    struct pos_result out;
+    bool ok = pos_solve(m, 4, NULL, &out);
+
+    CHECK(ok);
+    CHECK(out.valid);
+    CHECK(fabsf(out.x - tx) < 1e-2f);
+    CHECK(fabsf(out.y - ty) < 1e-2f);
+    CHECK(out.residual_m < 0.05f);
+}
+
 int main(void)
 {
     test_exact_recovery_3d();
@@ -629,6 +663,7 @@ int main(void)
     test_nonfinite_input_is_rejected();
     test_n_out_of_range_is_rejected();
     test_seeded_solve_agrees_with_cold_solve();
+    test_mixed_real_and_fallback_dz();
 
     if (g_fail) { printf("%d FAILURES\n", g_fail); return 1; }
     printf("ALL TESTS PASSED\n");

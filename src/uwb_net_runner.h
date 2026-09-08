@@ -40,15 +40,26 @@ bool uwb_radio_sleep_enabled(void);
 
 /* `pwr sched` -- beacon scheduler state. Returns false before the first
  * re-sync of either kind. Any out pointer may be NULL. Read without a lock
- * from the BT RX thread; the values are advisory. */
+ * from the BT RX thread; the values are advisory. `phase_mask` (Phase 3) is
+ * the currently granted phase mask -- see UWB_NET_CYCLE_C in uwb_net.h. */
 bool uwb_net_runner_sched_get(uint32_t *period_q16, uint32_t *window_ms,
                               uint32_t *eff_skip, uint32_t *misses,
-                              uint32_t *ok_count, uint32_t *miss_count);
+                              uint32_t *ok_count, uint32_t *miss_count,
+                              uint16_t *phase_mask);
 
 /* `pwr schedrst` -- zero the ok/miss counters, leaving the estimate alone. */
 void uwb_net_runner_sched_reset_stats(void);
 
 /* `pwr scan` -- coverage-probe ladder rung and the interval it implies. */
 void uwb_net_runner_scan_get(uint8_t *rung, uint32_t *next_ms);
+
+/* `pos z` diagnostic -- how many of the last sweep's anchors reported a real
+ * (non-NaN) z in their MPOL_RESP, out of up to ANCHOR_SELECT_MAX (4). 0 before
+ * the first sweep. */
+uint8_t uwb_net_runner_sweep_real_z_count(void);
+
+/* `pwr tier` -- the phase mask (Phase 3) the tier's listen_skip is now
+ * clamped by. 0 before the first GRANT. */
+uint16_t uwb_net_runner_phase_mask(void);
 
 #endif /* UWB_NET_RUNNER_H_ */

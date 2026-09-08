@@ -104,6 +104,35 @@ static void test_dz_is_part_of_the_model(void)
     CHECK(pos_residual_rms(planar, 4, tx, ty) > 0.3f);
 }
 
+/* Network-scaling v3 Task 10: two anchors carrying a real per-anchor dz
+ * (resolved upstream from MPOL_RESP's z) and two falling back to pos_cfg's
+ * single pair -- the residual model must stay correct for a MIX of dz values
+ * across one measurement set, not just a uniform one. */
+static void test_mixed_real_and_fallback_dz(void)
+{
+    const float ax[4] = { 0.0f, 3.0f, 0.0f, 3.0f };
+    const float ay[4] = { 0.0f, 0.0f, 2.0f, 2.0f };
+    const float dz[4] = { 2.0f, 2.0f, 1.6f, 1.6f };  /* real, real, fallback, fallback */
+    const float tx = 1.0f, ty = 0.5f;
+
+    struct pos_meas m[4];
+    for (int i = 0; i < 4; i++) {
+        float dx = tx - ax[i];
+        float dy = ty - ay[i];
+        m[i].x  = ax[i];
+        m[i].y  = ay[i];
+        m[i].dz = dz[i];
+        m[i].range_m = sqrtf(dx * dx + dy * dy + dz[i] * dz[i]);
+    }
+
+    CHECK(fabsf(pos_residual_rms(m, 4, tx, ty)) < 1e-4f);
+
+    /* Corrupting one anchor's range still shows up against the true position
+     * even with heterogeneous dz elsewhere in the set. */
+    m[1].range_m += 1.0f;
+    CHECK(pos_residual_rms(m, 4, tx, ty) > 0.3f);
+}
+
 int main(void)
 {
     test_consistent_geometry_has_zero_residual();
@@ -112,6 +141,7 @@ int main(void)
     test_offset_position_is_penalised();
     test_zero_measurements();
     test_dz_is_part_of_the_model();
+    test_mixed_real_and_fallback_dz();
 
     if (g_fail) { printf("%d FAILURES\n", g_fail); return 1; }
     printf("ALL TESTS PASSED\n");
