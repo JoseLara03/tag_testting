@@ -9,6 +9,23 @@
 #define UWB_NET_LEASE_SF        50   /* lease length, superframes */
 #define UWB_NET_MISS_MAX        3    /* M: consecutive beacon misses -> lost */
 #define UWB_NET_JOIN_RETRY_MAX  4    /* N: join attempts -> back to scan */
+
+/* JOIN backoff (network-scaling-v3, design §3.E / §2.5): spreads a tag's
+ * FIRST JOIN of a joining episode over 0..UWB_NET_JOIN_BACKOFF_MAX-1
+ * superframes, seeded from the tag's own EUI (uwb_net_join_backoff() below),
+ * rather than sending it on the very next beacon after SCAN locks on. 100
+ * tags rejoining simultaneously after a gateway restart -- the only way a
+ * population this large ever becomes JOINING at the same instant -- would
+ * otherwise all contend the same N_CAP (4) Aloha mini-slots every single
+ * superframe until enough of them happen to win by luck; UWB_ST_JOINING
+ * already resends on every beacon it receives with no jitter of its own
+ * (see uwb_net.c), so nothing upstream of this constant already solves it.
+ * Spread over 64 superframes (12.8 s), 100 tags average ~1.6 arrivals per
+ * superframe -- comfortably inside 4 mini-slots' Aloha capacity instead of
+ * colliding almost everywhere. Only the FIRST JOIN of an episode is delayed;
+ * UWB_NET_JOIN_RETRY_MAX's post-refusal retries and SCAN's own
+ * scan_backoff_core ladder are unchanged. */
+#define UWB_NET_JOIN_BACKOFF_MAX  64u
 #define UWB_NET_MIN_ANCHORS     3    /* need >=3 for a 2D fix */
 /* Must equal UWB_PROTO_VER in uwb_frame_802_15_4z.h -- the gateway stamps beacon
  * byte 10 with that one and the tag drops any beacon that does not match this
@@ -236,6 +253,9 @@ struct uwb_net_ctx {
     uint16_t  lease_remaining;  /* superframes until expiry */
     uint8_t   miss_count;       /* consecutive beacon misses */
     uint8_t   join_retries;
+    /* Superframes still to wait before this episode's first JOIN goes out --
+     * see UWB_NET_JOIN_BACKOFF_MAX. Zero means "send now". */
+    uint8_t   join_backoff_remaining;
     uint32_t  frame_counter;    /* last beacon's counter (last beacon seen) */
     uint8_t   n_anchors;        /* selected anchors after discovery */
     /* Participations since the last sweep. Counted, not derived from
@@ -257,6 +277,16 @@ struct uwb_net_ctx {
 
 void     uwb_net_init(struct uwb_net_ctx *c, const uint8_t eui[8]);
 uint32_t uwb_net_handle(struct uwb_net_ctx *c, const struct uwb_net_event *ev);
+
+/* Deterministic per-EUI value in [0, UWB_NET_JOIN_BACKOFF_MAX). Pure FNV-1a
+ * over the 8 EUI bytes -- deterministic so the same tag always waits the same
+ * number of superframes for a given joining episode (useful on the bench:
+ * reproducible, not flaky), while different EUIs scatter across the range.
+ * Not a security-grade hash and does not need to be; it only has to avoid
+ * clustering a physical fleet's EUIs, which typically differ in their low
+ * bytes (see the Tid EUI-hash collision discussion in ANCLA_ESP32S3's
+ * CLAUDE.md for why a well-mixed 32-bit hash is an accepted choice here). */
+uint32_t uwb_net_join_backoff(const uint8_t eui[8]);
 
 /* True if frame_counter's superframe falls on one of phase_mask's granted
  * bits within the UWB_NET_CYCLE_C-superframe cycle. Pure; wrap-safe because

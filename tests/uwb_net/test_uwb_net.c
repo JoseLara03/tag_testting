@@ -142,10 +142,18 @@ static void test_scan_join(void)
     CHECK(uwb_net_handle(&c, &bad) == UWB_ACT_SLEEP);
     CHECK(c.state == UWB_ST_SCAN);
 
-    /* Valid beacon: -> JOINING, emit join. */
+    /* Valid beacon: -> JOINING immediately; the first JOIN itself may be
+     * delayed by uwb_net_join_backoff(EUI) superframes (test_join_backoff
+     * below covers that mechanism in isolation) -- drain it here so the rest
+     * of this test can focus on the GRANT_MISS retry ladder. */
     struct uwb_net_event b = ev_beacon(5, false, 0);
-    CHECK(uwb_net_handle(&c, &b) == UWB_ACT_SEND_JOIN);
+    uint32_t act = uwb_net_handle(&c, &b);
     CHECK(c.state == UWB_ST_JOINING);
+    while (act == UWB_ACT_NONE) {
+        b.frame_counter++;
+        act = uwb_net_handle(&c, &b);
+    }
+    CHECK(act == UWB_ACT_SEND_JOIN);
 
     /* GRANT_MISS retries up to N, then back to SCAN. */
     struct uwb_net_event miss; memset(&miss, 0, sizeof(miss)); miss.kind = UWB_EV_GRANT_MISS;
@@ -478,9 +486,15 @@ static void test_scan_sleeps(void)
     }
     CHECK(c.state == UWB_ST_SCAN);
 
-    /* A usable beacon still joins instead of sleeping. */
+    /* A usable beacon still joins instead of sleeping, once any per-EUI JOIN
+     * backoff has drained (see test_join_backoff). */
     struct uwb_net_event b = ev_beacon(5, false, 0);
-    CHECK(uwb_net_handle(&c, &b) == UWB_ACT_SEND_JOIN);
+    uint32_t act = uwb_net_handle(&c, &b);
+    while (act == UWB_ACT_NONE) {
+        b.frame_counter++;
+        act = uwb_net_handle(&c, &b);
+    }
+    CHECK(act == UWB_ACT_SEND_JOIN);
 
     /* And the sleep must not have cost the SCAN alert rule: a HELP raised out
      * of coverage still goes out blind on both BEACON and BEACON_MISS. */
@@ -832,6 +846,79 @@ static void test_sweep_gate_interval(void)
               0x00000100u + UWB_NET_REDISCOVER_INTERVAL_MS));
 }
 
+/* network-scaling-v3, design §2.5/§3.E: JOIN backoff spreads a joining
+ * episode's first JOIN over 0..UWB_NET_JOIN_BACKOFF_MAX-1 superframes,
+ * seeded from the EUI, so a bulk gateway-restart rejoin does not have every
+ * tag contend the same 4 Aloha mini-slots every single superframe. */
+static void test_join_backoff(void)
+{
+    /* In range for every EUI tried, and deterministic for a fixed one. */
+    uint8_t euis[][8] = {
+        {0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 1},
+        {0, 0, 0, 0, 0, 0, 0, 0},
+        {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF},
+        {1, 2, 3, 4, 5, 6, 7, 8},
+    };
+    for (size_t i = 0; i < sizeof(euis) / sizeof(euis[0]); i++) {
+        uint32_t b1 = uwb_net_join_backoff(euis[i]);
+        uint32_t b2 = uwb_net_join_backoff(euis[i]);
+
+        CHECK(b1 < UWB_NET_JOIN_BACKOFF_MAX);
+        CHECK(b1 == b2);   /* deterministic per EUI */
+    }
+
+    /* Different EUIs are not all funnelled onto the same slot -- a
+     * regression here (e.g. a hash that only mixes one byte) would silently
+     * defeat the whole point of this mechanism. Weak but cheap: among four
+     * EUIs differing in every byte, not all four collide on one value. */
+    uint32_t distinct = 0;
+    uint32_t seen[4];
+    for (size_t i = 0; i < 4; i++) {
+        seen[i] = uwb_net_join_backoff(euis[i]);
+        bool dup = false;
+        for (size_t j = 0; j < i; j++) {
+            if (seen[j] == seen[i]) { dup = true; break; }
+        }
+        if (!dup) distinct++;
+    }
+    CHECK(distinct > 1);
+
+    /* The FSM mechanic: SCAN -> JOINING happens on the very first beacon
+     * regardless of backoff, but UWB_ACT_SEND_JOIN is withheld until exactly
+     * uwb_net_join_backoff(EUI) further beacons have been counted down. */
+    struct uwb_net_ctx c; uwb_net_init(&c, EUI);
+    uint32_t backoff = uwb_net_join_backoff(EUI);
+
+    struct uwb_net_event b = ev_beacon(0, false, 0);
+    uint32_t act = uwb_net_handle(&c, &b);
+    CHECK(c.state == UWB_ST_JOINING);
+    CHECK(c.join_backoff_remaining == backoff);
+    if (backoff == 0) {
+        CHECK(act == UWB_ACT_SEND_JOIN);
+    } else {
+        CHECK(act == UWB_ACT_NONE);
+        for (uint32_t k = 1; k <= backoff; k++) {
+            b.frame_counter++;
+            CHECK(uwb_net_handle(&c, &b) == UWB_ACT_NONE);
+            CHECK(c.join_backoff_remaining == backoff - k);
+        }
+        b.frame_counter++;
+        CHECK(uwb_net_handle(&c, &b) == UWB_ACT_SEND_JOIN);
+        CHECK(c.join_backoff_remaining == 0);
+    }
+
+    /* A fresh episode (back to SCAN, then a new beacon) re-samples the
+     * backoff rather than remembering the drained-to-zero value from the
+     * last episode -- same EUI, so it lands on the same value again, but the
+     * assignment must have actually happened, not just been skipped because
+     * the field was already 0. */
+    struct uwb_net_ctx c2; uwb_net_init(&c2, EUI);
+    c2.join_backoff_remaining = 7;   /* poison: must be overwritten, not kept */
+    struct uwb_net_event b2 = ev_beacon(0, false, 0);
+    uwb_net_handle(&c2, &b2);
+    CHECK(c2.join_backoff_remaining == backoff);
+}
+
 int main(void)
 {
     test_proto_ver_matches_frame_module();
@@ -840,6 +927,7 @@ int main(void)
     test_tier_filter();
     test_scan_sleeps();
     test_scan_join();
+    test_join_backoff();
     test_grant_discover();
     test_discover_keeps_lease();
     test_ranging();

@@ -189,6 +189,18 @@ void uwb_net_init(struct uwb_net_ctx *c, const uint8_t eui[8])
     c->filt_tier = UWB_TIER_FAST;
 }
 
+uint32_t uwb_net_join_backoff(const uint8_t eui[8])
+{
+    /* FNV-1a 32-bit, offset basis and prime per the standard algorithm. */
+    uint32_t hash = 2166136261u;
+
+    for (int i = 0; i < 8; i++) {
+        hash ^= eui[i];
+        hash *= 16777619u;
+    }
+    return hash % UWB_NET_JOIN_BACKOFF_MAX;
+}
+
 static uint32_t uwb_net_handle_core(struct uwb_net_ctx *c, const struct uwb_net_event *ev);
 
 /* Age the seat's lease by the superframes that actually elapsed since the last
@@ -268,7 +280,18 @@ static uint32_t uwb_net_handle_core(struct uwb_net_ctx *c, const struct uwb_net_
             c->miss_count = 0;
             c->join_retries = 0;
             c->state = UWB_ST_JOINING;
-            return UWB_ACT_SEND_JOIN;
+            /* JOIN backoff (design §2.5/§3.E): stagger this episode's first
+             * JOIN over up to UWB_NET_JOIN_BACKOFF_MAX superframes instead of
+             * sending it on the very superframe SCAN locks on -- see
+             * UWB_NET_JOIN_BACKOFF_MAX's comment for why. A backoff of 0 (this
+             * EUI's hash lands on the first slot) sends immediately, same as
+             * before this existed. */
+            c->join_backoff_remaining =
+                (uint8_t)uwb_net_join_backoff(c->eui);
+            if (c->join_backoff_remaining == 0) {
+                return UWB_ACT_SEND_JOIN;
+            }
+            return UWB_ACT_NONE;
         }
         /* Out of coverage: sleep the radio until the next scheduled probe.
          * This state used to return UWB_ACT_NONE on everything, so an unjoined
@@ -302,6 +325,12 @@ static uint32_t uwb_net_handle_core(struct uwb_net_ctx *c, const struct uwb_net_
             ev->proto_ver == UWB_NET_PROTO_VER) {
             c->miss_count = 0;
             c->frame_counter = ev->frame_counter;
+            if (c->join_backoff_remaining > 0) {
+                /* Still waiting out this episode's initial backoff -- no
+                 * JOIN has gone out yet, so there is nothing to retry. */
+                c->join_backoff_remaining--;
+                return UWB_ACT_NONE;
+            }
             return UWB_ACT_SEND_JOIN;   /* retry each beacon until GRANT */
         }
         return UWB_ACT_NONE;
