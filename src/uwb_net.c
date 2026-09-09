@@ -326,14 +326,39 @@ static uint32_t uwb_net_handle_core(struct uwb_net_ctx *c, const struct uwb_net_
             c->miss_count = 0;
             lease_age(c, ev);
             c->frame_counter = ev->frame_counter;
-            /* Both, not either (Phase 3): the mask is what the gateway
-             * granted, the map is what it is publishing right now, and a
-             * disagreement -- the seat reclaimed (!in_map), or a beacon
-             * landing on a superframe this grant never authorized -- means
-             * re-JOIN rather than silently participating or silently
-             * ignoring a beacon the FSM's bookkeeping already advanced past. */
-            if (!ev->in_map ||
+            /* A beacon publishes exactly ONE phase's slot row per superframe
+             * (frame_counter % UWB_NET_CYCLE_C). Being absent from a beacon
+             * that carries a phase this grant does not cover is therefore
+             * NORMAL and says nothing about our seat: only a beacon on one of
+             * OUR phases can show it reclaimed.
+             *
+             * This was `!in_map || !phase_active`, which read raw absence as
+             * lease loss and so bounced any tag holding fewer than CYCLE_C
+             * phases to SCAN on the first foreign-phase beacon -- immediately
+             * in practice, since the gateway never grants all 16 (IDLE gets 1,
+             * FAST at most GW_PHASES_MAX_FAST). Observed on the bench as the
+             * gateway re-GRANTing the same address every single superframe.
+             *
+             * lease_age() above still runs on every beacon, so a seat that is
+             * genuinely gone still expires by timeout rather than by this test.
+             * A zero mask means the grant carried no phase information, which
+             * should not happen once JOINed: fall through to the bare in_map
+             * check so that degrades to a re-JOIN instead of ignoring every
+             * beacon forever. */
+            if (c->phase_mask != 0u &&
                 !uwb_net_phase_active(c->phase_mask, ev->frame_counter)) {
+                /* Foreign phase: this beacon publishes some OTHER phase's slot
+                 * row, so being absent from it is expected and carries no
+                 * information about our seat -- ignore it. Being PRESENT in a
+                 * row for a phase we were never granted is still a real
+                 * disagreement, and still forces a re-JOIN. */
+                if (ev->in_map) {
+                    c->state = UWB_ST_SCAN;
+                    return UWB_ACT_TO_SCAN;
+                }
+                return UWB_ACT_NONE;
+            }
+            if (!ev->in_map) {
                 c->state = UWB_ST_SCAN;
                 return UWB_ACT_TO_SCAN;
             }
@@ -376,10 +401,23 @@ static uint32_t uwb_net_handle_core(struct uwb_net_ctx *c, const struct uwb_net_
             c->miss_count = 0;
             lease_age(c, ev);
             c->frame_counter = ev->frame_counter;
-            /* Both, not either -- see the identical check and comment in
-             * UWB_ST_DISCOVER above. */
-            if (!ev->in_map ||
+            /* Foreign-phase beacons carry no information about our seat --
+             * see the identical check and full derivation in UWB_ST_DISCOVER
+             * above. */
+            if (c->phase_mask != 0u &&
                 !uwb_net_phase_active(c->phase_mask, ev->frame_counter)) {
+                /* Foreign phase: this beacon publishes some OTHER phase's slot
+                 * row, so being absent from it is expected and carries no
+                 * information about our seat -- ignore it. Being PRESENT in a
+                 * row for a phase we were never granted is still a real
+                 * disagreement, and still forces a re-JOIN. */
+                if (ev->in_map) {
+                    c->state = UWB_ST_SCAN;
+                    return UWB_ACT_TO_SCAN;
+                }
+                return UWB_ACT_NONE;
+            }
+            if (!ev->in_map) {
                 c->state = UWB_ST_SCAN;
                 return UWB_ACT_TO_SCAN;
             }

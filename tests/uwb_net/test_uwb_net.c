@@ -318,6 +318,42 @@ static void test_phase_mask_disagreement_forces_rejoin(void)
     CHECK(c.state == UWB_ST_SCAN);
 }
 
+/* A beacon for a phase this tag was NOT granted, in which the tag is correctly
+ * ABSENT from the slot map, must be ignored -- not read as a lost lease.
+ *
+ * This is the case the suite was missing. The other phase tests feed the FSM
+ * only its own phases, on the stated assumption that the runner never delivers
+ * the others. The runner cannot honour that during acquisition: its
+ * phase-derived sleep only engages once beacon tracking has locked
+ * (bt_narrow && beacon_sched_have_ref), and until then every superframe's
+ * beacon is received. Under the old `!in_map || !phase_active` test the first
+ * foreign-phase beacon bounced the tag to SCAN, so it could never stay seated
+ * long enough for tracking to lock -- unbootstrappable by construction, and
+ * seen on hardware as the gateway re-GRANTing the same address every single
+ * superframe, forever.
+ *
+ * Complements test_phase_mask_disagreement_forces_rejoin above, which covers a
+ * foreign phase WITH in_map set: that is a genuine contradiction and must still
+ * re-JOIN. Absence on a foreign phase is normal; presence is the anomaly. */
+static void test_foreign_phase_absent_from_map_is_ignored(void)
+{
+    const uint16_t mask = (uint16_t)(1u << 5);   /* phase 5 only */
+    struct uwb_net_ctx c;
+    to_ranging_phase(&c, UWB_TIER_FAST, mask);
+
+    /* Every superframe of a full cycle, as the radio actually hears them. */
+    for (uint32_t fc = 0; fc < UWB_NET_CYCLE_C; fc++) {
+        if (fc == 5u) {
+            continue;                   /* our own phase, covered elsewhere */
+        }
+        struct uwb_net_event b = ev_beacon(fc, false, 0);   /* absent, as normal */
+        uint32_t a = uwb_net_handle(&c, &b);
+
+        CHECK(!(a & UWB_ACT_TO_SCAN));
+        CHECK(c.state == UWB_ST_RANGING);
+    }
+}
+
 /* KEEPALIVE fires only after UWB_NET_KEEPALIVE_AFTER_N participations with no
  * POS frame sent, once the lease is low -- a real POS transmission (stronger
  * liveness proof, Task 12) resets the count and suppresses it again. */
@@ -846,6 +882,7 @@ int main(void)
     test_single_phase_participates_once_per_cycle();
     test_multi_phase_mover_participates_n_times_per_cycle();
     test_phase_mask_disagreement_forces_rejoin();
+    test_foreign_phase_absent_from_map_is_ignored();
     test_phase_skip_to_next();
     test_keepalive_suppressed_until_n_participations_without_pos();
     test_phase_active_wrap_does_not_skip_phase();
