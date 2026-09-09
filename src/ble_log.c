@@ -220,5 +220,12 @@ void ble_log_send(const char *msg)
     if (msg == NULL) {
         return;
     }
+    /* Mirror to the console. Bring-up diagnostics -- uwb_init()'s probe/init/PHY
+     * failures and main()'s "DW3000: init failed" -- are all emitted before any
+     * central connects, and ble_log_send_raw() drops a message outright when
+     * current_conn is NULL. So the one class of fault that leaves the tag unable
+     * to transmit is also the one that reports itself nowhere. printk() is a
+     * no-op without CONFIG_PRINTK, so the production image is unaffected. */
+    printk("%s", msg);
     ble_log_send_raw((const uint8_t *)msg, (uint16_t)strlen(msg));
 }

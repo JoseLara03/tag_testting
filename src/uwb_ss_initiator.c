@@ -290,12 +290,32 @@ bool do_one_range_anchor(uint8_t aid, float *range_m, float *ax, float *ay)
  * so the two constants must stay matched to that arithmetic, not just to each
  * other. */
 #define MPOL_BASE_UUS   2200U   /* first response: ~2050 uus anchor turnaround + margin */
-#define MPOL_SLOT_UUS   1700U   /* stagger step: ~1.35 ms response airtime + margin */
-/* Provisional: covers MPOL_BASE_UUS + 3*MPOL_SLOT_UUS + one response's airtime
- * + margin for 4 anchors (~9.15 ms). Task 9 re-derives T_SLOT_MS from a
- * hardware measurement of the real occupancy (Step 4 below) -- re-check this
- * window against that measurement before relying on it beyond the bench. */
-#define MPOL_WINDOW_MS    12U
+/* Stagger step. Was 1700 (derived from response airtime alone), which lost one
+ * response on nearly every sweep: the collection loop below re-arms the
+ * receiver per frame (setrxtimeout / setpreambledetecttimeout / setinterrupt /
+ * rxenable, four SPI transactions plus the interrupt and the frame read), and
+ * airtime is not what has to fit between two RMARKERs. The real budget is
+ *
+ *   slot >= tail(i) + rearm + preamble(i+1)
+ *
+ * and `preamble` is the trap: dwt_setdelayedtrxtime() schedules the RMARKER,
+ * not the physical start, so the PLEN_1024 preamble (~1050 us) is transmitted
+ * BEFORE the next slot's instant. With a ~320 us frame tail that leaves
+ * 1744 - 1370 = ~370 us of re-arm budget at the old value -- marginal, which
+ * is why the tag caught slot 1 only intermittently and reported n=2 with a
+ * rotating cast of anchors. 2400 uus (~2462 us) gives ~1090 us instead.
+ * Bench-observed before the change: SWEEP n=2 on every sweep with three
+ * anchors answering every poll on the gateway's sniffer.
+ * This constant is written into each slot's delay_us and the anchor simply
+ * obeys it, so it needs no matching change on the anchor side. */
+#define MPOL_SLOT_UUS   2400U
+/* Covers MPOL_BASE_UUS + 3*MPOL_SLOT_UUS (9400 uus ~= 9.64 ms) + one
+ * response's airtime + margin for 4 anchors. Grew with MPOL_SLOT_UUS above:
+ * the old 12 ms would have truncated the fourth slot. Still well inside
+ * T_SLOT_MS (24 ms). Task 9 re-derives T_SLOT_MS from a hardware measurement
+ * of the real occupancy (Step 4 below) -- re-check this window against that
+ * measurement before relying on it beyond the bench. */
+#define MPOL_WINDOW_MS    15U
 
 int uwb_multipoll_sweep(struct pos_meas *out_by_slot, bool *ok_out,
                         const uint8_t *anchor_ids, uint8_t n_anchors,
@@ -378,6 +398,14 @@ int uwb_multipoll_sweep(struct pos_meas *out_by_slot, bool *ok_out,
         irq_evt_t evt = wait_event(K_MSEC((uint32_t)rem));
         if (evt != EVT_RXFCG) {
             dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
+#ifdef CONFIG_PRINTK
+            /* TEMPORARY. Passive -- changes no behaviour. A sweep that ends
+             * with fewer responses than anchors polled shows up here as the
+             * window expiring; pair it with the MPOL arrival times below to
+             * see whether a response was late, absent, or simply arrived
+             * while the receiver was still being re-armed. */
+            printk("  MPOL rx_fail evt=%d n=%u\n", (int)evt, (unsigned)n);
+#endif
             continue;
         }
 
@@ -385,6 +413,9 @@ int uwb_multipoll_sweep(struct pos_meas *out_by_slot, bool *ok_out,
         if (flen <= FCS_LEN ||
             (flen - FCS_LEN) != UWB_FRAME_LEN_MPOL_RESP) {
             dwt_writesysstatuslo(DWT_INT_RXFCG_BIT_MASK);
+#ifdef CONFIG_PRINTK
+            printk("  MPOL wronglen=%u\n", (unsigned)flen);
+#endif
             continue;
         }
 
