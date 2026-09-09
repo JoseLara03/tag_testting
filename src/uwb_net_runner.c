@@ -291,6 +291,15 @@ int uwb_radio_rx_beacon(uint8_t *buf, size_t buf_len, uint32_t timeout_ms)
     irq_evt_t evt = wait_event(K_MSEC(timeout_ms));
 
     if (evt != EVT_RXFCG) {
+        /* Force the receiver off before returning. dwt_setrxtimeout(0) above
+         * means there is NO hardware timeout: the kernel timeout in
+         * wait_event() expiring leaves the DW3000 still receiving, and a
+         * transceiver that is in RX will not start a TX -- dwt_starttx()
+         * fails and TXFRS never arrives. A successful RXFCG idles the receiver
+         * by itself, so only this path can leak an armed receiver, and before
+         * the v3 ANNOUNCE window nothing transmitted straight after a timed-out
+         * listen, which is why it never showed up until now. */
+        dwt_forcetrxoff();
         dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
         return -ETIMEDOUT;
     }
@@ -321,7 +330,20 @@ int uwb_radio_tx_cap(const uint8_t *buf, size_t len, uint8_t minislot)
     dwt_writetxdata((uint16_t)len, (uint8_t *)(uintptr_t)buf, 0);
     dwt_writetxfctrl((uint16_t)(len + 2U), 0, 0);   /* +2 for FCS */
     dwt_setinterrupt(DWT_INT_TXFRS_BIT_MASK, 0, DWT_ENABLE_INT_ONLY);
-    dwt_starttx(DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED);
+
+    /* Return was discarded, which is why a transmit that never started was
+     * indistinguishable here from one that started and was lost in the air:
+     * both surfaced only as the TXFRS wait below timing out. dwt_starttx()
+     * refuses while the transceiver is in RX, so this is the error that a
+     * leaked receiver actually produces. */
+    if (dwt_starttx(DWT_START_TX_IMMEDIATE | DWT_RESPONSE_EXPECTED)
+        != DWT_SUCCESS) {
+        dwt_forcetrxoff();
+        /* -EBUSY, distinct from the -EIO below, so "the transmit was refused
+         * before it began" and "it began and TXFRS never came back" are
+         * separable in a log instead of both reading as -5. */
+        return -EBUSY;
+    }
 
     irq_evt_t evt = wait_event(K_MSEC(50));
 
@@ -394,6 +416,19 @@ static int run_discovery(uint16_t src_addr, uint8_t group, uint8_t n_groups,
     {
         uint32_t t_end = k_uptime_get_32() + DISCOVERY_WINDOW_MS;
         uint8_t  resp_buf[UWB_FRAME_LEN_RESP];
+        /* TEMPORARY. Response arrival time relative to the DISCOVERY TX, in
+         * microseconds, measured on the TAG's own receiver -- the gateway
+         * cannot supply this (its RX callback drops any frame arriving while
+         * one is pending, so it silently undercounts a staggered burst).
+         * Compare each value against disc_schedule.h: a grouped round puts
+         * every responder at rank = anchor_id / n_groups, so with n_groups=8
+         * and ids 0..7 that is rank 0 = DISC_BASE_UUS ~= 2050 us for ALL of
+         * them. An arrival at ~5600 or ~9000 us is the UNGROUPED
+         * 2000 + rank*3500 ladder, i.e. an anchor that is not applying the
+         * group schedule. */
+#ifdef CONFIG_PRINTK
+        uint32_t t_tx_cyc = k_cycle_get_32();
+#endif
 
         for (;;) {
             int32_t rem = (int32_t)(t_end - k_uptime_get_32());
@@ -409,6 +444,11 @@ static int run_discovery(uint16_t src_addr, uint8_t group, uint8_t n_groups,
                                                         &src, &cir_p, &cir_q) == 0) {
                     anchor_pool_update((uint8_t)src, cir_p, cir_q);
                     round_found++;
+#ifdef CONFIG_PRINTK
+                    printk("  RESP src=0x%04X t=%uus grp=%u\n", src,
+                           k_cyc_to_us_floor32(k_cycle_get_32() - t_tx_cyc),
+                           group);
+#endif
                 }
             }
         }
@@ -797,6 +837,18 @@ static void runner_fn(void *p1, void *p2, void *p3)
         uint32_t bcn_rx_ms = 0;
 
         rx_stats_arm();
+#ifdef CONFIG_PRINTK
+        /* TEMPORARY beacon-acquisition probe. rx_stats only records
+         * beacon-vs-miss, which cannot distinguish "the radio hears nothing"
+         * from "frames arrive and every one is rejected" -- and those two have
+         * completely different causes. Counts frames actually returned by
+         * uwb_radio_rx_beacon() and why each was refused. Remove once the
+         * silent-tag fault is closed. */
+        int dbg_frames = 0;   /* rx_beacon() returned a frame (len >= 0) */
+        int dbg_last = 0;     /* last return: >=0 length, <0 -errno */
+        int dbg_wronglen = 0; /* a frame, but not UWB_FRAME_LEN_BEACON */
+        int dbg_notbcn = 0;   /* right length, but is_beacon() said no */
+#endif
         for (;;) {
             int32_t rem = (int32_t)(bcn_deadline - uwb_radio_now_ms());
             if (rem <= 0) {
@@ -804,6 +856,17 @@ static void runner_fn(void *p1, void *p2, void *p3)
             }
             int len = uwb_radio_rx_beacon(beacon_buf, sizeof(beacon_buf),
                                           (uint32_t)rem);
+#ifdef CONFIG_PRINTK
+            dbg_last = len;
+            if (len >= 0) {
+                dbg_frames++;
+                if (len != UWB_FRAME_LEN_BEACON) {
+                    dbg_wronglen++;
+                } else if (!uwb_frame_is_beacon(beacon_buf, (size_t)len)) {
+                    dbg_notbcn++;
+                }
+            }
+#endif
             if (len == UWB_FRAME_LEN_BEACON &&
                 uwb_frame_is_beacon(beacon_buf, (size_t)len)) {
                 beacon_len = len;
@@ -823,6 +886,11 @@ static void runner_fn(void *p1, void *p2, void *p3)
             }
             /* non-beacon frame or rx timeout/error: keep waiting for the beacon */
         }
+#ifdef CONFIG_PRINTK
+        printk("SCAN st=%d frames=%d wronglen=%d notbcn=%d last=%d got=%d\n",
+               (int)ctx.state, dbg_frames, dbg_wronglen, dbg_notbcn, dbg_last,
+               beacon_len == UWB_FRAME_LEN_BEACON ? 1 : 0);
+#endif
         uint32_t t0_ms = uwb_radio_now_ms();
 
         /* 3. Build the event. */
@@ -915,12 +983,21 @@ static void runner_fn(void *p1, void *p2, void *p3)
             if (jlen > 0) {
                 /* Pick a random mini-slot (0 .. N_CAP-1) for Aloha. */
                 uint8_t mslot = (uint8_t)(sys_rand32_get() % N_CAP);
-                uwb_radio_tx_cap(join_buf, (size_t)jlen, mslot);
+                int txrc = uwb_radio_tx_cap(join_buf, (size_t)jlen, mslot);
 
                 /* Listen briefly for a GRANT addressed to our EUI. */
                 uint8_t grant_buf[UWB_FRAME_LEN_GRANT];
                 int glen = uwb_radio_rx_beacon(grant_buf, sizeof(grant_buf),
                                                (uint32_t)N_CAP * T_MINISLOT_MS + T_GUARD_MS);
+#ifdef CONFIG_PRINTK
+                /* TEMPORARY, pairs with the SCAN probe above. uwb_radio_tx_cap()'s
+                 * return was discarded here, so a JOIN that never reached the air
+                 * (no TXFRS -> -EIO) looked exactly like one the gateway ignored.
+                 * txrc=0 means the frame was physically transmitted. */
+                printk("JOIN jlen=%d mslot=%u tx=%d glen=%d\n",
+                       jlen, mslot, txrc, glen);
+#endif
+                (void)txrc;   /* only read by the probe above */
 
                 struct uwb_net_event gev = { 0 };
                 if (glen == UWB_FRAME_LEN_GRANT &&
@@ -1018,6 +1095,19 @@ static void runner_fn(void *p1, void *p2, void *p3)
                 .n_anchors = (uint8_t)(n > 0 ? n : 0),
             };
             uwb_net_handle(&ctx, &dev);
+#ifdef CONFIG_PRINTK
+            /* TEMPORARY, pairs with the SCAN/JOIN probes. `found` is what
+             * answered THIS group's round; `pool` is the persistent selection
+             * the FSM compares against UWB_NET_MIN_ANCHORS. Only pool reaching
+             * MIN_ANCHORS moves the tag to RANGING, so this is the number that
+             * decides whether a position fix is ever produced. The gateway's
+             * console cannot answer this: its RX callback drops any frame that
+             * arrives while one is still pending, so it undercounts responses
+             * that land in the same staggered window. */
+            printk("DISC grp=%u/%u found=%u pool=%d st=%d\n",
+                   this_group, (unsigned)UWB_DISC_N_GROUPS, round_found, n,
+                   (int)ctx.state);
+#endif
         }
 
         if (act & UWB_ACT_RUN_SWEEP) {
@@ -1072,6 +1162,29 @@ static void runner_fn(void *p1, void *p2, void *p3)
                 struct pos_result pos;
                 bool solved = (n >= 3) &&
                               pos_solve(meas, (size_t)n, seed_p, &pos);
+#ifdef CONFIG_PRINTK
+                /* TEMPORARY, last of the bring-up probes. A fix is published
+                 * only when (n >= 3 && pos_solve()) -- two very different
+                 * failures that are indistinguishable from outside, since
+                 * neither emits anything. Integer millimetres/centimetres
+                 * rather than %f: picolibc's printk has no float conversion.
+                 * Anchor coordinates come off the wire in each MPOL_RESP, so
+                 * a wrong survey shows up here too. */
+                printk("SWEEP n=%d solved=%d mv=%d tier=%d filt=%d", n,
+                       solved ? 1 : 0, motion_moving ? 1 : 0,
+                       (int)ctx.tier, (int)ctx.filt_tier);
+                for (int i = 0; i < n && i < POS_MAX_ANCHORS; i++) {
+                    printk(" [a%d %d,%dcm r=%dmm]", i,
+                           (int)(meas[i].x * 100.0f), (int)(meas[i].y * 100.0f),
+                           (int)(meas[i].range_m * 1000.0f));
+                }
+                if (solved) {
+                    printk(" -> %d,%dcm res=%dmm used=%u",
+                           (int)(pos.x * 100.0f), (int)(pos.y * 100.0f),
+                           (int)(pos.residual_m * 1000.0f), pos.n_used);
+                }
+                printk("\n");
+#endif
 
                 /* Run the filter on every sweep that produced ranges, whether
                  * or not the snapshot converged: the gating and the ZUPT are
