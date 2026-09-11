@@ -109,7 +109,7 @@ void twr_log_raw(const uint8_t *buf, size_t len)
 
 /* ---- BLE sender thread ----------------------------------------------------- */
 #define BLE_TX_PRIO   6
-#define BLE_TX_STACK  512
+#define BLE_TX_STACK  2048
 
 K_THREAD_STACK_DEFINE(ss_ble_tx_stack, BLE_TX_STACK);
 static struct k_thread ss_ble_tx_tid;

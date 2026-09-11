@@ -336,6 +336,24 @@ static uint32_t uwb_net_handle_core(struct uwb_net_ctx *c, const struct uwb_net_
         return UWB_ACT_NONE;
 
     case UWB_ST_DISCOVER:
+        if (ev->kind == UWB_EV_GRANT) {
+            /* A re-GRANT from a KEEPALIVE-triggered re-phase (gw_core.h's
+             * GW_KEEPALIVE_REPHASED) -- NOT the initial JOIN grant, which
+             * only ever arrives in UWB_ST_JOINING above. regrant() never
+             * moves a tag to a different short_addr, only its
+             * phase/slot/tier/lease/mask, so this never changes state or
+             * triggers rediscovery -- only the bookkeeping about which
+             * superframes are ours moves. Defensive short_addr check: a
+             * GRANT for a different address reaching here would be a
+             * wire-level bug, not a normal event. */
+            if (ev->g_short_addr == c->short_addr) {
+                c->slot_index      = ev->g_slot;
+                c->tier            = (uwb_tier_t)ev->g_tier;
+                c->lease_remaining = ev->g_lease;
+                c->phase_mask      = ev->g_phase_mask;
+            }
+            return UWB_ACT_NONE;
+        }
         if (ev->kind == UWB_EV_DISCOVERED) {
             c->n_anchors = ev->n_anchors;
             if (ev->n_anchors >= UWB_NET_MIN_ANCHORS) {
@@ -407,6 +425,17 @@ static uint32_t uwb_net_handle_core(struct uwb_net_ctx *c, const struct uwb_net_
         return UWB_ACT_NONE;
 
     case UWB_ST_RANGING:
+        if (ev->kind == UWB_EV_GRANT) {
+            /* Same re-GRANT case as UWB_ST_DISCOVER above -- see the comment
+             * there for the full derivation. */
+            if (ev->g_short_addr == c->short_addr) {
+                c->slot_index      = ev->g_slot;
+                c->tier            = (uwb_tier_t)ev->g_tier;
+                c->lease_remaining = ev->g_lease;
+                c->phase_mask      = ev->g_phase_mask;
+            }
+            return UWB_ACT_NONE;
+        }
         if (ev->kind == UWB_EV_BEACON_MISS) {
             if (++c->miss_count >= UWB_NET_MISS_MAX) {
                 c->state = UWB_ST_SCAN; c->miss_count = 0;

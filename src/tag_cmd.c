@@ -353,7 +353,8 @@ static void tag_cmd_on_rx(const uint8_t *data, uint16_t len)
 	}
 
 #ifdef CONFIG_TAG_CAL_MODE
-	if (strncmp(buf, "cal listen", 10) == 0 || strncmp(buf, "cal probe", 9) == 0) {
+	if (strncmp(buf, "cal listen", 10) == 0 || strncmp(buf, "cal probe", 9) == 0 ||
+	    strncmp(buf, "cal set", 7) == 0) {
 		cal_diag_on_rx(data, len);
 		return;
 	}

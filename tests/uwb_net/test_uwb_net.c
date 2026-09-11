@@ -362,6 +362,112 @@ static void test_foreign_phase_absent_from_map_is_ignored(void)
     }
 }
 
+/* A re-GRANT from a KEEPALIVE-triggered re-phase (gw_core.h's
+ * GW_KEEPALIVE_REPHASED) must update the tag's bookkeeping in place, without
+ * touching state or triggering rediscovery -- the tag is already ranging
+ * against a live seat, only which superframes are its own has changed. */
+static void test_regrant_while_ranging_updates_phase_mask(void)
+{
+    const uint16_t old_mask = (uint16_t)(1u << 5);
+    struct uwb_net_ctx c;
+    to_ranging_phase(&c, UWB_TIER_FAST, old_mask);
+
+    const uint16_t new_mask = (uint16_t)((1u << 0) | (1u << 4) | (1u << 8) | (1u << 12));
+    struct uwb_net_event g = ev_grant_phase(c.short_addr, 7, UWB_TIER_SLOW, 40, new_mask);
+    uint32_t a = uwb_net_handle(&c, &g);
+
+    CHECK(a == UWB_ACT_NONE);
+    CHECK(c.state == UWB_ST_RANGING);
+    CHECK(c.slot_index == 7);
+    CHECK(c.tier == UWB_TIER_SLOW);
+    CHECK(c.lease_remaining == 40);
+    CHECK(c.phase_mask == new_mask);
+
+    /* The new mask, not the old one, now governs foreign-phase gating: a
+     * beacon on the tag's NEW phase 0, in_map true, must be accepted. */
+    struct uwb_net_event b = ev_beacon(0u, true, 7);
+    CHECK(!(uwb_net_handle(&c, &b) & UWB_ACT_TO_SCAN));
+    CHECK(c.state == UWB_ST_RANGING);
+}
+
+/* Same case as above, but from UWB_ST_DISCOVER -- a re-GRANT must not bounce
+ * a still-discovering tag back to JOINING/SCAN or restart discovery. */
+static void test_regrant_while_discover_updates_phase_mask(void)
+{
+    struct uwb_net_ctx c; uwb_net_init(&c, EUI);
+    struct uwb_net_event b = ev_beacon(0, false, 0);
+    uwb_net_handle(&c, &b);                                     /* -> JOINING */
+    const uint16_t old_mask = (uint16_t)(1u << 5);
+    struct uwb_net_event g = ev_grant_phase(0x0007, 3, UWB_TIER_FAST, 50, old_mask);
+    uwb_net_handle(&c, &g);                                     /* -> DISCOVER */
+    CHECK(c.state == UWB_ST_DISCOVER);
+
+    const uint16_t new_mask = (uint16_t)(1u << 9);
+    struct uwb_net_event g2 = ev_grant_phase(c.short_addr, 3, UWB_TIER_SLOW, 40, new_mask);
+    uint32_t a = uwb_net_handle(&c, &g2);
+
+    CHECK(a == UWB_ACT_NONE);
+    CHECK(c.state == UWB_ST_DISCOVER);          /* not restarted, not JOINING */
+    CHECK(c.tier == UWB_TIER_SLOW);
+    CHECK(c.lease_remaining == 40);
+    CHECK(c.phase_mask == new_mask);
+
+    /* Regression: the FSM must gate on the NEW mask from here on. A beacon on
+     * the OLD phase (5), absent, must now be ignored as foreign -- if the
+     * mask update had not taken, this would instead be read as our own
+     * granted phase and, being absent, force a re-JOIN. */
+    struct uwb_net_event stale = ev_beacon(5u, false, 0);
+    CHECK(!(uwb_net_handle(&c, &stale) & UWB_ACT_TO_SCAN));
+    CHECK(c.state == UWB_ST_DISCOVER);
+}
+
+/* A GRANT naming a different short_addr reaching the FSM would be a
+ * wire-level bug, not a normal event -- it must be ignored outright rather
+ * than applied. */
+static void test_regrant_for_wrong_addr_is_ignored(void)
+{
+    const uint16_t mask = (uint16_t)(1u << 5);
+    struct uwb_net_ctx c;
+    to_ranging_phase(&c, UWB_TIER_FAST, mask);
+
+    uint16_t   slot_before  = c.slot_index;
+    uwb_tier_t tier_before  = c.tier;
+    uint16_t   lease_before = c.lease_remaining;
+    uint16_t   mask_before  = c.phase_mask;
+
+    struct uwb_net_event g = ev_grant_phase((uint16_t)(c.short_addr + 1), 9,
+                                            UWB_TIER_IDLE, 5, 0x0001u);
+    uint32_t a = uwb_net_handle(&c, &g);
+
+    CHECK(a == UWB_ACT_NONE);
+    CHECK(c.state == UWB_ST_RANGING);
+    CHECK(c.slot_index == slot_before);
+    CHECK(c.tier == tier_before);
+    CHECK(c.lease_remaining == lease_before);
+    CHECK(c.phase_mask == mask_before);
+}
+
+/* Accepted residual risk (see the phase-set-change plan): there is no retry
+ * for a LOST re-GRANT. If the gateway's regrant() moves the tag off a phase
+ * it still believes it holds and the re-GRANT frame itself never arrives,
+ * the tag finds out the same way it always has -- a beacon on that stale
+ * phase shows it absent -- and the existing fallback must still catch it. */
+static void test_stale_mask_after_lost_regrant_forces_rejoin(void)
+{
+    const uint16_t stale_mask = (uint16_t)(1u << 5);
+    struct uwb_net_ctx c;
+    to_ranging_phase(&c, UWB_TIER_FAST, stale_mask);
+
+    /* The gateway reallocated this tag off phase 5 (a lost re-GRANT never
+     * updated c.phase_mask), so the next beacon covering phase 5 shows the
+     * tag genuinely absent from a phase it still believes is its own. */
+    struct uwb_net_event b = ev_beacon(5u, false, 0);
+    uint32_t a = uwb_net_handle(&c, &b);
+
+    CHECK(a & UWB_ACT_TO_SCAN);
+    CHECK(c.state == UWB_ST_SCAN);
+}
+
 /* KEEPALIVE fires only after UWB_NET_KEEPALIVE_AFTER_N participations with no
  * POS frame sent, once the lease is low -- a real POS transmission (stronger
  * liveness proof, Task 12) resets the count and suppresses it again. */
@@ -971,6 +1077,10 @@ int main(void)
     test_multi_phase_mover_participates_n_times_per_cycle();
     test_phase_mask_disagreement_forces_rejoin();
     test_foreign_phase_absent_from_map_is_ignored();
+    test_regrant_while_ranging_updates_phase_mask();
+    test_regrant_while_discover_updates_phase_mask();
+    test_regrant_for_wrong_addr_is_ignored();
+    test_stale_mask_after_lost_regrant_forces_rejoin();
     test_phase_skip_to_next();
     test_keepalive_suppressed_until_n_participations_without_pos();
     test_phase_active_wrap_does_not_skip_phase();

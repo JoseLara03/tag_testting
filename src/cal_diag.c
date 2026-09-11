@@ -15,6 +15,7 @@
 #include "uwb_ss_initiator.h"   /* twr_log() */
 #include "cal.h"                /* cal_is_valid(), cal_get_ant_dly() */
 #include "cal_math.h"           /* cal_split_dly() -- TEMPORARY probe-delay-override diagnostic */
+#include "cal_run.h"            /* cal_store() -- `cal set` */
 #include "phy_config.h"         /* TX_ANT_DLY / RX_ANT_DLY fallback */
 #include "deca_device_api.h"
 
@@ -60,7 +61,18 @@ static struct k_thread cal_diag_tid;
 
 /* Claim the radio and drive it with interrupts fully disabled: this module
  * polls SYS_STATUS_LO by hand, and an enabled IRQ would clear the very bits
- * being polled for before the poll could see them. */
+ * being polled for before the poll could see them.
+ *
+ * Also loads the antenna delay explicitly, the same way every other claim
+ * site in this codebase does (cal_run_claim_radio()+cal_run_apply_total_dly()
+ * in cal_run.c; uwb_ss_initiator.c and uwb_net_runner.c's own claims). This
+ * module used to rely on release_radio() having left the calibrated value
+ * resident in hardware from some EARLIER operation -- true only if a `cal`
+ * run or another probe already happened in the same boot. A `cal probe` run
+ * as the first command after a fresh flash/boot silently ran on whatever the
+ * driver's raw reset default was, not the stored calibration, which reads as
+ * "calibration converged but probing still shows meters of error" with
+ * nothing in the code pointing at why. */
 static bool claim_radio(void)
 {
     if (!uwb_radio_request(CAL_DIAG_RADIO_WAIT)) {
@@ -69,6 +81,17 @@ static bool claim_radio(void)
     dwt_forcetrxoff();
     dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
     dwt_setinterrupt(0xFFFFFFFFU, 0xFFFFFFFFU, DWT_DISABLE_INT);
+
+    uint16_t tx, rx;
+
+    if (cal_is_valid()) {
+        cal_get_ant_dly(&tx, &rx);
+    } else {
+        tx = TX_ANT_DLY;
+        rx = RX_ANT_DLY;
+    }
+    dwt_settxantennadelay(tx);
+    dwt_setrxantennadelay(rx);
     return true;
 }
 
@@ -262,20 +285,34 @@ static void do_probe(uint32_t param)
     uint8_t  type_byte   = buf[TYPE_BYTE_IDX];
     uint16_t plen        = (uint16_t)(flen - FCS_LEN);
 
-    /* Corrected distance, wire_id==0 (non-addressed calibration frame) only:
-     * the exact same clock-offset-corrected ToF formula cal_range_poll()
-     * uses in cal_run.c, applied to this single isolated exchange. Lets an
-     * operator compare one clean sample directly against a `cal <mm>` run's
-     * per-iteration error, with none of that loop's averaging, outlier
-     * rejection, or antenna-delay correction between samples. Not computed
-     * for an addressed (anchor) probe -- that is not the frame `cal <mm>`
-     * uses, so it is out of scope for this comparison. */
-    bool    have_dist = false;
-    int32_t dist_mm   = 0;
+    /* Corrected distance for BOTH probe kinds: the exact same clock-offset-
+     * corrected ToF formula cal_range_poll() (cal_run.c) and
+     * do_one_range_anchor() (uwb_ss_initiator.c) use, applied to this single
+     * isolated exchange. Lets an operator compare one clean sample directly
+     * against either a `cal <mm>` run's per-iteration error or a live
+     * MULTI-POLL sweep's per-anchor range, with none of a loop's averaging,
+     * outlier rejection, or (for MULTI-POLL) stagger scheduling in the way --
+     * this is the single-poll baseline to check that path against.
+     *
+     * wire_id==0 reads the non-addressed calibration frame's timestamp
+     * offsets; wire_id in 1..4 reads the addressed positioning frame's
+     * offsets, shifted by the anchor-id byte, and also checks that the
+     * response actually came from the anchor asked (same check
+     * do_one_range_anchor() makes) rather than trusting the header match
+     * alone. */
+    bool     have_dist   = false;
+    int32_t  dist_mm     = 0;
+    uint16_t poll_rx_idx = (wire_id == 0) ? UWB_WAVE_RESP_POLL_RX_TS_IDX
+                                           : UWB_WAVE_POS_POLL_RX_TS_IDX;
+    uint16_t resp_tx_idx = (wire_id == 0) ? UWB_WAVE_RESP_RESP_TX_TS_IDX
+                                           : UWB_WAVE_POS_RESP_TX_TS_IDX;
+    bool     id_ok       = (wire_id == 0) ||
+                            (flen > UWB_WAVE_POS_ANCHOR_ID_IDX + FCS_LEN &&
+                             buf[UWB_WAVE_POS_ANCHOR_ID_IDX] == (uint8_t)wire_id);
 
-    if (wire_id == 0 && flen >= UWB_WAVE_RESP_RESP_TX_TS_IDX + 4 + FCS_LEN) {
-        uint32_t poll_rx_ts = get_ts_4b(&buf[UWB_WAVE_RESP_POLL_RX_TS_IDX]);
-        uint32_t resp_tx_ts = get_ts_4b(&buf[UWB_WAVE_RESP_RESP_TX_TS_IDX]);
+    if (id_ok && flen >= resp_tx_idx + 4 + FCS_LEN) {
+        uint32_t poll_rx_ts = get_ts_4b(&buf[poll_rx_idx]);
+        uint32_t resp_tx_ts = get_ts_4b(&buf[resp_tx_idx]);
         double   clock_offset_ratio =
             ((double)dwt_readclockoffset()) / (uint32_t)(1 << 26);
 
@@ -391,6 +428,39 @@ void cal_diag_on_rx(const uint8_t *data, uint16_t len)
         if (k_msgq_put(&cal_diag_q, &req, K_NO_WAIT) != 0) {
             twr_log("F busy\n");
         }
+        return;
+    }
+
+    /* `cal set <total>` -- commit a manually-derived combined antenna delay
+     * straight to NVS, bypassing cal_run.c's DWM3001CDK-driven auto-solve
+     * entirely. Exists for calibrating against a trusted ANCLA anchor
+     * instead: read a clean sample with `cal probe <id>`, compare to a laser-
+     * measured true distance, verify a candidate total live with
+     * `cal probe <total>` (n>4, no NVS write), then commit the verified value
+     * here. No radio involved -- this is a pure NVS write, so it runs
+     * synchronously in the BLE RX thread like `cal clear`/`cal last`, not
+     * through cal_diag_q. */
+    if (strncmp(buf, "cal set", 7) == 0) {
+        const char *arg = buf + 7;
+
+        while (*arg == ' ') {
+            arg++;
+        }
+        uint32_t total;
+
+        if (!parse_u32(arg, &total) || total == 0 || total > CAL_MAX_TOTAL_DLY) {
+            twr_log("CAL ERR set total\n");
+            return;
+        }
+
+        uint16_t tx, rx;
+
+        cal_split_dly((uint16_t)total, &tx, &rx);
+        if (cal_store(tx, rx, 0, 0) != 0) {
+            twr_log("CAL FAIL nvs\n");
+            return;
+        }
+        twr_log("CAL SET %u/%u\n", tx, rx);
         return;
     }
 }

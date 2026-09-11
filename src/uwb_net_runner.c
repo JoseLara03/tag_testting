@@ -1043,6 +1043,47 @@ static void runner_fn(void *p1, void *p2, void *p3)
             if (klen > 0) {
                 uint8_t mslot = (uint8_t)(sys_rand32_get() % N_CAP);
                 uwb_radio_tx_cap(ka_buf, (size_t)klen, mslot);
+
+                /* Listen briefly for a re-GRANT, mirroring the JOIN path
+                 * above -- a KEEPALIVE that changes req_tier can grow or
+                 * shrink this tag's phase set (gw_core.h's
+                 * GW_KEEPALIVE_REPHASED), and without this listen the tag
+                 * would never learn its new phase_mask, leaving it ranging
+                 * on a stale single phase forever. Deliberately no
+                 * UWB_EV_GRANT_MISS here, unlike JOIN: GW_KEEPALIVE_SAME --
+                 * the overwhelmingly common case -- produces no gateway
+                 * transmission at all, so treating every silent window as a
+                 * miss worth reacting to would be wrong; a lost re-GRANT is
+                 * instead caught later by the existing foreign-phase/in_map
+                 * check in uwb_net.c dropping the tag to SCAN. */
+                uint8_t grant_buf[UWB_FRAME_LEN_GRANT];
+                int glen = uwb_radio_rx_beacon(grant_buf, sizeof(grant_buf),
+                                               (uint32_t)N_CAP * T_MINISLOT_MS + T_GUARD_MS);
+
+                if (glen == UWB_FRAME_LEN_GRANT &&
+                    uwb_frame_is_grant(grant_buf, (size_t)glen)) {
+
+                    uint8_t  geui[UWB_FRAME_EUI_LEN];
+                    uint16_t gaddr = 0;
+                    uint8_t  gslot = 0, gtier = 0;
+                    uint16_t glease = 0, gphase = 0;
+
+                    if (uwb_frame_parse_grant(grant_buf, (size_t)glen,
+                                              geui, &gaddr, &gslot,
+                                              &gtier, &glease, &gphase) == 0 &&
+                        memcmp(geui, runner_eui, UWB_FRAME_EUI_LEN) == 0) {
+
+                        struct uwb_net_event gev = { 0 };
+                        gev.kind         = UWB_EV_GRANT;
+                        gev.g_short_addr = gaddr;
+                        gev.g_slot       = gslot;
+                        gev.g_tier       = gtier;
+                        gev.g_lease      = glease;
+                        gev.g_phase_mask = gphase;
+                        act |= uwb_net_gate_actions(uwb_net_handle(&ctx, &gev),
+                                                    cal_is_valid());
+                    }
+                }
             }
         }
 
@@ -1238,12 +1279,16 @@ static void runner_fn(void *p1, void *p2, void *p3)
                  * evaluated at the snapshot point rather than the filtered
                  * one. */
                 if (solved) {
-                    float fx, fy;
-
-                    if (pos_ekf_get(&ekf, &fx, &fy, NULL, NULL)) {
-                        pos.x = fx;
-                        pos.y = fy;
-                    }
+                    /* TEMPORARY diagnostic: publish the raw snapshot solve,
+                     * not the EKF's filtered (fx, fy), to isolate whether the
+                     * large position jumps seen while the tag is moving come
+                     * from the snapshot solve itself or are introduced/
+                     * amplified by the filter. The EKF keeps running
+                     * unchanged above (seed/predict/update/zupt) so its state
+                     * stays valid for re-enabling this overwrite later --
+                     * only the publish path bypasses it. Revert by restoring
+                     * the pos_ekf_get()-then-overwrite here once the raw vs.
+                     * filtered comparison is done. */
                     position_publish(&pos, (uint8_t)n, ctx.short_addr);
                 }
 
