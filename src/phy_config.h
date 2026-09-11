@@ -3,7 +3,12 @@
 #ifndef PHY_CONFIG_H_
 #define PHY_CONFIG_H
 
-#define CONFIG_OPTION CONFIG_OPTION_07
+#define CONFIG_OPTION CONFIG_OPTION_42
+
+/* Experimental channel 5, PLEN 256, PAC16, code 9, 6.8 Mbps,
+ * 4z 8-symbol SFD, STS off. Separate ID preserves calibration validation:
+ * a stored option-07 record is not valid for this PHY. */
+#define CONFIG_OPTION_42 42
 
 /* Factory-reference antenna delay (device time units), split equally between
  * TX and RX. This is ONLY the seed/fallback used by the calibration routine on
@@ -43,7 +48,7 @@
  */
 // #define CONFIG_OPTION_06 6
 
-/* Configuration option 07 (ACTIVE).
+/* Configuration option 07 (baseline).
  * Channel 5, PRF 64M, Preamble Length 1024, PAC 32, Preamble code 9, Data Rate 850k, STS Length 64
  */
 #define CONFIG_OPTION_07 7
