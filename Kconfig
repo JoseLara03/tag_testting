@@ -11,6 +11,13 @@ config TAG_CAL_MODE
 
 	  Never ship this. It holds no network seat and reports no position.
 
+config TAG_SWEEP_TIMING
+	bool "Measure MULTI-POLL through EA (bench only)"
+	depends on PRINTK
+	help
+	  Emit one timing record after each sweep. Suppresses hot-path
+	  SWEEP/MPOL printk probes. Does not change radio deadlines.
+
 endmenu
 
 source "Kconfig.zephyr"

@@ -64,6 +64,25 @@ int uwb_multipoll_sweep(struct pos_meas *out_by_slot, bool *ok_out,
 void position_publish(const struct pos_result *pos, uint8_t n_anchors,
                       uint16_t src_addr);
 
+#ifdef CONFIG_TAG_SWEEP_TIMING
+/* Runner-owned snapshot: MCU microseconds from sweep entry; air_rx_dtu uses
+ * DW3000 RMARKER differences, not MCU time. Zero means not observed.
+ * mpol: 0 not called, 1 invalid/build, 2 start failed, 3 TX timeout,
+ *       4 receive incomplete, 5 complete. ea: 0 skipped, 1 build failed,
+ *       2 start failed, 3 TX timeout, 4 TXFRS observed (not gateway ACK). */
+struct uwb_sweep_timing {
+    uint32_t start_cyc, poll_arm_us, poll_done_us, last_rx_us;
+    uint32_t first_rx_us, rearm_max_us;
+    uint32_t air_rx_dtu[4];
+    uint8_t ids[4], requested, received, mpol, ea;
+};
+extern struct uwb_sweep_timing uwb_sweep_timing;
+static inline uint32_t uwb_sweep_elapsed_us(void)
+{
+    return k_cyc_to_us_floor32(k_cycle_get_32() - uwb_sweep_timing.start_cyc);
+}
+#endif
+
 /* Last position cached by position_publish(), for the alert frame's last_x/
  * last_y. Returns false (leaving the pointed-to x and y untouched) when there
  * has never been a fix -- the caller sends NaN in that case. */

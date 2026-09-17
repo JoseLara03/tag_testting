@@ -289,43 +289,72 @@ bool do_one_range_anchor(uint8_t aid, float *range_m, float *ax, float *ay)
  * these values (its own RX timestamp of this poll, plus its slot's delay_us),
  * so the two constants must stay matched to that arithmetic, not just to each
  * other. */
-#define MPOL_BASE_UUS   2200U   /* first response: ~2050 uus anchor turnaround + margin */
+/* First response's delay. Was 2200 (~2050 uus anchor turnaround BY ANALOGY
+ * with the legacy WAVE responder -- never measured on this path). ANCLA's
+ * mpol_turnaround_probe (anchor_respond_multipoll(), removed once this number
+ * was captured) measured the real RX(MULTI-POLL)->armed(MPOL_RESP) floor at
+ * 367-391 uus, consistent across all 4 anchors. Hard floor = worst_observed +
+ * preamble + SFD (PLEN_512 + 8-symbol SFD = 520 uus -- 1 UUS is 1 preamble
+ * symbol, and dwt_setdelayedtrxtime() schedules the RMARKER, not physical TX
+ * start, so the preamble must clear before the scheduled instant) = 911 uus.
+ * A naive margin (+240, matching what worked for the WAVE constant) was NOT
+ * enough here: 1150 lost the first slot on ~100% of sweeps (deterministic --
+ * the same rank failed every time regardless of which physical anchor
+ * occupied it, not jitter). 1250 (+339) cut the failures but still lost the
+ * slot often enough to matter. 1400 (+489, ~2x the naive margin) is clean
+ * across all 4 anchors. Do not re-derive a smaller value from the 911 floor
+ * alone -- this path's real margin requirement is well above the arithmetic
+ * floor, for reasons not fully isolated on the bench. */
+#define MPOL_BASE_UUS   1400U
 /* Stagger step. Was 1700 (derived from response airtime alone), which lost one
  * response on nearly every sweep: the collection loop below re-arms the
  * receiver per frame (setrxtimeout / setpreambledetecttimeout / setinterrupt /
  * rxenable, four SPI transactions plus the interrupt and the frame read), and
- * airtime is not what has to fit between two RMARKERs. The real budget is
- *
- *   slot >= tail(i) + rearm + preamble(i+1)
- *
- * and `preamble` is the trap: dwt_setdelayedtrxtime() schedules the RMARKER,
- * not the physical start, so the PLEN_1024 preamble (~1050 us) is transmitted
- * BEFORE the next slot's instant. With a ~320 us frame tail that leaves
- * 1744 - 1370 = ~370 us of re-arm budget at the old value -- marginal, which
- * is why the tag caught slot 1 only intermittently and reported n=2 with a
- * rotating cast of anchors. 2400 uus (~2462 us) gives ~1090 us instead.
- * Bench-observed before the change: SWEEP n=2 on every sweep with three
- * anchors answering every poll on the gateway's sniffer.
+ * airtime is not what has to fit between two RMARKERs. 2400 fixed that, but
+ * was never the real floor either -- just the first value that happened to
+ * work. Real constraint is the tag's own RX rearm turnaround, measured via
+ * CONFIG_TAG_SWEEP_TIMING's rearm_us in the TIM log over a large bench
+ * sample: worst case 1373 uus, best case 1129 -- clearly the binding floor,
+ * not per-frame airtime (~600 uus at PLEN_512/6.8 Mbps, well under rearm).
+ * 1600/1700/1750 all failed the SAME way: exactly 2 anchors dropped per
+ * sweep, not a gradually rising miss rate -- a late rearm for one slot pushes
+ * the tag behind schedule for the next one too, so a marginal value costs
+ * two anchors at once, not one. 1800 is a clean cliff edge, not a gradual
+ * improvement -- do not shave further chasing marginal gains; past this
+ * point the failure mode is a cascade, not a small miss rate.
  * This constant is written into each slot's delay_us and the anchor simply
  * obeys it, so it needs no matching change on the anchor side. */
-#define MPOL_SLOT_UUS   2400U
-/* Covers MPOL_BASE_UUS + 3*MPOL_SLOT_UUS (9400 uus ~= 9.64 ms) + one
- * response's airtime + margin for 4 anchors. Grew with MPOL_SLOT_UUS above:
- * the old 12 ms would have truncated the fourth slot. Still well inside
- * T_SLOT_MS (24 ms). Task 9 re-derives T_SLOT_MS from a hardware measurement
- * of the real occupancy (Step 4 below) -- re-check this window against that
- * measurement before relying on it beyond the bench. */
+#define MPOL_SLOT_UUS   1800U
+/* Covers MPOL_BASE_UUS + 3*MPOL_SLOT_UUS (6800 uus ~= 6.8 ms, down from the
+ * original 9400 uus/9.64 ms) + one response's airtime + margin for 4
+ * anchors. Still well inside T_SLOT_MS (24 ms), now with more headroom than
+ * before -- worth re-deriving on its own bench pass if further session
+ * shortening is wanted, same margin-hunting discipline as the two constants
+ * above. Task 9 re-derives T_SLOT_MS from a hardware measurement of the real
+ * occupancy (Step 4 below) -- re-check this window against that measurement
+ * before relying on it beyond the bench. */
 #define MPOL_WINDOW_MS    15U
+
+#ifdef CONFIG_TAG_SWEEP_TIMING
+struct uwb_sweep_timing uwb_sweep_timing;
+#endif
 
 int uwb_multipoll_sweep(struct pos_meas *out_by_slot, bool *ok_out,
                         const uint8_t *anchor_ids, uint8_t n_anchors,
                         uint16_t src_addr, float dz_fallback, float tag_h_m,
                         uint8_t *real_z_count_out)
 {
+#ifdef CONFIG_TAG_SWEEP_TIMING
+    uwb_sweep_timing.mpol = 1;
+#endif
     if (!out_by_slot || !ok_out || !anchor_ids || n_anchors == 0 ||
         n_anchors > UWB_FRAME_MAX_ANCHORS) {
         return 0;
     }
+#ifdef CONFIG_TAG_SWEEP_TIMING
+    uwb_sweep_timing.requested = n_anchors;
+    memcpy(uwb_sweep_timing.ids, anchor_ids, n_anchors);
+#endif
     for (uint8_t i = 0; i < n_anchors; i++) {
         ok_out[i] = false;
     }
@@ -361,17 +390,28 @@ int uwb_multipoll_sweep(struct pos_meas *out_by_slot, bool *ok_out,
     dwt_setinterrupt(DWT_INT_TXFRS_BIT_MASK, 0, DWT_ENABLE_INT_ONLY);
     dwt_writetxdata((uint16_t)mlen, mbuf, 0);
     dwt_writetxfctrl((uint16_t)(mlen + FCS_LEN), 0, 0);
+#ifdef CONFIG_TAG_SWEEP_TIMING
+    uwb_sweep_timing.poll_arm_us = uwb_sweep_elapsed_us();
+    uwb_sweep_timing.mpol = 2;
+#endif
     if (dwt_starttx(DWT_START_TX_IMMEDIATE) != DWT_SUCCESS) {
         dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
         return 0;
     }
 
+#ifdef CONFIG_TAG_SWEEP_TIMING
+    uwb_sweep_timing.mpol = 3;
+#endif
     irq_evt_t tx_evt = wait_event(K_MSEC(10));
     dwt_writesysstatuslo(DWT_INT_TXFRS_BIT_MASK |
                          SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
     if (tx_evt != EVT_TXFRS) {
         return 0;
     }
+#ifdef CONFIG_TAG_SWEEP_TIMING
+    uwb_sweep_timing.poll_done_us = uwb_sweep_elapsed_us();
+    uwb_sweep_timing.mpol = 4;
+#endif
     uint32_t poll_tx_ts = dwt_readtxtimestamplo32();
 
     /* Collect responses for the FULL remaining window each iteration, never a
@@ -384,6 +424,10 @@ int uwb_multipoll_sweep(struct pos_meas *out_by_slot, bool *ok_out,
     size_t n = 0;
     uint32_t t_end = k_uptime_get_32() + MPOL_WINDOW_MS;
 
+#ifdef CONFIG_TAG_SWEEP_TIMING
+    uint32_t rearm_from_cyc = 0;
+    bool have_rx_event = false;
+#endif
     while (n < (size_t)n_anchors) {
         int32_t rem = (int32_t)(t_end - k_uptime_get_32());
         if (rem <= 0) {
@@ -394,11 +438,26 @@ int uwb_multipoll_sweep(struct pos_meas *out_by_slot, bool *ok_out,
         dwt_setpreambledetecttimeout(0);
         dwt_setinterrupt(INT_RX_PHASE, 0, DWT_ENABLE_INT_ONLY);
         dwt_rxenable(DWT_START_RX_IMMEDIATE);
+#ifdef CONFIG_TAG_SWEEP_TIMING
+        if (!uwb_sweep_timing.first_rx_us) {
+            uwb_sweep_timing.first_rx_us = uwb_sweep_elapsed_us();
+        }
+        if (have_rx_event) {
+            uint32_t rearm_us = k_cyc_to_us_floor32(k_cycle_get_32() - rearm_from_cyc);
+            if (rearm_us > uwb_sweep_timing.rearm_max_us) {
+                uwb_sweep_timing.rearm_max_us = rearm_us;
+            }
+        }
+#endif
 
         irq_evt_t evt = wait_event(K_MSEC((uint32_t)rem));
+#ifdef CONFIG_TAG_SWEEP_TIMING
+        rearm_from_cyc = k_cycle_get_32();
+        have_rx_event = true;
+#endif
         if (evt != EVT_RXFCG) {
             dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
-#ifdef CONFIG_PRINTK
+#if defined(CONFIG_PRINTK) && !defined(CONFIG_TAG_SWEEP_TIMING)
             /* TEMPORARY. Passive -- changes no behaviour. A sweep that ends
              * with fewer responses than anchors polled shows up here as the
              * window expiring; pair it with the MPOL arrival times below to
@@ -413,7 +472,7 @@ int uwb_multipoll_sweep(struct pos_meas *out_by_slot, bool *ok_out,
         if (flen <= FCS_LEN ||
             (flen - FCS_LEN) != UWB_FRAME_LEN_MPOL_RESP) {
             dwt_writesysstatuslo(DWT_INT_RXFCG_BIT_MASK);
-#ifdef CONFIG_PRINTK
+#if defined(CONFIG_PRINTK) && !defined(CONFIG_TAG_SWEEP_TIMING)
             printk("  MPOL wronglen=%u\n", (unsigned)flen);
 #endif
             continue;
@@ -464,6 +523,11 @@ int uwb_multipoll_sweep(struct pos_meas *out_by_slot, bool *ok_out,
         out_by_slot[slot].y       = ay;
         out_by_slot[slot].dz      = real_z ? (az - tag_h_m) : dz_fallback;
         out_by_slot[slot].range_m = (float)(tof * SPEED_OF_LIGHT);
+#ifdef CONFIG_TAG_SWEEP_TIMING
+        uwb_sweep_timing.last_rx_us = uwb_sweep_elapsed_us();
+        uwb_sweep_timing.air_rx_dtu[slot] = resp_rx_ts - poll_tx_ts;
+        uwb_sweep_timing.received++;
+#endif
         ok_out[slot] = true;
         n++;
         if (real_z && real_z_count_out) {
@@ -471,6 +535,9 @@ int uwb_multipoll_sweep(struct pos_meas *out_by_slot, bool *ok_out,
         }
     }
 
+#ifdef CONFIG_TAG_SWEEP_TIMING
+    uwb_sweep_timing.mpol = n == n_anchors ? 5 : 4;
+#endif
     return (int)n;
 }
 
@@ -516,6 +583,9 @@ bool pos_last_get(float *x, float *y)
 void position_publish(const struct pos_result *pos, uint8_t n_anchors,
                       uint16_t src_addr)
 {
+#ifdef CONFIG_TAG_SWEEP_TIMING
+    uwb_sweep_timing.ea = 1;
+#endif
     char xs[16], ys[16];
 
     last_pos_x     = pos->x;
@@ -549,6 +619,9 @@ void position_publish(const struct pos_result *pos, uint8_t n_anchors,
     dwt_writetxdata((uint16_t)len, buf, 0);
     dwt_writetxfctrl((uint16_t)(len + FCS_LEN), 0, 0);
 
+#ifdef CONFIG_TAG_SWEEP_TIMING
+    uwb_sweep_timing.ea = 2;
+#endif
     if (dwt_starttx(DWT_START_TX_IMMEDIATE) != DWT_SUCCESS) {
         dwt_forcetrxoff();
         dwt_writesysstatuslo(SYS_STATUS_ALL_RX_TO | SYS_STATUS_ALL_RX_ERR);
@@ -562,8 +635,14 @@ void position_publish(const struct pos_result *pos, uint8_t n_anchors,
      * ~1.3 ms of airtime; 30 iterations at 100 us each is ~3 ms, leaving
      * headroom against T_SLOT_MS=24 while still catching a stuck radio well
      * short of the next tag's slot. */
+#ifdef CONFIG_TAG_SWEEP_TIMING
+    uwb_sweep_timing.ea = 3;
+#endif
     for (int i = 0; i < 30; i++) {
         if (dwt_readsysstatuslo() & DWT_INT_TXFRS_BIT_MASK) {
+#ifdef CONFIG_TAG_SWEEP_TIMING
+            uwb_sweep_timing.ea = 4;
+#endif
             dwt_writesysstatuslo(DWT_INT_TXFRS_BIT_MASK);
             return;
         }

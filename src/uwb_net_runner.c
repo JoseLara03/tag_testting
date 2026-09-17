@@ -1186,9 +1186,17 @@ static void runner_fn(void *p1, void *p2, void *p3)
                  * prevent. A motion edge or a HELP press waits the few ms. */
                 uwb_radio_sleep_until_strict(slot_start);
 
+#ifdef CONFIG_TAG_SWEEP_TIMING
+                memset(&uwb_sweep_timing, 0, sizeof(uwb_sweep_timing));
+                uwb_sweep_timing.start_cyc = k_cycle_get_32();
+                int32_t late_ms = (int32_t)(uwb_radio_now_ms() - slot_start);
+#endif
                 struct pos_meas meas[POS_MAX_ANCHORS];
                 int n = uwb_radio_sweep(meas, POS_MAX_ANCHORS);
 
+#ifdef CONFIG_TAG_SWEEP_TIMING
+                uint32_t range_us = uwb_sweep_elapsed_us();
+#endif
                 uwb_sweep_gate_swept(&sweep_gate, (uint8_t)(n > 0 ? n : 0));
 
                 /* Seed the solve from the filter. Gauss-Newton converges more
@@ -1203,7 +1211,10 @@ static void runner_fn(void *p1, void *p2, void *p3)
                 struct pos_result pos;
                 bool solved = (n >= 3) &&
                               pos_solve(meas, (size_t)n, seed_p, &pos);
-#ifdef CONFIG_PRINTK
+#ifdef CONFIG_TAG_SWEEP_TIMING
+                uint32_t solve_us = uwb_sweep_elapsed_us() - range_us;
+#endif
+#if defined(CONFIG_PRINTK) && !defined(CONFIG_TAG_SWEEP_TIMING)
                 /* TEMPORARY, last of the bring-up probes. A fix is published
                  * only when (n >= 3 && pos_solve()) -- two very different
                  * failures that are indistinguishable from outside, since
@@ -1278,6 +1289,9 @@ static void runner_fn(void *p1, void *p2, void *p3)
                  * not a statement about the filter's confidence, and it is
                  * evaluated at the snapshot point rather than the filtered
                  * one. */
+#ifdef CONFIG_TAG_SWEEP_TIMING
+                uint32_t before_ea_us = uwb_sweep_elapsed_us();
+#endif
                 if (solved) {
                     /* TEMPORARY diagnostic: publish the raw snapshot solve,
                      * not the EKF's filtered (fx, fy), to isolate whether the
@@ -1291,6 +1305,29 @@ static void runner_fn(void *p1, void *p2, void *p3)
                      * filtered comparison is done. */
                     position_publish(&pos, (uint8_t)n, ctx.short_addr);
                 }
+
+#ifdef CONFIG_TAG_SWEEP_TIMING
+                uint32_t total_us = uwb_sweep_elapsed_us();
+                static uint32_t timing_seq;
+                const struct uwb_sweep_timing *tm = &uwb_sweep_timing;
+                /* All printing follows EA completion/failure; no formatting
+                 * while responses are arriving or before the EA transmit. */
+                printk("TIM seq=%u slot=%u late_ms=%d req=%u got=%u mpol=%u solved=%u ea=%u arm_us=%u tx_us=%u last_us=%u rx_ready_us=%u rearm_us=%u range_us=%u solve_us=%u post_us=%u ea_us=%u total_us=%u\n",
+                       ++timing_seq, ctx.slot_index, late_ms, tm->requested,
+                       tm->received, tm->mpol, solved, tm->ea,
+                       tm->poll_arm_us, tm->poll_done_us, tm->last_rx_us,
+                       tm->first_rx_us, tm->rearm_max_us,
+                       range_us, solve_us, before_ea_us - range_us - solve_us,
+                       total_us - before_ea_us, total_us);
+                uint32_t air_us[4];
+                for (unsigned i = 0; i < 4; ++i) {
+                    air_us[i] = (uint32_t)((uint64_t)tm->air_rx_dtu[i] * 10u / 638976u);
+                }
+                printk("TIM_RX seq=%u a=%u,%u,%u,%u us=%u,%u,%u,%u\n",
+                       timing_seq, tm->ids[0], tm->ids[1], tm->ids[2], tm->ids[3],
+                       air_us[0], air_us[1],
+                       air_us[2], air_us[3]);
+#endif
 
                 /* TEMPORARY: raw-range capture for EKF tuning -- remove with
                  * the module. Quality is passed NULL: the per-range

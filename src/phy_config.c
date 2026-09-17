@@ -4,14 +4,14 @@
 /* Matches ANCLA_ESP32S3/src/uwb_phy.h for both CAL and PROD images. */
 dwt_config_t config_options = {
     5,                    /* Channel. */
-    DWT_PLEN_256,          /* TX preamble length. */
+    DWT_PLEN_512,          /* TX preamble length. */
     DWT_PAC16,             /* RX acquisition chunk. */
     9, 9,                 /* TX/RX preamble codes. */
     3,                    /* 4z 8-symbol SFD. */
     DWT_BR_6M8,
     DWT_PHRMODE_STD,
     DWT_PHRRATE_STD,
-    (256 + 1 + 8 - 16),   /* SFD timeout: 249 symbols. */
+    (512 + 1 + 8 - 16),   /* SFD timeout: 505 symbols. */
     DWT_STS_MODE_OFF,
     DWT_STS_LEN_64,        /* Ignored with STS off. */
     DWT_PDOA_M0
