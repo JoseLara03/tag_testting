@@ -9,6 +9,41 @@ Zephyr RTOS firmware (nRF Connect SDK v3.2.4) for a custom IoT tracking tag base
 Board definition: `boards/Innovaforce/nRF52833_tag/`  
 Application entry point: `src/main.c`
 
+## Branches (cleaned up 2026-11-09)
+
+Only two branches exist, local and on `origin`. They pair with the same-named
+branches of `ANCLA_ESP32S3` (anchors and gateway); **a tag and its anchors must
+be on the same branch pair**, because the PHY and the protocol version are on
+the wire.
+
+- **`tdoa`** — the default branch. TDoA: the tag emits the `0xF0` BLINK and the
+  gateway solves (everything in the section below), `UWB_NET_PROTO_VER` 5, plus
+  the network PHY at **PLEN_256/PAC16** (`bccf699`). Formerly
+  `feat/rtls-scale-tdoa`. Pairs with ANCLA `tdoa`.
+- **`twr`** — the TWR line: the tag ranges the anchors and solves its own fix.
+  Cut from `9bb2853` (2026-08-26), the last commit of the protocol-v3 tag side
+  (slot-map absence means "not my turn", tier-derived `listen_skip`, ALERT on
+  `0xEE`) before any BLINK code, plus the same PLEN_256/PAC16 PHY (`17082b7`).
+  Pairs with ANCLA `twr` (cut from its `d027e4c`). **Not built and not run on
+  hardware** — the user builds and flashes, so no build was attempted when this
+  branch was made.
+
+Both PHY commits set the SFD timeout to `256 + 1 + 8 - 16 = 249`, matching the
+anchors' `uwb_phy.h`. The uncommitted working-tree edit this replaced read
+`257 + 1 + 8 - 16 = 250`, which disagrees with its own formula comment; if 250
+was deliberate, revert it on both branches. Any antenna-delay calibration done
+at PLEN_1024 is invalid at this PHY.
+
+Archived as tags on `origin` (recover with `git switch -c <name> <tag>`):
+`archive/master-2026-08-24-twr-ekf` (the former `master`: 3D range model,
+Gauss-Newton and EKF, from `1-smooth-movement`, before protocol v3),
+`archive/scaling-v3-2026-09-10` (the unmerged "network-scaling-v3" line, which
+also contains `codex/phy-256-6m8` and `docs/network-scaling-v3`) and
+`archive/stash-future-config-2026-09` (the `Future_config` stash, 2026-09; recover
+with `git stash apply <tag>`). The other feature branches were already contained
+in `tdoa` and were deleted. Older mentions of `master` or
+`feat/rtls-scale-tdoa` below mean history that now lives in `tdoa`.
+
 ## TDoA migration (Phase 2/3): measurement chain works, network capacity does not yet
 
 The project is migrating the whole fleet from TWR (each tag ranges four
