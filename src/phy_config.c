@@ -177,15 +177,15 @@ dwt_config_t config_options = {
  */
 dwt_config_t config_options = {
     5,                  /* Channel number. */
-    DWT_PLEN_1024,      /* Preamble length. Used in TX only. */
-    DWT_PAC32,           /* Preamble acquisition chunk size. Used in RX only. */
+    DWT_PLEN_256,      /* Preamble length. Used in TX only. */
+    DWT_PAC16,           /* Preamble acquisition chunk size. Used in RX only. */
     9,                  /* TX preamble code. Used in TX only. */
     9,                  /* RX preamble code. Used in RX only. */
     3,                  /* 0 to use standard 8 symbol SFD, 1 to use non-standard 8 symbol, 2 for non-standard 16 symbol SFD and 3 for 4z 8 symbol SDF type */
     DWT_BR_850K,        /* Data rate. */
     DWT_PHRMODE_STD,    /* PHY header mode. */
     DWT_PHRRATE_STD,    /* PHY header rate. */
-    (1024 + 1 + 8 - 32), /* SFD timeout (preamble length + 1 + SFD length - PAC size). Used in RX only. */
+    (256 + 1 + 8 - 16), /* SFD timeout (preamble length + 1 + SFD length - PAC size). Used in RX only. */
     DWT_STS_MODE_OFF,     /* Mode 1 STS enabled */
     DWT_STS_LEN_64,     /* STS length*/
     DWT_PDOA_M0         /* PDOA mode off */
