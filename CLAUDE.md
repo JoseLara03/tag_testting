@@ -9,6 +9,17 @@ Zephyr RTOS firmware (nRF Connect SDK v3.2.4) for a custom IoT tracking tag base
 Board definition: `boards/Innovaforce/nRF52833_tag/`  
 Application entry point: `src/main.c`
 
+## This is the `twr` branch (2026-11-09)
+
+The tag ranges the anchors and solves its own fix; no BLINK/TDoA code is here.
+Cut from `9bb2853` (2026-08-26, the protocol-v3 tag side) plus the network PHY at
+PLEN_256/PAC16 with SFD timeout 249 (`17082b7`). It pairs with ANCLA_ESP32S3's
+`twr` branch, and a tag and its anchors must be on the same pair (PHY and
+protocol version are on the wire). Not built and not run on hardware. Only two
+branches exist, `tdoa` (default) and `twr`; the full account, with the archive
+tags, is in `tdoa`'s CLAUDE.md section "Branches". Any other section of this
+file that mentions the TDoA migration, `blink` or proto 5 belongs to `tdoa`.
+
 ## Build & Flash
 
 `west build -b nRF52833_tag` (board root is this repo). **The user builds and flashes the firmware themselves** and reports errors and BLE output back — do not assume a build or flash can be run here.
